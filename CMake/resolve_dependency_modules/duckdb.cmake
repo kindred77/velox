@@ -30,11 +30,11 @@ message(STATUS "Building DuckDB from source")
 FetchContent_Declare(
   duckdb
   URL ${VELOX_DUCKDB_SOURCE_URL}
-  URL_HASH ${VELOX_DUCKDB_BUILD_SHA256_CHECKSUM}
-  PATCH_COMMAND
-    git apply ${CMAKE_CURRENT_LIST_DIR}/duckdb/remove-ccache.patch && git apply
-    ${CMAKE_CURRENT_LIST_DIR}/duckdb/fix-duckdbversion.patch && git apply
-    ${CMAKE_CURRENT_LIST_DIR}/duckdb/re2.patch)
+  URL_HASH ${VELOX_DUCKDB_BUILD_SHA256_CHECKSUM})
+#  PATCH_COMMAND
+#    git apply ${CMAKE_CURRENT_LIST_DIR}/duckdb/remove-ccache.patch && git apply
+#    ${CMAKE_CURRENT_LIST_DIR}/duckdb/fix-duckdbversion.patch && git apply
+#    ${CMAKE_CURRENT_LIST_DIR}/duckdb/re2.patch)
 
 set(BUILD_UNITTESTS OFF)
 set(ENABLE_SANITIZER OFF)
