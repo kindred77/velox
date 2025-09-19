@@ -31,12 +31,13 @@ message(STATUS "Building Abseil from source")
 
 FetchContent_Declare(
   absl
-  URL ${VELOX_ABSL_SOURCE_URL}
-  URL_HASH ${VELOX_ABSL_BUILD_SHA256_CHECKSUM}
+  #URL ${VELOX_ABSL_SOURCE_URL}
+  #URL_HASH ${VELOX_ABSL_BUILD_SHA256_CHECKSUM}
+  SOURCE_DIR ${CMAKE_BINARY_DIR}/../third_libs/abseil-cpp-20240116.2
   OVERRIDE_FIND_PACKAGE
   EXCLUDE_FROM_ALL
   SYSTEM
-  PATCH_COMMAND git apply ${CMAKE_CURRENT_LIST_DIR}/absl/absl-macos.patch
+  #PATCH_COMMAND git apply ${CMAKE_CURRENT_LIST_DIR}/absl/absl-macos.patch
 )
 
 set(ABSL_BUILD_TESTING OFF)

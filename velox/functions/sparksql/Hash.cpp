@@ -467,7 +467,7 @@ class Murmur3HashFunction final : public exec::VectorFunction {
   }
 
  private:
-  const std::optional<int32_t> seed_;
+  const std::optional<int32_t> seed_ = kDefaultSeed;
 };
 
 class XxHash64 final {
@@ -633,7 +633,7 @@ class XxHash64Function final : public exec::VectorFunction {
   }
 
  private:
-  const std::optional<int64_t> seed_;
+  const std::optional<int64_t> seed_ = kDefaultSeed;
 };
 
 bool checkHashElementType(const TypePtr& type) {

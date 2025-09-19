@@ -28,8 +28,9 @@ velox_resolve_dependency_url(FASTFLOAT)
 message(STATUS "Building fast_float from source")
 FetchContent_Declare(
   fastfloat
-  URL ${VELOX_FASTFLOAT_SOURCE_URL}
-  URL_HASH ${VELOX_FASTFLOAT_BUILD_SHA256_CHECKSUM}
+  SOURCE_DIR ${CMAKE_BINARY_DIR}/../third_libs/fast_float-8.0.2
+  #URL ${VELOX_FASTFLOAT_SOURCE_URL}
+  #URL_HASH ${VELOX_FASTFLOAT_BUILD_SHA256_CHECKSUM}
 )
 set(fastfloat_BUILD_TESTS OFF)
 FetchContent_MakeAvailable(fastfloat)

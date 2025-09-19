@@ -73,14 +73,15 @@ if(VELOX_ENABLE_ARROW)
   ExternalProject_Add(
     arrow_ep
     PREFIX ${ARROW_PREFIX}
-    URL ${VELOX_ARROW_SOURCE_URL}
-    URL_HASH ${VELOX_ARROW_BUILD_SHA256_CHECKSUM}
+    SOURCE_DIR ${CMAKE_BINARY_DIR}/../third_libs/arrow-apache-arrow-15.0.0
+    #URL ${VELOX_ARROW_SOURCE_URL}
+    #URL_HASH ${VELOX_ARROW_BUILD_SHA256_CHECKSUM}
     SOURCE_SUBDIR cpp
     CMAKE_ARGS ${ARROW_CMAKE_ARGS}
     BUILD_BYPRODUCTS ${ARROW_LIBDIR}/libarrow.a ${ARROW_LIBDIR}/libarrow_testing.a ${THRIFT_LIB}
-    PATCH_COMMAND
-      git apply ${CMAKE_CURRENT_LIST_DIR}/thrift-download.patch && git apply
-      ${CMAKE_CURRENT_LIST_DIR}/cmake-compatibility.patch
+    #PATCH_COMMAND
+    #  git apply ${CMAKE_CURRENT_LIST_DIR}/thrift-download.patch && git apply
+    #  ${CMAKE_CURRENT_LIST_DIR}/cmake-compatibility.patch
   )
 
   add_library(arrow STATIC IMPORTED GLOBAL)

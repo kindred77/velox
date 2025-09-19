@@ -1,0 +1,13 @@
+export TREAT_WARNINGS_AS_ERRORS=0
+export VELOX_ENABLE_PRESTO_FUNCTIONS=0
+export VELOX_ENABLE_SPARK_FUNCTIONS=0
+export folly_SOURCE=BUNDLED
+export Boost_SOURCE=BUNDLED
+export Arrow_SOURCE=BUNDLED
+export DuckDB_SOURCE=BUNDLED
+
+export LD_LIBRARY_PATH=/home/kindred/mywork/software/gcc-13/lib64:$LD_LIBRARY_PATH
+
+打过补丁的thirdpartlib不能再打
+
+用gcc编译, clang的话会找不到compare头文件

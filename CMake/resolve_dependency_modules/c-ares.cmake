@@ -31,9 +31,10 @@ message(STATUS "Building C-ARES from source")
 
 FetchContent_Declare(
   c-ares
-  URL ${VELOX_CARES_SOURCE_URL}
-  URL_HASH ${VELOX_CARES_BUILD_SHA256_CHECKSUM}
-  PATCH_COMMAND git init && git apply ${CMAKE_CURRENT_LIST_DIR}/c-ares/c-ares-random-file.patch
+  #URL ${VELOX_CARES_SOURCE_URL}
+  #URL_HASH ${VELOX_CARES_BUILD_SHA256_CHECKSUM}
+  SOURCE_DIR ${CMAKE_BINARY_DIR}/../third_libs/c-ares-cares-1_13_0
+  #PATCH_COMMAND git init && git apply ${CMAKE_CURRENT_LIST_DIR}/c-ares/c-ares-random-file.patch
   OVERRIDE_FIND_PACKAGE
   EXCLUDE_FROM_ALL
   SYSTEM

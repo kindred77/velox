@@ -67,7 +67,7 @@ function github_checkout {
     ${SUDO} rm -rf "${DIRNAME}"
   fi
   if [ ! -d "${DIRNAME}" ]; then
-    git clone -q -b "$VERSION" "${GIT_CLONE_PARAMS[@]}" "https://github.com/${REPO}.git"
+    git clone -q -b $VERSION $GIT_CLONE_PARAMS "git@github.com:${REPO}.git"
   fi
   cd "${DIRNAME}" || exit
 }
@@ -231,7 +231,8 @@ function wget_and_untar {
   pushd "${DIR}" || exit
   # Use ${VAR:+"$VAR"} pattern to only include CURL_OPTIONS if it's not empty
   # as curl >=8.6.0 rejects empty arguments
-  curl ${CURL_OPTIONS:+${CURL_OPTIONS}} -L "${URL}" -o "$2".tar.gz
+  # curl ${CURL_OPTIONS:+${CURL_OPTIONS}} -L "${URL}" -o "$2".tar.gz
+  wget -O $2.tar.gz "${URL}"
   tar -xz --strip-components=1 --no-same-owner -f "$2".tar.gz
   popd || exit
   popd || exit

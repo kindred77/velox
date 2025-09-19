@@ -28,23 +28,24 @@ velox_resolve_dependency_url(STEMMER)
 message(STATUS "Building stemmer from source")
 find_program(MAKE_PROGRAM make REQUIRED)
 
-set(STEMMER_PREFIX "${CMAKE_BINARY_DIR}/_deps/libstemmer")
-set(STEMMER_INCLUDE_PATH ${STEMMER_PREFIX}/src/libstemmer/include)
+set(STEMMER_PREFIX "${CMAKE_BINARY_DIR}/../third_libs/libstemmer_c-2.2.0")
+set(STEMMER_INCLUDE_PATH ${STEMMER_PREFIX}/include)
 
 # We can not use FetchContent as libstemmer does not use cmake
 ExternalProject_Add(
   libstemmer
   PREFIX ${STEMMER_PREFIX}
-  SOURCE_DIR ${STEMMER_PREFIX}/src/libstemmer
-  URL ${VELOX_STEMMER_SOURCE_URL}
-  URL_HASH ${VELOX_STEMMER_BUILD_SHA256_CHECKSUM}
+  SOURCE_DIR ${STEMMER_PREFIX}
+  #URL ${VELOX_STEMMER_SOURCE_URL}
+  #URL_HASH ${VELOX_STEMMER_BUILD_SHA256_CHECKSUM}
+  #SOURCE_DIR /home/kindred/mywork/projects/cpp/velox/kindred/velox/third_libs/libstemmer_c-2.2.0
   BUILD_IN_SOURCE TRUE
   CONFIGURE_COMMAND ""
   BUILD_COMMAND ${MAKE_PROGRAM}
   INSTALL_COMMAND ""
-  PATCH_COMMAND git apply ${CMAKE_CURRENT_LIST_DIR}/libstemmer/Makefile.patch
+  #PATCH_COMMAND git apply ${CMAKE_CURRENT_LIST_DIR}/libstemmer/Makefile.patch
   BUILD_BYPRODUCTS
-    ${STEMMER_PREFIX}/src/libstemmer/${CMAKE_STATIC_LIBRARY_PREFIX}stemmer${CMAKE_STATIC_LIBRARY_SUFFIX}
+    ${STEMMER_PREFIX}/${CMAKE_STATIC_LIBRARY_PREFIX}stemmer${CMAKE_STATIC_LIBRARY_SUFFIX}
 )
 
 add_library(stemmer STATIC IMPORTED GLOBAL)
@@ -54,7 +55,7 @@ set_target_properties(
   stemmer
   PROPERTIES
     IMPORTED_LOCATION
-      ${STEMMER_PREFIX}/src/libstemmer/${CMAKE_STATIC_LIBRARY_PREFIX}stemmer${CMAKE_STATIC_LIBRARY_SUFFIX}
+      ${STEMMER_PREFIX}/${CMAKE_STATIC_LIBRARY_PREFIX}stemmer${CMAKE_STATIC_LIBRARY_SUFFIX}
     INTERFACE_INCLUDE_DIRECTORIES ${STEMMER_INCLUDE_PATH}
 )
 

@@ -13,7 +13,9 @@
 # limitations under the License.
 
 add_executable(velox_parse_test QueryPlannerTest.cpp)
+add_executable(velox_gporca_test MyGPOrcaTest.cpp)
 
 add_test(velox_parse_test velox_parse_test)
 
 target_link_libraries(velox_parse_test velox_parse_parser GTest::gtest GTest::gtest_main)
+target_link_libraries(velox_gporca_test velox_parse_parser)

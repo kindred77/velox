@@ -31,11 +31,12 @@ message(STATUS "Building DuckDB from source")
 # twice. Velox already does this.
 FetchContent_Declare(
   duckdb
-  URL ${VELOX_DUCKDB_SOURCE_URL}
-  URL_HASH ${VELOX_DUCKDB_BUILD_SHA256_CHECKSUM}
-  PATCH_COMMAND
-    git apply ${CMAKE_CURRENT_LIST_DIR}/duckdb/remove-ccache.patch && git apply
-    ${CMAKE_CURRENT_LIST_DIR}/duckdb/re2.patch
+  SOURCE_DIR ${CMAKE_BINARY_DIR}/../third_libs/duckdb-0.8.1
+  #URL ${VELOX_DUCKDB_SOURCE_URL}
+  #URL_HASH ${VELOX_DUCKDB_BUILD_SHA256_CHECKSUM}
+  #PATCH_COMMAND
+  #  git apply ${CMAKE_CURRENT_LIST_DIR}/duckdb/remove-ccache.patch && git apply
+  #  ${CMAKE_CURRENT_LIST_DIR}/duckdb/re2.patch
 )
 
 # DuckDB uses git commands to retrieve version information during the build,
@@ -47,6 +48,7 @@ set(BUILD_UNITTESTS OFF)
 set(ENABLE_SANITIZER OFF)
 set(ENABLE_UBSAN OFF)
 set(BUILD_SHELL OFF)
+set(DISABLE_UNITY ON)
 set(EXPORT_DLL_SYMBOLS OFF)
 set(PREVIOUS_BUILD_TYPE ${CMAKE_BUILD_TYPE})
 set(CMAKE_BUILD_TYPE Release)
