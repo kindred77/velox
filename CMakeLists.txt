@@ -721,3 +721,6 @@ if(VELOX_ENABLE_GEO)
 endif()
 
 add_subdirectory(velox)
+
+velox_set_source(mygporca)
+velox_resolve_dependency(mygporca)
