@@ -30,7 +30,7 @@ velox_resolve_dependency_url(CURL)
 
 FetchContent_Declare(
   curl
-  SOURCE_DIR ${CMAKE_BINARY_DIR}/../third_libs/curl-8.4.0
+  SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}/../../third_libs/curl-8.4.0
   #URL ${VELOX_CURL_SOURCE_URL}
   #URL_HASH ${VELOX_CURL_BUILD_SHA256_CHECKSUM}
   )

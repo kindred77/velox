@@ -45,7 +45,7 @@ endif()
 
 FetchContent_Declare(
   Boost
-  SOURCE_DIR ${CMAKE_BINARY_DIR}/../third_libs/boost-1.84.0
+  SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}/../../../third_libs/boost-1.84.0
   #URL ${VELOX_BOOST_SOURCE_URL}
   #URL_HASH ${VELOX_BOOST_BUILD_SHA256_CHECKSUM}
   )

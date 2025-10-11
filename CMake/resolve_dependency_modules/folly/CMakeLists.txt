@@ -42,7 +42,7 @@ endif()
 
 FetchContent_Declare(
   folly
-  SOURCE_DIR ${CMAKE_BINARY_DIR}/../third_libs/folly
+  SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}/../../../third_libs/folly
   #URL ${VELOX_FOLLY_SOURCE_URL}
   #URL_HASH ${VELOX_FOLLY_BUILD_SHA256_CHECKSUM}
   #PATCH_COMMAND git apply ${CMAKE_CURRENT_LIST_DIR}/folly-no-export.patch ${glog_patch}

@@ -73,7 +73,7 @@ if(VELOX_ENABLE_ARROW)
   ExternalProject_Add(
     arrow_ep
     PREFIX ${ARROW_PREFIX}
-    SOURCE_DIR ${CMAKE_BINARY_DIR}/../third_libs/arrow-apache-arrow-15.0.0
+    SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}/../../../third_libs/arrow-apache-arrow-15.0.0
     #URL ${VELOX_ARROW_SOURCE_URL}
     #URL_HASH ${VELOX_ARROW_BUILD_SHA256_CHECKSUM}
     SOURCE_SUBDIR cpp

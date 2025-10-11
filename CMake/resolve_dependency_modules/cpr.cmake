@@ -33,7 +33,7 @@ velox_resolve_dependency_url(CPR)
 message(STATUS "Building cpr from source")
 FetchContent_Declare(
   cpr
-  SOURCE_DIR ${CMAKE_BINARY_DIR}/../third_libs/cpr-1.10.5
+  SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}/../../third_libs/cpr-1.10.5
   #URL ${VELOX_CPR_SOURCE_URL}
   #URL_HASH ${VELOX_CPR_BUILD_SHA256_CHECKSUM}
   #PATCH_COMMAND

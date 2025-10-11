@@ -28,7 +28,7 @@ velox_resolve_dependency_url(XSIMD)
 message(STATUS "Building xsimd from source")
 FetchContent_Declare(
   xsimd
-  SOURCE_DIR ${CMAKE_BINARY_DIR}/../third_libs/xsimd-10.0.0
+  SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}/../../third_libs/xsimd-10.0.0
   #URL ${VELOX_XSIMD_SOURCE_URL}
   #URL_HASH ${VELOX_XSIMD_BUILD_SHA256_CHECKSUM}
   )

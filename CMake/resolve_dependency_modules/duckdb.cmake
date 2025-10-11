@@ -31,7 +31,7 @@ message(STATUS "Building DuckDB from source")
 # twice. Velox already does this.
 FetchContent_Declare(
   duckdb
-  SOURCE_DIR ${CMAKE_BINARY_DIR}/../third_libs/duckdb-0.8.1
+  SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}/../../third_libs/duckdb-0.8.1
   #URL ${VELOX_DUCKDB_SOURCE_URL}
   #URL_HASH ${VELOX_DUCKDB_BUILD_SHA256_CHECKSUM}
   #PATCH_COMMAND

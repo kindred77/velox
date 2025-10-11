@@ -28,7 +28,7 @@ velox_resolve_dependency_url(STEMMER)
 message(STATUS "Building stemmer from source")
 find_program(MAKE_PROGRAM make REQUIRED)
 
-set(STEMMER_PREFIX "${CMAKE_BINARY_DIR}/../third_libs/libstemmer_c-2.2.0")
+set(STEMMER_PREFIX "${CMAKE_CURRENT_LIST_DIR}/../../third_libs/libstemmer_c-2.2.0")
 set(STEMMER_INCLUDE_PATH ${STEMMER_PREFIX}/include)
 
 # We can not use FetchContent as libstemmer does not use cmake
