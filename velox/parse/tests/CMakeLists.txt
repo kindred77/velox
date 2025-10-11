@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+add_compile_options(-DUSE_CMAKE)
+
+include_directories(${XERCES_INCLUDE_DIR})
 include_directories(${PROJECT_SOURCE_DIR}/third_libs/mygporca/libgpos/include)
 include_directories(${PROJECT_SOURCE_DIR}/third_libs/mygporca/libgpopt/include)
 include_directories(${PROJECT_SOURCE_DIR}/third_libs/mygporca/libmeta)
@@ -30,4 +33,8 @@ target_link_libraries(velox_parse_test velox_parse_parser GTest::gtest GTest::gt
 target_link_libraries(velox_gporca_test velox_parse_parser
         gpopt
         naucrates
-        gpos)
+        gpos
+        parser
+        translator
+        meta_provider
+        mygporca_pg_query)

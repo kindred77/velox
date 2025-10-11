@@ -11,3 +11,8 @@ export LD_LIBRARY_PATH=/home/kindred/mywork/software/gcc-13/lib64:$LD_LIBRARY_PA
 打过补丁的thirdpartlib不能再打
 
 用gcc编译, clang的话会找不到compare头文件
+
+禁用ccache
+cmake -DVELOX_ENABLE_CCACHE=OFF -DXERCES_LIBRARY=/home/kindred/mywork/projects/cpp/gp-xerces-kindred/install/lib/libxerces-c.a -DXERCES_INCLUDE_DIR=/home/kindred/mywork/projects/cpp/gp-xerces-kindred/install/include ..
+
+使用gcc-15编译

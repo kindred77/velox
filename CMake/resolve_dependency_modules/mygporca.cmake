@@ -15,13 +15,13 @@ include_guard(GLOBAL)
 
 #velox_resolve_dependency_url(MYGPORCA)
 
-message(STATUS "Building mygporca from source")
+message(STATUS "Building my_gporca from source")
 
 FetchContent_Declare(
-  mygporca
+  my_gporca
   SOURCE_DIR ${CMAKE_BINARY_DIR}/../third_libs/mygporca
   #URL ${VELOX_SIMDJSON_SOURCE_URL}
   #URL_HASH ${VELOX_SIMDJSON_BUILD_SHA256_CHECKSUM}
 )
 
-FetchContent_MakeAvailable(mygporca)
+FetchContent_MakeAvailable(my_gporca)
