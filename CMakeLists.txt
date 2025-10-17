@@ -722,5 +722,5 @@ endif()
 
 add_subdirectory(velox)
 
-velox_set_source(mygporca)
-velox_resolve_dependency(mygporca)
+#velox_set_source(mygporca)
+#velox_resolve_dependency(mygporca)

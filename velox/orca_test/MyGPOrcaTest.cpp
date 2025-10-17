@@ -30,6 +30,9 @@
 #include <naucrates/dxl/parser/CParseHandlerDXL.h>
 #include <naucrates/md/IMDProvider.h>
 
+#define GLOG_NO_ABBREVIATED_SEVERITIES
+#include "velox/parse/QueryPlanner.h"
+
 using namespace duckdb_libpgquery;
 using namespace gpmd;
 using namespace gpdxl;
@@ -590,14 +593,14 @@ main(INT iArgs, const CHAR **rgszArgs)
 
   //T_PGAExpr will be changed to other node type
   //std::string query_str = "select t.col1,t2.col4,t.col4,count(distinct t.col5) as cnt1,count(distinct t2.col5) as cnt2 from test.test t inner join test.test2 t2 on t.col2=t2.col2 where t.col1 like '%test' and t2.col3 between '2024-01-01 00:00:00' and '2024-02-01 00:00:00' group by t.col1,t2.col4,t.col4 order by cnt1,cnt2 desc;";
-  std::string query_str = "select t.col1,t2.col4,t.col4,count(distinct t.col5) as cnt1,count(distinct t2.col5) as cnt2 from test.test t inner join test.test2 t2 on t.col2=t2.col2 where t.col1 like '%test' group by t.col1,t2.col4,t.col4 having count(distinct t2.col5) > 10 order by cnt1,cnt2 desc;";
+  //std::string query_str = "select t.col1,t2.col4,t.col4,count(distinct t.col5) as cnt1,count(distinct t2.col5) as cnt2 from test.test t inner join test.test2 t2 on t.col2=t2.col2 where t.col1 like '%test' group by t.col1,t2.col4,t.col4 having count(distinct t2.col5) > 10 order by cnt1,cnt2 desc;";
   //std::string query_str = "select t.col2,t.col3 from test.test t where t.col1 = 'test'";
   //std::string query_str = "select count(*) from (select t.col1 from test.test t order by t.col1) t2";
   //std::string query_str = "select count(distinct col1) from (select t.col1 from test.test t order by t.col1) t2";
   //std::string query_str = "select col1 from (select t.col1 from test.test t order by t.col1) t2";
   //std::string query_str = "select sum(col2) from (select t.col1,t.col2 from test.test t order by t.col1) t2";
   //std::string query_str = "select count(distinct col1) from (select t.col1,sum(t.col2) cnt from test.test t group by t.col1 order by cnt desc) t2";
-  //std::string query_str = "select sum(col2) from test.test t group by col1 having sum(col2)>1";
+  std::string query_str = "select col1 from test.test";
   duckdb::PostgresParser::SetPreserveIdentifierCase(false);
 
   // auto shared_context = DB::Context::createShared();

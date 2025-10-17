@@ -27,12 +27,14 @@ include_directories(${PROJECT_SOURCE_DIR}/third_libs/mygporca/libnaucrates/inclu
 include_directories(${PROJECT_SOURCE_DIR}/third_libs/mygporca/libgpopt/include)
 
 add_executable(OrcaTest MyGPOrcaTest.cpp)
+#velox_add_library(OrcaTest MyGPOrcaTest.cpp)
 
-target_link_libraries(OrcaTest
+velox_link_libraries(OrcaTest
         gpopt
         naucrates
         gpos
         parser
         translator
         meta_provider
-        mygporca_pg_query)
+        mygporca_pg_query
+        velox_parse_parser)
