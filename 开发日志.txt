@@ -5,6 +5,8 @@ export folly_SOURCE=BUNDLED
 export Boost_SOURCE=BUNDLED
 export Arrow_SOURCE=BUNDLED
 export DuckDB_SOURCE=BUNDLED
+export glog_SOURCE=BUNDLED
+export gflags_SOURCE=BUNDLED
 
 export LD_LIBRARY_PATH=/home/kindred/mywork/software/gcc-13/lib64:$LD_LIBRARY_PATH
 

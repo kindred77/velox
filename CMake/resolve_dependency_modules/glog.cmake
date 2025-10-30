@@ -28,8 +28,9 @@ velox_resolve_dependency_url(GLOG)
 message(STATUS "Building glog from source")
 FetchContent_Declare(
   glog
-  URL ${VELOX_GLOG_SOURCE_URL}
-  URL_HASH ${VELOX_GLOG_BUILD_SHA256_CHECKSUM}
+  #URL ${VELOX_GLOG_SOURCE_URL}
+  #URL_HASH ${VELOX_GLOG_BUILD_SHA256_CHECKSUM}
+  SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}/../../third_libs/glog-0.6.0
   PATCH_COMMAND
     git apply ${CMAKE_CURRENT_LIST_DIR}/glog/glog-no-export.patch && git apply
     ${CMAKE_CURRENT_LIST_DIR}/glog/glog-config.patch

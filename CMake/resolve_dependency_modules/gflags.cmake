@@ -30,8 +30,9 @@ velox_resolve_dependency_url(GFLAGS)
 message(STATUS "Building gflags from source")
 FetchContent_Declare(
   gflags
-  URL ${VELOX_GFLAGS_SOURCE_URL}
-  URL_HASH ${VELOX_GFLAGS_BUILD_SHA256_CHECKSUM}
+  #URL ${VELOX_GFLAGS_SOURCE_URL}
+  #URL_HASH ${VELOX_GFLAGS_BUILD_SHA256_CHECKSUM}
+  SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}/../../third_libs/gflags-2.2.2
   PATCH_COMMAND git apply ${CMAKE_CURRENT_LIST_DIR}/gflags/gflags-config.patch
   OVERRIDE_FIND_PACKAGE
   EXCLUDE_FROM_ALL
