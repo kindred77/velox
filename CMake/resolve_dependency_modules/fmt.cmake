@@ -23,7 +23,10 @@ set(VELOX_FMT_SOURCE_URL "https://github.com/fmtlib/fmt/archive/${VELOX_FMT_VERS
 velox_resolve_dependency_url(FMT)
 
 message(STATUS "Building fmt from source")
-FetchContent_Declare(fmt URL ${VELOX_FMT_SOURCE_URL} URL_HASH ${VELOX_FMT_BUILD_SHA256_CHECKSUM})
+FetchContent_Declare(fmt
+＃   URL ${VELOX_FMT_SOURCE_URL} URL_HASH ${VELOX_FMT_BUILD_SHA256_CHECKSUM}
+        SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}/../../third_libs/fmt-10.1.1
+)
 # Force fmt to create fmt-config.cmake which can be found by other dependecies
 # (e.g. folly)
 set(FMT_INSTALL ON)
