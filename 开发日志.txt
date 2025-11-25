@@ -30,3 +30,5 @@ export LD_LIBRARY_PATH=/home/kindred/mywork/software/gcc-13/lib64:$LD_LIBRARY_PA
 cmake -DVELOX_ENABLE_CCACHE=OFF -DXERCES_LIBRARY=/home/kindred/mywork/projects/cpp/gp-xerces-kindred/install/lib/libxerces-c.a -DXERCES_INCLUDE_DIR=/home/kindred/mywork/projects/cpp/gp-xerces-kindred/install/include ..
 
 使用gcc-15编译
+
+velox使用name标识identifier，而gporca使用的是colID，理论上使用colID更合适
