@@ -85,5 +85,3 @@ endif()
 if(VELOX_BUILD_PYTHON_PACKAGE)
   add_subdirectory(python)
 endif()
-
-add_subdirectory(orca_test)
