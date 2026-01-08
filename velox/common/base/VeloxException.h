@@ -44,19 +44,35 @@ using namespace folly::string_literals;
 /// or an unsupported pattern of use are classified with source USER. Examples
 /// of errors in this category include syntax errors, unavailable names or
 /// objects.
+#ifndef NO_FIXED_STR_UDL
+inline constexpr auto kErrorSourceUser = "USER"_fs4;
+#elif
 inline constexpr auto kErrorSourceUser = "USER"_fs;
+#endif
 
 /// Errors where the root cause of the problem is an unexpected internal state
 /// in the system.
+#ifndef NO_FIXED_STR_UDL
+inline constexpr auto kErrorSourceRuntime = "RUNTIME"_fs8;
+#elif
 inline constexpr auto kErrorSourceRuntime = "RUNTIME"_fs;
+#endif
 
 /// Errors where the root cause of the problem is some unreliable aspect of the
 /// system are classified with source SYSTEM.
+#ifndef NO_FIXED_STR_UDL
+inline constexpr auto kErrorSourceSystem = "SYSTEM"_fs8;
+#elif
 inline constexpr auto kErrorSourceSystem = "SYSTEM"_fs;
+#endif
 
 /// Errors where the root cause of the problem is some external dependency (e.g.
 /// storage)
+#ifndef NO_FIXED_STR_UDL
+inline constexpr auto kErrorSourceExternal = "EXTERNAL"_fs8;
+#elif
 inline constexpr auto kErrorSourceExternal = "EXTERNAL"_fs;
+#endif
 } // namespace error_source
 
 namespace error_code {
@@ -65,74 +81,159 @@ using namespace folly::string_literals;
 ///====================== User Error Codes ======================:
 
 /// A generic user error code
+#ifndef NO_FIXED_STR_UDL
+inline constexpr auto kGenericUserError = "GENERIC_USER_ERROR"_fs32;
+#elif
 inline constexpr auto kGenericUserError = "GENERIC_USER_ERROR"_fs;
+#endif
 
 /// An error raised when an argument verification fails
+#ifndef NO_FIXED_STR_UDL
+inline constexpr auto kInvalidArgument = "INVALID_ARGUMENT"_fs16;
+#elif
 inline constexpr auto kInvalidArgument = "INVALID_ARGUMENT"_fs;
+#endif
 
 /// An error raised when a requested operation is not supported.
+#ifndef NO_FIXED_STR_UDL
+inline constexpr auto kUnsupported = "UNSUPPORTED"_fs16;
+#elif
 inline constexpr auto kUnsupported = "UNSUPPORTED"_fs;
+#endif
 
 /// Arithmetic errors - underflow, overflow, divide by zero etc.
+#ifndef NO_FIXED_STR_UDL
+inline constexpr auto kArithmeticError = "ARITHMETIC_ERROR"_fs16;
+#elif
 inline constexpr auto kArithmeticError = "ARITHMETIC_ERROR"_fs;
+#endif
 
 /// An error raised when types are not compatible
+#ifndef NO_FIXED_STR_UDL
+inline constexpr auto kSchemaMismatch = "SCHEMA_MISMATCH"_fs16;
+#elif
 inline constexpr auto kSchemaMismatch = "SCHEMA_MISMATCH"_fs;
+#endif
 
 ///====================== Runtime Error Codes ======================:
 
 /// An error raised when the current state of a component is invalid.
+#ifndef NO_FIXED_STR_UDL
+inline constexpr auto kInvalidState = "INVALID_STATE"_fs16;
+#elif
 inline constexpr auto kInvalidState = "INVALID_STATE"_fs;
+#endif
 
 /// An error raised when unreachable code point was executed.
+#ifndef NO_FIXED_STR_UDL
+inline constexpr auto kUnreachableCode = "UNREACHABLE_CODE"_fs16;
+#elif
 inline constexpr auto kUnreachableCode = "UNREACHABLE_CODE"_fs;
+#endif
 
 /// An error raised when a requested operation is not yet supported.
+#ifndef NO_FIXED_STR_UDL
+inline constexpr auto kNotImplemented = "NOT_IMPLEMENTED"_fs16;
+#elif
 inline constexpr auto kNotImplemented = "NOT_IMPLEMENTED"_fs;
+#endif
 
 /// An error raised when memory pool exceeds limits.
+#ifndef NO_FIXED_STR_UDL
+inline constexpr auto kMemCapExceeded = "MEM_CAP_EXCEEDED"_fs16;
+#elif
 inline constexpr auto kMemCapExceeded = "MEM_CAP_EXCEEDED"_fs;
+#endif
 
 /// An error raised when memory request failed due to arbitration failures. This
 /// is normally caused by insufficient global memory resource.
+#ifndef NO_FIXED_STR_UDL
+inline constexpr auto kMemArbitrationFailure = "MEM_ARBITRATION_FAILURE"_fs32;
+#elif
 inline constexpr auto kMemArbitrationFailure = "MEM_ARBITRATION_FAILURE"_fs;
+#endif
 
 /// An error raised when memory pool is aborted.
+#ifndef NO_FIXED_STR_UDL
+inline constexpr auto kMemAborted = "MEM_ABORTED"_fs16;
+#elif
 inline constexpr auto kMemAborted = "MEM_ABORTED"_fs;
+#endif
 
 /// An error raised when memory arbitration times out.
+#ifndef NO_FIXED_STR_UDL
+inline constexpr auto kMemArbitrationTimeout = "MEM_ARBITRATION_TIMEOUT"_fs32;
+#elif
 inline constexpr auto kMemArbitrationTimeout = "MEM_ARBITRATION_TIMEOUT"_fs;
+#endif
 
 /// Error caused by memory allocation failure (inclusive of allocator memory cap
 /// exceeded).
+#ifndef NO_FIXED_STR_UDL
+inline constexpr auto kMemAllocError = "MEM_ALLOC_ERROR"_fs16;
+#elif
 inline constexpr auto kMemAllocError = "MEM_ALLOC_ERROR"_fs;
+#endif
 
 /// Error caused by failing to allocate cache buffer space for IO.
+#ifndef NO_FIXED_STR_UDL
+inline constexpr auto kNoCacheSpace = "NO_CACHE_SPACE"_fs16;
+#elif
 inline constexpr auto kNoCacheSpace = "NO_CACHE_SPACE"_fs;
+#endif
 
 /// An error raised when spill bytes exceeds limits.
+#ifndef NO_FIXED_STR_UDL
+inline constexpr auto kSpillLimitExceeded = "SPILL_LIMIT_EXCEEDED"_fs32;
+#elif
 inline constexpr auto kSpillLimitExceeded = "SPILL_LIMIT_EXCEEDED"_fs;
+#endif
 
 /// An error raised to indicate any general failure happened during spilling.
+#ifndef NO_FIXED_STR_UDL
+inline constexpr auto kGenericSpillFailure = "GENERIC_SPILL_FAILURE"_fs32;
+#elif
 inline constexpr auto kGenericSpillFailure = "GENERIC_SPILL_FAILURE"_fs;
+#endif
 
 /// An error raised when trace bytes exceeds limits.
+#ifndef NO_FIXED_STR_UDL
+inline constexpr auto kTraceLimitExceeded = "TRACE_LIMIT_EXCEEDED"_fs32;
+#elif
 inline constexpr auto kTraceLimitExceeded = "TRACE_LIMIT_EXCEEDED"_fs;
+#endif
 
 /// Errors indicating file read corruptions.
+#ifndef NO_FIXED_STR_UDL
+inline constexpr auto kFileCorruption = "FILE_CORRUPTION"_fs16;
+#elif
 inline constexpr auto kFileCorruption = "FILE_CORRUPTION"_fs;
+#endif
 
 /// Errors indicating file not found.
+#ifndef NO_FIXED_STR_UDL
+inline constexpr auto kFileNotFound = "FILE_NOT_FOUND"_fs16;
+#elif
 inline constexpr auto kFileNotFound = "FILE_NOT_FOUND"_fs;
+#endif
 
 /// We do not know how to classify it yet.
+#ifndef NO_FIXED_STR_UDL
+inline constexpr auto kUnknown = "UNKNOWN"_fs8;
+#elif
 inline constexpr auto kUnknown = "UNKNOWN"_fs;
+#endif
 
 /// VeloxRuntimeErrors due to unsupported input values such as unicode input to
 /// cast-varchar-to-integer. This kind of errors is allowed in expression
 /// fuzzer.
+#ifndef NO_FIXED_STR_UDL
+inline constexpr auto kUnsupportedInputUncatchable =
+    "UNSUPPORTED_INPUT_UNCATCHABLE"_fs32;
+#elif
 inline constexpr auto kUnsupportedInputUncatchable =
     "UNSUPPORTED_INPUT_UNCATCHABLE"_fs;
+#endif
 } // namespace error_code
 
 class VeloxException : public std::exception {

@@ -17,7 +17,8 @@
 #include "velox/common/memory/MallocAllocator.h"
 #include "velox/common/memory/Memory.h"
 
-#include <sys/mman.h>
+//#include <sys/mman.h>
+#include <folly/portability/SysMman.h>
 
 namespace facebook::velox::memory {
 MallocAllocator::MallocAllocator(size_t capacity, uint32_t reservationByteLimit)

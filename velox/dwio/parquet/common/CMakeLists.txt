@@ -31,5 +31,5 @@ velox_link_libraries(
   Folly::folly
   Snappy::snappy
   thrift
-  zstd::zstd
+#  zstd::zstd
 )

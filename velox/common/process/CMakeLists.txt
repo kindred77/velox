@@ -29,6 +29,9 @@ velox_link_libraries(
 
 # Profiler need not be part of the core Velox library
 add_library(velox_profiler OBJECT Profiler.cpp)
+if(WIN32)
+  target_compile_definitions(velox_profiler PRIVATE GLOG_NO_ABBREVIATED_SEVERITIES)
+endif()
 target_link_libraries(
   velox_profiler
   PUBLIC velox_flag_definitions Folly::folly

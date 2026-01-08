@@ -27,7 +27,9 @@ if(VELOX_ENABLE_ABFS)
       AzureClientProviderFactories.cpp
       AzureClientProviderImpl.cpp
   )
-
+  if(WIN32)
+    target_compile_definitions(velox_abfs PRIVATE GLOG_NO_ABBREVIATED_SEVERITIES)
+  endif()
   velox_link_libraries(
     velox_abfs
     PUBLIC

@@ -14,7 +14,12 @@
 
 velox_add_library(velox_dynamic_library_loader DynamicLibraryLoader.cpp)
 
-velox_link_libraries(velox_dynamic_library_loader PRIVATE velox_exception)
+if (WIN32)
+  find_package(dlfcn-win32 REQUIRED)
+  set(CMAKE_DL_LIBS dlfcn-win32::dl)
+endif ()
+
+velox_link_libraries(velox_dynamic_library_loader PRIVATE velox_exception ${CMAKE_DL_LIBS})
 
 if(${VELOX_BUILD_TESTING})
   add_subdirectory(tests)

@@ -489,6 +489,7 @@ void PageReader::prepareDictionary(const PageHeader& pageHeader) {
         }
         break;
       } else if (type_->type()->isLongDecimal()) {
+        #ifdef FOLLY_HAS_INT128
         // Parquet decimal values have a fixed typeLength_ and are in big-endian
         // layout.
         if (numParquetBytes < numVeloxBytes) {
@@ -511,6 +512,9 @@ void PageReader::prepareDictionary(const PageHeader& pageHeader) {
           values[i] = bits::builtin_bswap128(values[i]);
         }
         break;
+        #else
+        VELOX_FAIL("Int128 is not supported");
+        #endif
       }
       VELOX_UNSUPPORTED(
           "Parquet type {} not supported for dictionary", parquetType);

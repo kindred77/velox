@@ -8,7 +8,7 @@
 #define YY_DECL int facebook::velox::functions::prestosql::Scanner::lex(facebook::velox::functions::prestosql::Parser::semantic_type *yylval)
 %}
 
-%option c++ noyywrap noyylineno nodefault caseless ecs
+%option c++ noyywrap noyylineno nodefault caseless ecs nounistd
 
 A   [A|a]
 B   [B|b]

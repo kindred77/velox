@@ -724,7 +724,8 @@ bool inline hasIntersection(
 
 template <typename T = uint64_t>
 inline int32_t countLeadingZeros(T word) {
-  static_assert(std::is_same_v<T, uint64_t> || std::is_same_v<T, __uint128_t>);
+  //static_assert(std::is_same_v<T, uint64_t> || std::is_same_v<T, __uint128_t>);
+  static_assert(std::is_same_v<T, uint64_t>);
   /// Built-in Function: int __builtin_clz (unsigned int x) returns the number
   /// of leading 0-bits in x, starting at the most significant bit position. If
   /// x is 0, the result is undefined.
@@ -992,6 +993,7 @@ inline void padToAlignment(
 
 /// Returns value with the order of the bytes reversed; for example, 0xaabb
 /// becomes 0xbbaa. Byte here always means exactly 8 bits.
+#ifdef FOLLY_HAS_INT128
 inline __int128_t builtin_bswap128(__int128_t value) {
 #if defined __has_builtin
 #if __has_builtin(__builtin_bswap128)
@@ -1003,9 +1005,11 @@ inline __int128_t builtin_bswap128(__int128_t value) {
   return (static_cast<__uint128_t>(__builtin_bswap64(value)) << 64) |
       __builtin_bswap64(value >> 64);
 #else
+  return boost_bswap128();
 #undef VELOX_HAS_BUILTIN_BSWAP_INT128
 #endif
 }
+#endif
 
 /// Store `bits' into the memory region pointed by `byte', at `index' (bit
 /// index).  If `kSize' is 8, we store the whole byte directly; otherwise it

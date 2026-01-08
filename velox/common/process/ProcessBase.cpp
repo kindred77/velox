@@ -19,7 +19,8 @@
 #include <limits.h>
 #include <stdlib.h>
 #include <time.h>
-#include <unistd.h>
+//#include <unistd.h>
+#include <folly/portability/Unistd.h>
 
 #include <folly/CpuId.h>
 #include <folly/FileUtil.h>

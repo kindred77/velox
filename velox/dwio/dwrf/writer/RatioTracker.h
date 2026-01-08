@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include <glob.h>
+//#include <glob.h>
 
 constexpr float kCompressionRatioInitialGuess = 0.3f;
 constexpr float kFlushOverheadRatioInitialGuess = 0.1f;

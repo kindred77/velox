@@ -614,6 +614,7 @@ inline void readString(
 }
 
 // Reads the offset to start and length from buffer, set rawValue[index].
+#ifdef FOLLY_HAS_INT128
 void readLongDecimal(
     const char* buffer,
     const char* start,
@@ -630,6 +631,15 @@ void readLongDecimal(
       length);
   rawValue[index] = bits::builtin_bswap128(bigEndianValue);
 }
+#else
+void readLongDecimal(
+    const char* buffer,
+    const char* start,
+    int128_t* rawValue,
+    vector_size_t index) {
+  VELOX_UNSUPPORTED("Long decimal is not supported on this platform.");
+}
+#endif
 
 VectorPtr deserializeUnknowns(
     const TypePtr& type,
@@ -674,6 +684,7 @@ VectorPtr deserializeStrings(
   return flatVector;
 }
 
+#ifdef FOLLY_HAS_INT128
 VectorPtr deserializeLongDecimal(
     const TypePtr& type,
     const std::vector<char*>& data,
@@ -698,6 +709,16 @@ VectorPtr deserializeLongDecimal(
 
   return flatVector;
 }
+#else
+VectorPtr deserializeLongDecimal(
+    const TypePtr& type,
+    const std::vector<char*>& data,
+    const BufferPtr& nulls,
+    std::vector<size_t>& offsets,
+    memory::MemoryPool* pool) {
+  VELOX_UNSUPPORTED("Long decimal is not supported on this platform.");
+}
+#endif
 
 VectorPtr deserializeUnknownArrays(
     const TypePtr& type,
@@ -711,6 +732,7 @@ VectorPtr deserializeUnknownArrays(
   return BaseVector::createNullConstant(UNKNOWN(), total, pool);
 }
 
+#ifdef FOLLY_HAS_INT128
 VectorPtr deserializeLongDecimalArrays(
     const TypePtr& type,
     const std::vector<char*>& data,
@@ -754,6 +776,17 @@ VectorPtr deserializeLongDecimalArrays(
 
   return flatVector;
 }
+#else
+VectorPtr deserializeLongDecimalArrays(
+    const TypePtr& type,
+    const std::vector<char*>& data,
+    const BufferPtr& sizes,
+    const std::vector<int32_t>& arrayStartOffsets,
+    std::vector<int32_t>& arrayDataOffsets,
+    memory::MemoryPool* pool) {
+  VELOX_UNSUPPORTED("Long decimal is not supported on this platform.");
+}
+#endif
 
 // Deserializes multiple strings from each 'row' in 'data'.
 // Each set of strings starts at data[row] + offsets and contains

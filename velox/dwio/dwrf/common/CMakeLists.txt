@@ -40,7 +40,7 @@ velox_link_libraries(
   velox_dwio_common_compression
   velox_caching
   Snappy::snappy
-  zstd::zstd
+#  zstd::zstd
   protobuf::libprotobuf
 )
 

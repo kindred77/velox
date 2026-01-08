@@ -31,7 +31,7 @@ std::string unescape_doublequote(const char* yytext) {
 }
 %}
 
-%option c++ noyywrap noyylineno nodefault caseless
+%option c++ noyywrap noyylineno nodefault caseless nounistd
 
 A   [A|a]
 B   [B|b]

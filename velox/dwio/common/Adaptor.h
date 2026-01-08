@@ -26,8 +26,14 @@
 #elif defined(__GNUC__)
 #define DIAGNOSTIC_PUSH _Pragma("GCC diagnostic push")
 #define DIAGNOSTIC_POP _Pragma("GCC diagnostic pop")
+#elif defined(_MSC_VER)
+#define DIAGNOSTIC_PUSH __pragma(warning(push))
+#define DIAGNOSTIC_POP  __pragma(warning(pop))
+#define DIAGNOSTIC_DISABLE_UNUSED __pragma(warning(disable:4101))
 #else
-#error("Unknown compiler")
+#define DIAGNOSTIC_PUSH
+#define DIAGNOSTIC_POP
+#define DIAGNOSTIC_DISABLE_UNUSED
 #endif
 
 #define PRAGMA(TXT) _Pragma(#TXT)
@@ -36,6 +42,8 @@
 #define DIAGNOSTIC_IGNORE(XXX) PRAGMA(clang diagnostic ignored XXX)
 #elif defined(__GNUC__)
 #define DIAGNOSTIC_IGNORE(XXX) PRAGMA(GCC diagnostic ignored XXX)
+#elif defined(_MSC_VER)
+#define DIAGNOSTIC_IGNORE(XXX) __pragma(warning(disable: XXX))
 #else
 #define DIAGNOSTIC_IGNORE(XXX)
 #endif

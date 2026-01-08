@@ -24,9 +24,11 @@
 #include <thread>
 
 #include <fcntl.h>
-#include <sys/resource.h>
-#include <sys/wait.h>
-#include <unistd.h>
+//#include <sys/resource.h>
+#include <folly/portability/SysResource.h>
+//#include <sys/wait.h>
+//#include <unistd.h>
+#include <folly/portability/Unistd.h>
 
 DEFINE_string(profiler_tmp_dir, "/tmp", "Writable temp for perf.data");
 

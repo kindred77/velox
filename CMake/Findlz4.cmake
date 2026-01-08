@@ -23,7 +23,7 @@
 include(FindPackageHandleStandardArgs)
 include(SelectLibraryConfigurations)
 
-find_library(LZ4_LIBRARY_RELEASE lz4 PATHS $LZ4_LIBRARYDIR})
+find_library(LZ4_LIBRARY_RELEASE lz4 PATHS ${LZ4_LIBRARYDIR})
 find_library(LZ4_LIBRARY_DEBUG lz4d PATHS ${LZ4_LIBRARYDIR})
 
 find_path(LZ4_INCLUDE_DIR lz4.h PATHS ${LZ4_INCLUDEDIR})
@@ -34,18 +34,53 @@ find_package_handle_standard_args(lz4 DEFAULT_MSG LZ4_LIBRARY LZ4_INCLUDE_DIR)
 
 mark_as_advanced(LZ4_LIBRARY LZ4_INCLUDE_DIR)
 
-get_filename_component(liblz4_ext ${LZ4_LIBRARY} EXT)
-if(liblz4_ext STREQUAL ".a")
+# would be "optimized;xxx/vcpkg/installed/x64-windows/lib/lz4.lib;debug;xxx/vcpkg/installed/x64-windows/debug/lib/lz4d.lib" in vcpkg on Win
+# TODO: temporary workaround for vcpkg
+set(LZ4_LIBS_FORSEARCH ${LZ4_LIBRARY})
+list(FILTER LZ4_LIBS_FORSEARCH INCLUDE REGEX ".*lz4\\.lib.*")
+if(LZ4_LIBS_FORSEARCH)
+  message(STATUS "Using lz4.lib, may be in Windows: ${LZ4_LIBS_FORSEARCH}")
   set(liblz4_type STATIC)
+  set(LZ4_LIBRARY ${LZ4_LIBS_FORSEARCH})
+  message(STATUS "lz4.lib in vcpkg has been set to: ${LZ4_LIBRARY}")
 else()
-  set(liblz4_type SHARED)
+  get_filename_component(liblz4_ext ${LZ4_LIBRARY} EXT)
+  if(liblz4_ext STREQUAL ".a")
+    set(liblz4_type STATIC)
+  else()
+    set(liblz4_type SHARED)
+  endif()
 endif()
 
 if(NOT TARGET lz4::lz4)
   add_library(lz4::lz4 ${liblz4_type} IMPORTED)
   set_target_properties(lz4::lz4 PROPERTIES INTERFACE_INCLUDE_DIRECTORIES "${LZ4_INCLUDE_DIR}")
-  set_target_properties(
-    lz4::lz4
-    PROPERTIES IMPORTED_LINK_INTERFACE_LANGUAGES "C" IMPORTED_LOCATION "${LZ4_LIBRARIES}"
-  )
+
+  #set_target_properties(
+  #  lz4::lz4
+  #  PROPERTIES IMPORTED_LINK_INTERFACE_LANGUAGES "C" IMPORTED_LOCATION "${LZ4_LIBRARY}"
+  #)
+
+  # Set the locations for different configurations
+    if(LZ4_LIBRARY_RELEASE)
+        set_target_properties(lz4::lz4 PROPERTIES
+            IMPORTED_LOCATION_RELEASE "${LZ4_LIBRARY_RELEASE}"
+        )
+    endif()
+    if(LZ4_LIBRARY_DEBUG)
+        set_target_properties(lz4::lz4 PROPERTIES
+            IMPORTED_LOCATION_DEBUG "${LZ4_LIBRARY_DEBUG}"
+        )
+    endif()
+    # Fallback for single-config generators (like Makefiles)
+    if(LZ4_LIBRARY_RELEASE AND NOT LZ4_LIBRARY_DEBUG)
+        set_target_properties(lz4::lz4 PROPERTIES
+            IMPORTED_LOCATION "${LZ4_LIBRARY_RELEASE}"
+        )
+    endif()
+endif()
+
+# Set the LZ4_LIBRARIES variable for compatibility
+if(LZ4_FOUND)
+    set(LZ4_LIBRARIES lz4::lz4)
 endif()

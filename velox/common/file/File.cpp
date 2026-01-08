@@ -26,7 +26,7 @@
 #ifdef linux
 #include <linux/fs.h>
 #endif // linux
-#include <sys/ioctl.h>
+//#include <sys/ioctl.h>
 
 namespace facebook::velox {
 

@@ -21,8 +21,10 @@
 #include "velox/dwio/common/exception/Exception.h"
 
 #include <fcntl.h>
-#include <sys/mman.h>
-#include <unistd.h>
+//#include <sys/mman.h>
+#include <folly/portability/SysMman.h>
+//#include <unistd.h>
+#include <folly/portability/Unistd.h>
 
 namespace facebook::velox::dwio::common {
 namespace {

@@ -39,5 +39,5 @@ velox_link_libraries(
   arrow
   Snappy::snappy
   thrift
-  zstd::zstd
+#  zstd::zstd
 )

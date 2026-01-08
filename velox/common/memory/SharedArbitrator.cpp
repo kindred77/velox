@@ -16,7 +16,7 @@
 
 #include "velox/common/memory/SharedArbitrator.h"
 #include <folly/system/ThreadName.h>
-#include <pthread.h>
+#include <folly/portability/PThread.h>
 #include <mutex>
 #include "velox/common/base/AsyncSource.h"
 #include "velox/common/base/Exceptions.h"

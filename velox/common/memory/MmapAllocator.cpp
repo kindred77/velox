@@ -16,7 +16,8 @@
 
 #include "velox/common/memory/MmapAllocator.h"
 
-#include <sys/mman.h>
+//#include <sys/mman.h>
+#include <folly/portability/SysMman.h>
 
 #include "velox/common/base/Counters.h"
 #include "velox/common/base/Portability.h"

@@ -183,6 +183,38 @@ message(STATUS "Setting FOLLY_USE_SYMBOLIZER: ${FOLLY_USE_SYMBOLIZER}")
 message(STATUS "Setting FOLLY_HAVE_ELF: ${FOLLY_HAVE_ELF}")
 message(STATUS "Setting FOLLY_HAVE_DWARF: ${FOLLY_HAVE_DWARF}")
 
+# 1. 先将测试代码写入一个临时文件
+file(WRITE ${CMAKE_BINARY_DIR}/test_optional.cpp "
+#include <atomic>
+  int main(int argc, char** argv) {
+    std::atomic<uint8_t> a1;
+    std::atomic<uint16_t> a2;
+    std::atomic<uint32_t> a4;
+    std::atomic<uint64_t> a8;
+    struct Test { bool val; };
+    std::atomic<Test> s;
+    return a1++ + a2++ + a4++ + a8++ + unsigned(s.is_lock_free());
+  }
+")
+
+# 2. 调用 try_compile
+try_compile(
+    CXX_SUPPORTS_OPTIONAL          # 结果会存入这个变量
+    ${CMAKE_BINARY_DIR}/try_compile_test # 临时构建目录
+    ${CMAKE_BINARY_DIR}/test_optional.cpp # 要编译的源文件
+
+    # 【关键】捕获编译输出，用于调试
+    OUTPUT_VARIABLE COMPILE_OUTPUT
+)
+
+# 3. 根据结果进行处理
+if(CXX_SUPPORTS_OPTIONAL)
+    message(STATUS "=------------------kindred-------------ok-----------")
+else()
+    message(STATUS "=------------------kindred-------------fail-----------")
+    message(STATUS "Detailed output:\n${COMPILE_OUTPUT}")
+endif()
+
 # Using clang with libstdc++ requires explicitly linking against libatomic
 check_cxx_source_compiles("
   #include <atomic>

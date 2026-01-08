@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-find_library(STEMMER_LIB libstemmer.a)
+#find_library(STEMMER_LIB libstemmer.a)
+find_library(STEMMER_LIB stemmer.lib)
 if("${STEMMER_LIB}" STREQUAL "STEMMER_LIB-NOTFOUND")
   set(stemmer_FOUND false)
   return()

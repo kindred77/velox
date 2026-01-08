@@ -9,7 +9,7 @@
 #define YY_DECL int facebook::velox::type::Scanner::lex(facebook::velox::type::Parser::semantic_type *yylval)
 %}
 
-%option c++ noyywrap noyylineno nodefault caseless ecs
+%option c++ noyywrap noyylineno nodefault caseless ecs nounistd
 
 A   [A|a]
 B   [B|b]

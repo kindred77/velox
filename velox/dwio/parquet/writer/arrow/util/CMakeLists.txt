@@ -28,7 +28,7 @@ velox_link_libraries(
   velox_dwio_common
   arrow
   Snappy::snappy
-  zstd::zstd
+#  zstd::zstd
   ZLIB::ZLIB
   lz4::lz4
 )

@@ -4,7 +4,7 @@
 #define YY_DECL int facebook::velox::expression::calculate::Scanner::lex(facebook::velox::expression::calculate::Parser::semantic_type *yylval)
 %}
 
-%option c++ noyywrap noyylineno nodefault
+%option c++ noyywrap noyylineno nodefault nounistd
 
 integer         ([[:digit:]]+)
 var             ([[:alpha:]][[:alnum:]_]*)

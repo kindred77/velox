@@ -367,6 +367,10 @@ if(
           )
           AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 15
         )
+      OR
+        (
+          "${CMAKE_CXX_COMPILER_ID}" STREQUAL "MSVC"
+        )
     )
 )
   message(
@@ -458,7 +462,12 @@ if(ENABLE_ALL_WARNINGS)
        ${KNOWN_COMPILER_SPECIFIC_WARNINGS}"
   )
 
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra ${KNOWN_WARNINGS}")
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall")
+  else()
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra ${KNOWN_WARNINGS}")
+  endif()
+
 endif()
 
 if(VELOX_ENABLE_WAVE OR VELOX_ENABLE_CUDF)
@@ -568,16 +577,16 @@ if(${VELOX_BUILD_MINIMAL_WITH_DWIO} OR ${VELOX_ENABLE_HIVE_CONNECTOR})
   #
   # TODO: make these optional and pluggable.
   find_package(ZLIB REQUIRED)
-  find_package(zstd REQUIRED)
+  #find_package(zstd REQUIRED)
   find_package(Snappy REQUIRED)
-  if(NOT TARGET zstd::zstd)
-    if(TARGET zstd::libzstd_static)
-      set(ZSTD_TYPE static)
-    else()
-      set(ZSTD_TYPE shared)
-    endif()
-    add_library(zstd::zstd ALIAS zstd::libzstd_${ZSTD_TYPE})
-  endif()
+  #if(NOT TARGET zstd::zstd)
+  #  if(TARGET zstd::libzstd_static)
+  #    set(ZSTD_TYPE static)
+  #  else()
+  #    set(ZSTD_TYPE shared)
+  #  endif()
+  #  add_library(zstd::zstd ALIAS zstd::libzstd_${ZSTD_TYPE})
+  #endif()
 endif()
 
 velox_set_source(re2)
@@ -718,6 +727,29 @@ endif()
 if(VELOX_ENABLE_GEO)
   velox_set_source(geos)
   velox_resolve_dependency(geos)
+endif()
+
+if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Windows")
+  add_definitions(-DGLOG_NO_ABBREVIATED_SEVERITIES)
+endif()
+
+if(MSVC)
+    string(REGEX REPLACE "/showIncludes" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+    string(REGEX REPLACE "/showIncludes" "" CMAKE_C_FLAGS "${CMAKE_C_FLAGS}")
+
+    if(MSVC_VERSION GREATER_EQUAL 1930)
+        message(STATUS "-----------kindred-----------_MSC_VER >= 1930-------")
+        add_compile_options(/Zc:preprocessor)
+        set(CMAKE_CXX_STANDARD 20)
+        set(CMAKE_CXX_STANDARD_REQUIRED ON)
+        add_compile_options(/std:c++20)
+        add_compile_options(/permissive-)
+    endif()
+
+    if(DEFINED VCPKG_CXX_FLAGS)
+      string(REGEX REPLACE "/std:c\\+\\+[0-9]+" "" VCPKG_CXX_FLAGS "${VCPKG_CXX_FLAGS}")
+      set(VCPKG_CXX_FLAGS "${VCPKG_CXX_FLAGS} /std:c++20")
+    endif()
 endif()
 
 add_subdirectory(velox)

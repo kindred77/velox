@@ -370,7 +370,11 @@ inline cppType IntDecoder<isSigned>::readLittleEndianFromBigEndian() {
         numBytes_);
     // Convert bigEndianValue to little endian value and return.
     if constexpr (sizeof(cppType) == 16) {
+      #ifdef FOLLY_HAS_INT128
       return bits::builtin_bswap128(bigEndianValue);
+      #else
+      VELOX_FAIL("Int128 is not supported");
+      #endif
     } else {
       return __builtin_bswap64(bigEndianValue);
     }
@@ -399,7 +403,11 @@ inline cppType IntDecoder<isSigned>::readLittleEndianFromBigEndian() {
       numBytes_);
   // Convert bigEndianValue to little endian value and return.
   if constexpr (sizeof(cppType) == 16) {
+    #ifdef FOLLY_HAS_INT128
     return bits::builtin_bswap128(bigEndianValue);
+    #else
+    VELOX_FAIL("Int128 is not supported");
+    #endif
   } else {
     return __builtin_bswap64(bigEndianValue);
   }
