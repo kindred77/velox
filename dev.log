@@ -36,6 +36,17 @@ call "D:\software\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcva
       -B E:\mywork\projects\cpp\velox\cmake-build-debug-vs2022
 
 
+
+  cmd.exe /c "call D:\software\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat x64 && cd /d E:\mywork\projects\cpp\velox\cmake-build-
+  debug-vs2022 && E:\software\CLion-2026.1.1.win\bin\ninja\win\x64\ninja.exe -j 4 2>&1"
+
+  等价于两步走：
+
+  1. 执行 vcvarsall.bat x64 设置 MSVC 环境
+  2. 在构建目录下运行 ninja -j 4
+
+
+
 cmd.exe /c "call `"D:\software\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat`" x64 && cd /d E:
   │ \mywork\projects\cpp\velox\cmake-build-debug-vs2022 && E:\software\CLion-2026.1.1.win\bin\ninja\win\x64\ninja.exe -j 4 2>&1"
 
