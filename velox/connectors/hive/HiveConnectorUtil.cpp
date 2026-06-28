@@ -222,7 +222,7 @@ void addSubfields(
             subscript->index(),
             0,
             "Non-positive array subscript cannot be push down");
-        maxIndex = std::max(maxIndex, std::min(kMaxIndex, subscript->index()));
+        maxIndex = std::max<int64_t>(maxIndex, std::min<int64_t>(kMaxIndex, subscript->index()));
       }
       spec.setMaxArrayElementsCount(maxIndex);
       break;

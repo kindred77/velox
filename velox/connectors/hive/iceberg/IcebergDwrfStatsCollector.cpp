@@ -111,7 +111,11 @@ std::string encodeDoubleLittleEndian(double value) {
 // complement byte array required by the Iceberg single-value spec.
 std::string encodeDecimalBigEndian(int128_t value) {
   std::array<uint8_t, 16> bytes{};
+  #ifndef _MSC_VER
   auto bits = static_cast<__uint128_t>(value);
+#else
+  auto bits = static_cast<facebook::velox::uint128_t>(value);
+#endif
   for (int32_t i = 15; i >= 0; --i) {
     bytes[i] = static_cast<uint8_t>(bits & 0xFF);
     bits >>= 8;

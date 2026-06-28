@@ -58,7 +58,8 @@ folly::dynamic extractPartitionValue(
     const VectorPtr& child,
     vector_size_t row) {
   using T = typename TypeTraits<Kind>::NativeType;
-  return child->asChecked<SimpleVector<T>>()->valueAt(row);
+  auto val = child->asChecked<SimpleVector<T>>()->valueAt(row);
+  return folly::dynamic(static_cast<int64_t>(val));
 }
 
 template <>
