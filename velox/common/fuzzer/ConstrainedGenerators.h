@@ -21,6 +21,7 @@
 #include "folly/json.h"
 
 #include "velox/common/fuzzer/Utils.h"
+#include "velox/common/memory/HashStringAllocator.h"
 #include "velox/functions/lib/QuantileDigest.h"
 #include "velox/type/Type.h"
 #include "velox/type/Variant.h"
@@ -60,6 +61,10 @@ class RandomInputGenerator : public AbstractInputGenerator {
 
     if (type_->isDate()) {
       return variant(randDate(rng_));
+    }
+    if (type_->isTime()) {
+      VELOX_DCHECK(type_->equivalent(*TIME()));
+      return variant(randTime(rng_));
     }
     return variant(rand<T>(rng_));
   }
@@ -284,7 +289,10 @@ class RandomInputGenerator<T, std::enable_if_t<std::is_same_v<T, RowType>>>
   std::vector<std::unique_ptr<AbstractInputGenerator>> fieldGenerators_;
 };
 
-template <typename T, std::enable_if_t<std::is_arithmetic_v<T>, int> = 0>
+template <
+    typename T,
+    std::enable_if_t<std::is_arithmetic_v<T> || std::is_same_v<T, int128_t>, int> =
+        0>
 class RangeConstrainedGenerator : public AbstractInputGenerator {
  public:
   RangeConstrainedGenerator(
@@ -377,7 +385,20 @@ class JsonInputGenerator : public AbstractInputGenerator {
     using T = typename TypeTraits<KIND>::DeepCopiedType;
     VELOX_CHECK(v.isSet());
     const T value = v.value<T>();
-    return folly::dynamic(value);
+    // folly::dynamic has no constructor for velox's 128-bit integer type,
+    // which is a class on Windows/MSVC. Store it as int64_t to match folly's
+    // behavior for the native __int128 on other platforms.
+    if constexpr (std::is_same_v<T, int128_t>) {
+      return folly::dynamic(static_cast<int64_t>(value));
+    } else if constexpr (std::is_same_v<T, Timestamp>) {
+      // Timestamp defines several implicit conversion operators (folly::dynamic,
+      // std::string, StringView); MSVC cannot disambiguate the function-style
+      // cast, so invoke the conversion explicitly. This stores the seconds,
+      // matching Timestamp::operator folly::dynamic().
+      return folly::dynamic(value.getSeconds());
+    } else {
+      return folly::dynamic(value);
+    }
   }
 
   // Presto and Velox JSON parser have different behavior for floating point
@@ -525,6 +546,23 @@ class TDigestInputGenerator : public AbstractInputGenerator {
   ~TDigestInputGenerator() override;
 
   variant generate() override;
+};
+
+class SetDigestInputGenerator : public AbstractInputGenerator {
+ public:
+  SetDigestInputGenerator(size_t seed, const TypePtr& type, double nullRatio);
+
+  ~SetDigestInputGenerator() override;
+
+  variant generate() override;
+
+ private:
+  template <typename T>
+  variant generateTyped();
+
+  TypePtr baseType_;
+  std::shared_ptr<memory::MemoryPool> pool_;
+  std::unique_ptr<HashStringAllocator> allocator_;
 };
 
 class BingTileInputGenerator : public AbstractInputGenerator {

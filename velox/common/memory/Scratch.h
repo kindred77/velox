@@ -79,14 +79,17 @@ class Scratch {
     // stringop-overflow warning when 'newCapacity' is 0.
     folly::assume(capacity_ >= 0);
     if (newCapacity > capacity_) {
-      Item* newItems =
-          reinterpret_cast<Item*>(::malloc(sizeof(Item) * newCapacity));
+      auto* newItems =
+          reinterpret_cast<uint8_t*>(::malloc(sizeof(Item) * newCapacity));
       if (fill_ > 0) {
         ::memcpy(newItems, items_, fill_ * sizeof(Item));
       }
-      ::memset(newItems + fill_, 0, (newCapacity - fill_) * sizeof(Item));
+      ::memset(
+          newItems + fill_ * sizeof(Item),
+          0,
+          (newCapacity - fill_) * sizeof(Item));
       ::free(items_);
-      items_ = newItems;
+      items_ = reinterpret_cast<Item*>(newItems);
       capacity_ = newCapacity;
     }
     fill_ = std::min(fill_, newCapacity);
@@ -156,7 +159,7 @@ class ScratchPtr {
   raw_vector<char> data_;
   T* ptr_{nullptr};
   int32_t size_{0};
-  T inline_[inlineSize];
+  T inline_[inlineSize == 0 ? 1 : inlineSize];
   char padding_[inlineSize == 0 ? 0 : simd::kPadding];
 };
 

@@ -16,10 +16,16 @@
 
 #pragma once
 
+#include <folly/container/F14Set.h>
 #include <limits>
+#include <string>
+#include <unordered_map>
 #include <unordered_set>
+#include <utility>
+#include <vector>
 
 #include <folly/Executor.h>
+#include "velox/common/EnumDeclare.h"
 #include "velox/common/base/RandomUtil.h"
 #include "velox/common/base/SpillConfig.h"
 #include "velox/common/compression/Compression.h"
@@ -31,11 +37,19 @@
 #include "velox/dwio/common/FlatMapHelper.h"
 #include "velox/dwio/common/FlushPolicy.h"
 #include "velox/dwio/common/InputStream.h"
+#include "velox/dwio/common/ParquetFieldId.h"
 #include "velox/dwio/common/ScanSpec.h"
 #include "velox/dwio/common/UnitLoader.h"
 #include "velox/dwio/common/encryption/Encryption.h"
 #include "velox/type/Timestamp.h"
 #include "velox/type/tz/TimeZoneMap.h"
+
+namespace facebook::velox {
+struct FileHandle;
+namespace cache {
+class AsyncDataCache;
+} // namespace cache
+} // namespace facebook::velox
 
 namespace facebook::velox::dwio::common {
 
@@ -51,17 +65,82 @@ enum class FileFormat {
   NIMBLE = 8,
   ORC = 9,
   SST = 10, // rocksdb sst format
+  FLUX = 11,
+  AVRO = 12,
+  PUFFIN =
+      13, // Iceberg V3 Puffin blob container (e.g. deletion vectors).
+          // Not consumed by dwio::ReaderFactory; read directly by the
+          // Iceberg connector via FileSystem::pread of the blob byte-range.
 };
 
-FileFormat toFileFormat(std::string_view s);
-std::string_view toString(FileFormat fmt);
+VELOX_DECLARE_ENUM_NAME(FileFormat);
 
-FOLLY_ALWAYS_INLINE std::ostream& operator<<(
-    std::ostream& output,
-    const FileFormat& fmt) {
-  output << toString(fmt);
-  return output;
-}
+FileFormat toFileFormat(std::string_view s);
+
+/// Returns a format-scoped config prefix using the file format's canonical
+/// string token. For example, PARQUET with "." returns "parquet.", while
+/// PARQUET with "_" returns "parquet_".
+std::string formatConfigPrefix(FileFormat fmt, std::string_view separator);
+
+/// Controls how a reader maps the requested table schema to physical file
+/// columns.
+enum class ColumnMappingMode {
+  /// Match columns by physical position. This is the default and keeps legacy
+  /// behavior for formats and callers that rely on ordinal schema matching.
+  kPosition,
+
+  /// Match columns by field name. This supports files whose physical column
+  /// order differs from the requested schema, as long as the relevant names
+  /// are stable and present in the file schema.
+  kName,
+
+  /// Matches physical Parquet fields to requested columns by Parquet field_id.
+  ///
+  /// Use this mode for table formats, such as Iceberg, where a column's
+  /// identity is its field ID rather than its name or ordinal position. This
+  /// allows the reader to handle schema evolution where columns are renamed,
+  /// reordered, deleted, or added back later with the same name but a different
+  /// type.
+  ///
+  /// The caller must provide ReaderOptions::parquetFieldIds() ordered to match
+  /// ReaderOptions::fileSchema() at every row-typed level. Each ParquetFieldId
+  /// entry describes the table field ID for the corresponding requested column,
+  /// and nested children describe field IDs below structs, arrays, and maps.
+  ///
+  /// Physical Parquet schema nodes that do not have field_id metadata are
+  /// treated as having a missing field ID and therefore do not match positive
+  /// Iceberg field IDs. This is expected for legacy Hive-style Parquet files or
+  /// files written by producers that do not preserve field IDs. In that case,
+  /// kParquetFieldId can still be used, but any requested positive field ID
+  /// without a matching physical field is read as missing and is materialized
+  /// by the connector as null or as the table format's default value. Use kName
+  /// or kPosition instead when reading files whose schema identity must come
+  /// from names or positions.
+  ///
+  /// This is Parquet-specific. Readers for other formats should reject this
+  /// mode instead of interpreting it as a generic column identity mechanism.
+  kParquetFieldId,
+
+  /// Matches physical fields to requested columns by Iceberg field id carried
+  /// as per-type string attributes ("iceberg.id") in the file schema.
+  ///
+  /// Use this mode for DWRF/ORC files written for Iceberg, where a column's
+  /// identity is its field id rather than its name or position. Unlike
+  /// kParquetFieldId (which reads physical Parquet field_id metadata), this
+  /// mode
+  /// reads the ORC-spec attribute convention that DWRF/ORC writers stamp onto
+  /// each schema node. The caller provides ReaderOptions::fieldIds() describing
+  /// the requested (table) schema's field ids, aligned to fileSchema() at every
+  /// row-typed level. The reader renames the file's columns to the requested
+  /// names that share their field id, so a downstream name-based read resolves
+  /// renames, reorders, deletions, and drop/re-add-with-same-name correctly.
+  /// Physical nodes without an "iceberg.id" attribute do not match any positive
+  /// requested field id and are surfaced as missing (the connector materializes
+  /// them as null or the table format's default value).
+  kFieldId,
+};
+
+VELOX_DECLARE_ENUM_NAME(ColumnMappingMode);
 
 /// Formatting options for serialization.
 enum class SerDeSeparator {
@@ -147,8 +226,15 @@ struct RowNumberColumnInfo {
   std::string name;
 };
 
+/// Carries format-owned reader and writer options through the common reader
+/// interfaces.
 class FormatSpecificOptions {
  public:
+  FormatSpecificOptions() = default;
+  FormatSpecificOptions(const FormatSpecificOptions&) = default;
+  FormatSpecificOptions& operator=(const FormatSpecificOptions&) = default;
+  FormatSpecificOptions(FormatSpecificOptions&&) = default;
+  FormatSpecificOptions& operator=(FormatSpecificOptions&&) = default;
   virtual ~FormatSpecificOptions() = default;
 };
 
@@ -282,6 +368,22 @@ class RowReaderOptions {
     scanSpec_ = std::move(scanSpec);
   }
 
+  folly::Executor* ioExecutor() const {
+    return ioExecutor_;
+  }
+
+  void setIOExecutor(folly::Executor* const ioExecutor) {
+    ioExecutor_ = ioExecutor;
+  }
+
+  size_t parallelUnitLoadCount() const {
+    return parallelUnitLoadCount_;
+  }
+
+  void setParallelUnitLoadCount(size_t parallelUnitLoadCount) {
+    parallelUnitLoadCount_ = parallelUnitLoadCount;
+  }
+
   const std::shared_ptr<velox::common::MetadataFilter>& metadataFilter() const {
     return metadataFilter_;
   }
@@ -296,8 +398,8 @@ class RowReaderOptions {
           flatmapNodeIdsAsStruct) {
     VELOX_CHECK(
         std::all_of(
-            flatmapNodeIdsAsStruct.begin(),
-            flatmapNodeIdsAsStruct.end(),
+            flatmapNodeIdsAsStruct.cbegin(),
+            flatmapNodeIdsAsStruct.cend(),
             [](const auto& kv) { return !kv.second.empty(); }),
         "To use struct encoding for flatmap, keys to project must be specified");
     flatmapNodeIdAsStruct_ = std::move(flatmapNodeIdsAsStruct);
@@ -432,8 +534,68 @@ class RowReaderOptions {
     return trackRowSize_;
   }
 
-  void setTrackRowSize(bool value) {
-    trackRowSize_ = value;
+  void setTrackRowSize(bool trackRowSize) {
+    trackRowSize_ = trackRowSize;
+  }
+
+  bool indexEnabled() const {
+    return indexEnabled_;
+  }
+
+  /// Sets whether to use the cluster index for filter-based row pruning.
+  /// When enabled, filters from ScanSpec are converted to index bounds for
+  /// efficient row skipping based on the file's cluster index.
+  ///
+  /// NOTE: currently only supported by Nimble format.
+  void setIndexEnabled(bool enabled) {
+    indexEnabled_ = enabled;
+  }
+
+  bool stringDecoderZeroCopy() const {
+    return stringDecoderZeroCopy_;
+  }
+
+  void setStringDecoderZeroCopy(bool stringDecoderZeroCopy) {
+    stringDecoderZeroCopy_ = stringDecoderZeroCopy;
+  }
+
+  bool nimblePreserveDictionaryEncoding() const {
+    return nimblePreserveDictionaryEncoding_;
+  }
+
+  void setNimblePreserveDictionaryEncoding(bool value) {
+    nimblePreserveDictionaryEncoding_ = value;
+  }
+
+  bool lazyColumnIo() const {
+    return lazyColumnIo_;
+  }
+
+  void setLazyColumnIo(bool lazyColumnIo) {
+    lazyColumnIo_ = lazyColumnIo;
+  }
+
+  const folly::F14FastSet<std::string>& remainingFilterColumns() const {
+    return remainingFilterColumns_;
+  }
+
+  void setRemainingFilterColumns(
+      const folly::F14FastSet<std::string>& columns) {
+    remainingFilterColumns_ = columns;
+  }
+
+  bool collectColumnCpuMetrics() const {
+    return collectColumnCpuMetrics_;
+  }
+
+  RowReaderOptions& setCollectColumnCpuMetrics(bool collect) {
+    collectColumnCpuMetrics_ = collect;
+    return *this;
+  }
+
+  // Legacy alias — remove after Nimble OSS bumps Velox.
+  RowReaderOptions& setCollectColumnStats(bool collect) {
+    return setCollectColumnCpuMetrics(collect);
   }
 
  private:
@@ -442,6 +604,7 @@ class RowReaderOptions {
   bool preloadStripe_;
   bool projectSelectedType_;
   bool returnFlatVector_ = false;
+  size_t parallelUnitLoadCount_ = 0;
   ErrorTolerance errorTolerance_;
   std::shared_ptr<ColumnSelector> selector_;
   RowTypePtr requestedType_;
@@ -454,7 +617,8 @@ class RowReaderOptions {
   // Whether to generate FlatMapVectors when reading flat maps from the file. By
   // default, converts flat maps in the file to MapVectors.
   bool preserveFlatMapsInMemory_ = false;
-
+  // Optional io executor to enable parallel unit loader.
+  folly::Executor* ioExecutor_{nullptr};
   // Optional executors to enable internal reader parallelism.
   // 'decodingExecutor' allow parallelising the vector decoding process.
   // 'ioExecutor' enables parallelism when performing file system read
@@ -494,25 +658,41 @@ class RowReaderOptions {
 
   std::shared_ptr<FormatSpecificOptions> formatSpecificOptions_;
   bool trackRowSize_{false};
+  bool indexEnabled_{false};
+  // Enables zero-copy string decoding in the Nimble selective reader,
+  // using the non-legacy encoding path. Controlled via session property.
+  bool stringDecoderZeroCopy_{false};
+  // Controls whether dictionary-encoded Nimble string columns return
+  // DictionaryVector instead of FlatVector.
+  bool nimblePreserveDictionaryEncoding_{false};
+  // Defers I/O for projected columns without pushdown or remaining filters.
+  bool lazyColumnIo_{false};
+  folly::F14FastSet<std::string> remainingFilterColumns_;
+  bool collectColumnCpuMetrics_{false};
 };
 
 /// Options for creating a Reader.
 class ReaderOptions : public io::ReaderOptions {
  public:
-  static constexpr uint64_t kDefaultFooterEstimatedSize = 1024 * 1024; // 1MB
+  static constexpr uint64_t kDefaultFooterSpeculativeIoSize =
+      1024 * 1024; // 1MB
   static constexpr uint64_t kDefaultFilePreloadThreshold =
       1024 * 1024 * 8; // 8MB
 
   explicit ReaderOptions(velox::memory::MemoryPool* pool)
-      : io::ReaderOptions(pool),
-        tailLocation_(std::numeric_limits<uint64_t>::max()),
-        fileFormat_(FileFormat::UNKNOWN),
-        fileSchema_(nullptr) {}
+      : io::ReaderOptions(pool) {}
 
   /// Sets the format of the file, such as "rc" or "dwrf". The default is
   /// "dwrf".
   ReaderOptions& setFileFormat(FileFormat format) {
     fileFormat_ = format;
+    return *this;
+  }
+
+  /// Sets the property bag.
+  ReaderOptions& setProperties(
+      std::unordered_map<std::string, std::string> properties) {
+    properties_ = std::move(properties);
     return *this;
   }
 
@@ -544,11 +724,10 @@ class ReaderOptions : public io::ReaderOptions {
     return *this;
   }
 
-  ReaderOptions& setFooterEstimatedSize(uint64_t size) {
-    footerEstimatedSize_ = size;
+  ReaderOptions& setFooterSpeculativeIoSize(uint64_t size) {
+    footerSpeculativeIoSize_ = size;
     return *this;
   }
-
   ReaderOptions& setFilePreloadThreshold(uint64_t threshold) {
     filePreloadThreshold_ = threshold;
     return *this;
@@ -559,13 +738,16 @@ class ReaderOptions : public io::ReaderOptions {
     return *this;
   }
 
-  ReaderOptions& setUseColumnNamesForColumnMapping(bool flag) {
-    useColumnNamesForColumnMapping_ = flag;
+  ReaderOptions& setColumnMappingMode(ColumnMappingMode mode) {
+    columnMappingMode_ = mode;
     return *this;
   }
 
-  ReaderOptions& setIOExecutor(std::shared_ptr<folly::Executor> executor) {
-    ioExecutor_ = std::move(executor);
+  /// Sets the requested (table) schema field ids for
+  /// ColumnMappingMode::kFieldId, one ParquetFieldId tree per top-level column,
+  /// aligned to fileSchema().
+  ReaderOptions& setFieldIds(std::vector<ParquetFieldId> fieldIds) {
+    fieldIds_ = std::move(fieldIds);
     return *this;
   }
 
@@ -589,9 +771,28 @@ class ReaderOptions : public io::ReaderOptions {
     return fileFormat_;
   }
 
+  /// Gets the property bag.
+  const std::unordered_map<std::string, std::string>& properties() const {
+    return properties_;
+  }
+
+  const std::shared_ptr<FormatSpecificOptions>& formatSpecificOptions() const {
+    return formatSpecificOptions_;
+  }
+
+  void setFormatSpecificOptions(
+      std::shared_ptr<FormatSpecificOptions> options) {
+    formatSpecificOptions_ = std::move(options);
+  }
+
   /// Gets the file schema.
   const std::shared_ptr<const velox::RowType>& fileSchema() const {
     return fileSchema_;
+  }
+
+  /// Gets the requested schema field ids for ColumnMappingMode::kFieldId.
+  const std::vector<ParquetFieldId>& fieldIds() const {
+    return fieldIds_;
   }
 
   SerDeOptions& serDeOptions() {
@@ -606,16 +807,12 @@ class ReaderOptions : public io::ReaderOptions {
     return decrypterFactory_;
   }
 
-  uint64_t footerEstimatedSize() const {
-    return footerEstimatedSize_;
+  uint64_t footerSpeculativeIoSize() const {
+    return footerSpeculativeIoSize_;
   }
 
   uint64_t filePreloadThreshold() const {
     return filePreloadThreshold_;
-  }
-
-  const std::shared_ptr<folly::Executor>& ioExecutor() const {
-    return ioExecutor_;
   }
 
   const tz::TimeZone* sessionTimezone() const {
@@ -630,8 +827,8 @@ class ReaderOptions : public io::ReaderOptions {
     return fileColumnNamesReadAsLowerCase_;
   }
 
-  bool useColumnNamesForColumnMapping() const {
-    return useColumnNamesForColumnMapping_;
+  ColumnMappingMode columnMappingMode() const {
+    return columnMappingMode_;
   }
 
   const std::shared_ptr<random::RandomSkipTracker>& randomSkip() const {
@@ -642,12 +839,12 @@ class ReaderOptions : public io::ReaderOptions {
     randomSkip_ = std::move(randomSkip);
   }
 
-  bool noCacheRetention() const {
-    return noCacheRetention_;
+  bool cacheable() const {
+    return cacheable_;
   }
 
-  void setNoCacheRetention(bool noCacheRetention) {
-    noCacheRetention_ = noCacheRetention;
+  void setCacheable(bool cacheable) {
+    cacheable_ = cacheable;
   }
 
   const std::shared_ptr<velox::common::ScanSpec>& scanSpec() const {
@@ -666,6 +863,96 @@ class ReaderOptions : public io::ReaderOptions {
     selectiveNimbleReaderEnabled_ = value;
   }
 
+  /// Whether to cache file metadata (footer, stripes, index) in the
+  /// process-wide AsyncDataCache. When enabled, the first reader performs a
+  /// speculative tail read and populates the cache; subsequent readers on the
+  /// same file initialize from the cache with zero additional IO.
+  bool cacheMetadata() const {
+    return cacheMetadata_;
+  }
+
+  void setCacheMetadata(bool value) {
+    cacheMetadata_ = value;
+  }
+
+  /// If true, pins parsed metadata objects (e.g., StripeGroup, IndexGroup) in
+  /// the reader's metadata cache with strong references so they are never
+  /// evicted. This avoids re-reading and re-parsing metadata on every stripe
+  /// access when weak-pointer cache entries would otherwise expire. Works
+  /// independently of cacheMetadata.
+  bool pinMetadata() const {
+    return pinMetadata_;
+  }
+
+  void setPinMetadata(bool value) {
+    pinMetadata_ = value;
+  }
+
+  /// If true, caches index data (e.g., cluster index key stream) in the
+  /// async data cache.
+  bool cacheIndex() const {
+    return cacheIndex_;
+  }
+
+  void setCacheIndex(bool value) {
+    cacheIndex_ = value;
+  }
+
+  /// If true, pins parsed index objects in the reader's index cache with
+  /// strong references so they are never evicted. Works independently of
+  /// cacheIndex.
+  bool pinIndex() const {
+    return pinIndex_;
+  }
+
+  void setPinIndex(bool value) {
+    pinIndex_ = value;
+  }
+
+  /// If true, caches data column reads in the async data cache. Default false
+  /// keeps the cache scoped to metadata/index only.
+  bool cacheData() const {
+    return cacheData_;
+  }
+
+  void setCacheData(bool value) {
+    cacheData_ = value;
+  }
+
+  /// Whether to load and initialize the cluster index during file open.
+  /// When true, the cluster index section is preloaded and the structured
+  /// ClusterIndex object is created. Default false.
+  bool loadClusterIndex() const {
+    return loadClusterIndex_;
+  }
+
+  void setLoadClusterIndex(bool value) {
+    loadClusterIndex_ = value;
+  }
+
+  /// Whether to eagerly preload all per-partition metadata and decode all
+  /// per-partition key streams during file open. Only effective when
+  /// loadClusterIndex() is also true. Implies pinning so preloaded chunks
+  /// are not evicted on first lookup. Default false.
+  bool preloadIndex() const {
+    return preloadIndex_;
+  }
+
+  void setPreloadIndex(bool value) {
+    preloadIndex_ = value;
+  }
+
+  /// Whether to load and initialize the chunk index during file open.
+  /// When true, the chunk index section is preloaded and the structured
+  /// ChunkIndex object is created. Default true.
+  bool loadChunkIndex() const {
+    return loadChunkIndex_;
+  }
+
+  void setLoadChunkIndex(bool value) {
+    loadChunkIndex_ = value;
+  }
+
   bool allowEmptyFile() const {
     return allowEmptyFile_;
   }
@@ -674,23 +961,60 @@ class ReaderOptions : public io::ReaderOptions {
     allowEmptyFile_ = value;
   }
 
+  /// File handle providing the cache key (uuid) for metadata caching in
+  /// Nimble's TabletReader. The pointer is only dereferenced during reader
+  /// construction to extract the uuid; it does not need to outlive the
+  /// reader factory call.
+  const FileHandle* fileHandle() const {
+    return fileHandle_;
+  }
+
+  void setFileHandle(const FileHandle* handle) {
+    fileHandle_ = handle;
+  }
+
+  /// Process-wide async data cache for Nimble metadata caching. When both
+  /// fileHandle and cache are set, TabletReader creates a
+  /// CachedMetadataInput that caches decompressed footer, stripes, and
+  /// index metadata across readers on the same file.
+  cache::AsyncDataCache* cache() const {
+    return cache_;
+  }
+
+  void setCache(cache::AsyncDataCache* cache) {
+    VELOX_CHECK_NOT_NULL(cache);
+    cache_ = cache;
+  }
+
  private:
-  uint64_t tailLocation_;
-  FileFormat fileFormat_;
+  uint64_t tailLocation_{std::numeric_limits<uint64_t>::max()};
+  FileFormat fileFormat_{FileFormat::UNKNOWN};
   RowTypePtr fileSchema_;
+  std::vector<ParquetFieldId> fieldIds_;
   SerDeOptions serDeOptions_;
+  std::unordered_map<std::string, std::string> properties_{};
+  std::shared_ptr<FormatSpecificOptions> formatSpecificOptions_;
   std::shared_ptr<encryption::DecrypterFactory> decrypterFactory_;
-  uint64_t footerEstimatedSize_{kDefaultFooterEstimatedSize};
+  uint64_t footerSpeculativeIoSize_{kDefaultFooterSpeculativeIoSize};
   uint64_t filePreloadThreshold_{kDefaultFilePreloadThreshold};
   bool fileColumnNamesReadAsLowerCase_{false};
-  bool useColumnNamesForColumnMapping_{false};
-  std::shared_ptr<folly::Executor> ioExecutor_;
+  ColumnMappingMode columnMappingMode_{ColumnMappingMode::kPosition};
   std::shared_ptr<random::RandomSkipTracker> randomSkip_;
   std::shared_ptr<velox::common::ScanSpec> scanSpec_;
   const tz::TimeZone* sessionTimezone_{nullptr};
   bool adjustTimestampToTimezone_{false};
   bool selectiveNimbleReaderEnabled_{false};
+  bool cacheMetadata_{false};
+  bool pinMetadata_{false};
+  bool cacheIndex_{false};
+  bool pinIndex_{false};
+  bool cacheData_{true};
+  bool loadClusterIndex_{false};
+  bool preloadIndex_{false};
+  bool loadChunkIndex_{true};
   bool allowEmptyFile_{false};
+  const FileHandle* fileHandle_{nullptr};
+  cache::AsyncDataCache* cache_{nullptr};
 };
 
 struct WriterOptions {
@@ -711,9 +1035,11 @@ struct WriterOptions {
   std::map<std::string, std::string> serdeParameters;
   std::function<std::unique_ptr<dwio::common::FlushPolicy>()>
       flushPolicyFactory;
+  uint64_t maxTargetFileSizeBytes{0};
 
   std::string sessionTimezoneName;
   bool adjustTimestampToTimezone{false};
+  std::shared_ptr<FormatSpecificOptions> formatSpecificOptions;
 
   // WriterOption implementations can implement this function to specify how to
   // process format-specific session and connector configs.
@@ -726,9 +1052,8 @@ struct WriterOptions {
 
 // Options for creating a column reader.
 struct ColumnReaderOptions {
-  // Whether to map table field names to file field names using names, not
-  // indices.
-  bool useColumnNamesForColumnMapping_{false};
+  /// How to map table fields to file fields.
+  ColumnMappingMode columnMappingMode_{ColumnMappingMode::kPosition};
 };
 
 ColumnReaderOptions makeColumnReaderOptions(const ReaderOptions& options);
@@ -742,6 +1067,19 @@ struct fmt::formatter<facebook::velox::dwio::common::FileFormat>
   auto format(facebook::velox::dwio::common::FileFormat fmt, FormatContext& ctx)
       const {
     return formatter<std::string_view>::format(
-        facebook::velox::dwio::common::toString(fmt), ctx);
+        facebook::velox::dwio::common::FileFormatName::toName(fmt), ctx);
+  }
+};
+
+template <>
+struct fmt::formatter<facebook::velox::dwio::common::ColumnMappingMode>
+    : fmt::formatter<std::string_view> {
+  template <typename FormatContext>
+  auto format(
+      facebook::velox::dwio::common::ColumnMappingMode mode,
+      FormatContext& ctx) const {
+    return formatter<std::string_view>::format(
+        facebook::velox::dwio::common::ColumnMappingModeName::toName(mode),
+        ctx);
   }
 };

@@ -12,12 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-velox_add_library(velox_exception Exceptions.cpp VeloxException.cpp Exceptions.h)
+velox_add_library(
+  velox_exception
+  Exceptions.cpp
+  VeloxException.cpp
+  Exceptions.h
+  HEADERS
+  FmtStdFormatters.h
+  VeloxException.h
+)
 velox_link_libraries(
   velox_exception
   PUBLIC velox_flag_definitions velox_process Folly::folly fmt::fmt gflags::gflags glog::glog
 )
 
+include_directories(${FLEX_INCLUDE_DIRS})
 velox_add_library(
   velox_common_base
   AdmissionController.cpp
@@ -30,10 +39,49 @@ velox_add_library(
   SimdUtil.cpp
   SkewedPartitionBalancer.cpp
   SpillConfig.cpp
-  SpillStats.cpp
+  SplitBlockBloomFilter.cpp
   StatsReporter.cpp
   SuccinctPrinter.cpp
-  TraceConfig.cpp
+  YyFlexLexerShim.cpp
+  HEADERS
+  AdmissionController.h
+  BitSet.h
+  BitUtil.h
+  BloomFilter.h
+  CheckedArithmetic.h
+  ClassName.h
+  CoalesceIo.h
+  ConcurrentCounter.h
+  CountBits.h
+  Counters.h
+  Crc.h
+  Doubles.h
+  Fs.h
+  GTestMacros.h
+  IOUtils.h
+  IndexedPriorityQueue.h
+  IoCounter.h
+  Nulls.h
+  PeriodicStatsReporter.h
+  Pointers.h
+  Portability.h
+  PrefixSortConfig.h
+  RandomUtil.h
+  Range.h
+  RuntimeMetrics.h
+  ScopedLock.h
+  SelectivityInfo.h
+  Semaphore.h
+  SimdUtil-inl.h
+  SimdUtil.h
+  SkewedPartitionBalancer.h
+  SortingNetwork.h
+  SpillConfig.h
+  SplitBlockBloomFilter.h
+  StatsReporter.h
+  SuccinctPrinter.h
+  TreeOfLosers.h
+  XxHashInline.h
 )
 
 velox_link_libraries(
@@ -50,7 +98,7 @@ if(${VELOX_ENABLE_BENCHMARKS})
   add_subdirectory(benchmarks)
 endif()
 
-velox_add_library(velox_id_map BigintIdMap.cpp)
+velox_add_library(velox_id_map BigintIdMap.cpp HEADERS BigintIdMap.h)
 velox_link_libraries(
   velox_id_map
   velox_memory
@@ -61,5 +109,20 @@ velox_link_libraries(
   fmt::fmt
 )
 
-velox_add_library(velox_status Status.cpp)
+velox_add_library(velox_status Status.cpp HEADERS Status.h)
 velox_link_libraries(velox_status PUBLIC fmt::fmt Folly::folly PRIVATE glog::glog)
+
+velox_add_library(velox_compare_flags INTERFACE HEADERS CompareFlags.h)
+
+velox_add_library(velox_macros INTERFACE HEADERS Macros.h)
+
+velox_add_library(velox_async_source INTERFACE HEADERS AsyncSource.h)
+
+velox_add_library(velox_lazy_cpu_thread_pool_executor INTERFACE HEADERS LazyCPUThreadPoolExecutor.h)
+
+velox_add_library(velox_exception_helper INTERFACE HEADERS ExceptionHelper.h)
+
+# Add Windows-specific glog defines
+if(WIN32)
+  velox_compile_definitions(velox_status PRIVATE GLOG_USE_GLOG_EXPORT)
+endif()

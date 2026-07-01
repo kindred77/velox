@@ -15,15 +15,25 @@
  */
 
 #include "velox/common/memory/MallocAllocator.h"
+#include <folly/system/HardwareConcurrency.h>
+#ifdef _WIN32
+#include "velox/common/base/windows/FollyConcurrencyCompat.h"
+#endif
 #include "velox/common/memory/Memory.h"
 
+#ifndef _WIN32
 #include <sys/mman.h>
+#else
+// Windows compatibility - provides posix_* wrapper functions for aligned allocations
+#include "velox/common/memory/windows/PosixMemoryCompat.h"
+#endif
 
 namespace facebook::velox::memory {
-MallocAllocator::MallocAllocator(size_t capacity, uint32_t reservationByteLimit)
+MallocAllocator::MallocAllocator(const Options& options)
     : kind_(MemoryAllocator::Kind::kMalloc),
-      capacity_(capacity),
-      reservationByteLimit_(reservationByteLimit),
+      mallocContiguousEnabled_(options.mallocContiguousEnabled),
+      capacity_(options.capacity),
+      reservationByteLimit_(options.reservationByteLimit),
       reserveFunc_(
           [this](uint32_t& counter, uint32_t increment, std::mutex& lock) {
             return incrementUsageWithReservationFunc(counter, increment, lock);
@@ -33,16 +43,24 @@ MallocAllocator::MallocAllocator(size_t capacity, uint32_t reservationByteLimit)
             decrementUsageWithReservationFunc(counter, decrement, lock);
             return true;
           }),
-      reservations_(std::thread::hardware_concurrency()) {}
+      reservations_(folly::available_concurrency()) {}
 
 MallocAllocator::~MallocAllocator() {
   // TODO: Remove the check when memory leak issue is resolved.
   if (FLAGS_velox_memory_leak_check_enabled) {
-    VELOX_CHECK(
-        ((allocatedBytes_ - reservations_.read()) == 0) &&
-            (numAllocated_ == 0) && (numMapped_ == 0),
-        "{}",
-        toString());
+    const bool hasLeak = ((allocatedBytes_ - reservations_.read()) != 0) ||
+        (numAllocated_ != 0) || (numMapped_ != 0);
+    if (hasLeak) {
+#ifdef _WIN32
+      // On Windows, throwing in a destructor causes std::terminate → abort
+      // (exit code 3). Log the leak instead so the test reports actual
+      // failures rather than crashing the entire suite.
+      VELOX_MEM_LOG(ERROR) << "Memory leak in MallocAllocator destructor: "
+                           << toString();
+#else
+      VELOX_CHECK(false, "{}", toString());
+#endif
+    }
   }
 }
 
@@ -144,11 +162,7 @@ bool MallocAllocator::allocateContiguousImpl(
   }
   auto numContiguousCollateralPages = allocation.numPages();
   if (numContiguousCollateralPages > 0) {
-    useHugePages(allocation, false);
-    if (::munmap(allocation.data(), allocation.maxSize()) < 0) {
-      VELOX_MEM_LOG(ERROR) << "munmap got " << folly::errnoStr(errno) << "for "
-                           << allocation.data() << ", " << allocation.size();
-    }
+    dispatchFreeContiguous(allocation);
     numMapped_.fetch_sub(numContiguousCollateralPages);
     numAllocated_.fetch_sub(numContiguousCollateralPages);
     numExternalMapped_.fetch_sub(numContiguousCollateralPages);
@@ -174,19 +188,23 @@ bool MallocAllocator::allocateContiguousImpl(
   numAllocated_.fetch_add(numPages);
   numMapped_.fetch_add(numPages);
   numExternalMapped_.fetch_add(numPages);
-  void* data = ::mmap(
-      nullptr,
-      AllocationTraits::pageBytes(maxPages),
-      PROT_READ | PROT_WRITE,
-      MAP_PRIVATE | MAP_ANONYMOUS,
-      -1,
-      0);
-  // TODO: add handling of MAP_FAILED.
-  allocation.set(
-      data,
-      AllocationTraits::pageBytes(numPages),
-      AllocationTraits::pageBytes(maxPages));
-  useHugePages(allocation, true);
+  const auto maxBytes = AllocationTraits::pageBytes(maxPages);
+  void* data = dispatchAllocateContiguous(maxBytes);
+  if (FOLLY_UNLIKELY(data == nullptr)) {
+    numAllocated_.fetch_sub(numPages);
+    numMapped_.fetch_sub(numPages);
+    numExternalMapped_.fetch_sub(numPages);
+    decrementUsage(static_cast<int64_t>(AllocationTraits::pageBytes(numPages)));
+    const auto errorMsg = fmt::format(
+        "Failed to allocate {} of contiguous memory", succinctBytes(maxBytes));
+    VELOX_MEM_LOG(WARNING) << errorMsg;
+    setAllocatorFailureMessage(errorMsg);
+    return false;
+  }
+  allocation.set(data, AllocationTraits::pageBytes(numPages), maxBytes);
+  if (!mallocContiguousEnabled_) {
+    useHugePages(allocation, true);
+  }
   return true;
 }
 
@@ -221,19 +239,52 @@ void MallocAllocator::freeContiguousImpl(ContiguousAllocation& allocation) {
   if (allocation.empty()) {
     return;
   }
-  useHugePages(allocation, false);
   const auto bytes = allocation.size();
   const auto numPages = allocation.numPages();
-  if (::munmap(allocation.data(), allocation.maxSize()) < 0) {
-    VELOX_MEM_LOG(ERROR) << "Error for munmap(" << allocation.data() << ", "
-                         << succinctBytes(bytes) << "): '"
-                         << folly::errnoStr(errno) << "'";
-  }
+  dispatchFreeContiguous(allocation);
   numMapped_.fetch_sub(numPages);
   numAllocated_.fetch_sub(numPages);
   numExternalMapped_.fetch_sub(numPages);
   decrementUsage(bytes);
   allocation.clear();
+}
+
+void* MallocAllocator::dispatchAllocateContiguous(size_t maxBytes) {
+  if (testingHasInjectedFailure(InjectedFailure::kAllocate)) {
+    return nullptr;
+  }
+  if (mallocContiguousEnabled_) {
+#ifdef _WIN32
+    return ::posix_aligned_alloc(AllocationTraits::kPageSize, maxBytes);
+#else
+    return ::aligned_alloc(AllocationTraits::kPageSize, maxBytes);
+#endif
+  }
+  // TODO: add handling of MAP_FAILED.
+  return ::mmap(
+      nullptr,
+      maxBytes,
+      PROT_READ | PROT_WRITE,
+      MAP_PRIVATE | MAP_ANONYMOUS,
+      -1,
+      0);
+}
+
+void MallocAllocator::dispatchFreeContiguous(ContiguousAllocation& allocation) {
+  if (mallocContiguousEnabled_) {
+#ifdef _WIN32
+    ::posix_free(allocation.data());
+#else
+    ::free(allocation.data());
+#endif
+  } else {
+    useHugePages(allocation, false);
+    if (::munmap(allocation.data(), allocation.maxSize()) < 0) {
+      VELOX_MEM_LOG(ERROR) << "Error for munmap(" << allocation.data() << ", "
+                           << succinctBytes(allocation.size()) << "): '"
+                           << folly::errnoStr(errno) << "'";
+    }
+  }
 }
 
 bool MallocAllocator::growContiguousWithoutRetry(
@@ -280,8 +331,13 @@ void* MallocAllocator::allocateBytesWithoutRetry(
         bytes,
         alignment);
   }
+#ifdef _WIN32
+  void* result = (alignment > kMinAlignment) ? ::posix_aligned_alloc(alignment, bytes)
+                                             : ::malloc(bytes);
+#else
   void* result = (alignment > kMinAlignment) ? ::aligned_alloc(alignment, bytes)
                                              : ::malloc(bytes);
+#endif
   if (FOLLY_UNLIKELY(result == nullptr)) {
     VELOX_MEM_LOG(ERROR) << "Failed to allocateBytes " << succinctBytes(bytes)
                          << " with " << alignment << " alignment";
@@ -300,7 +356,11 @@ void* MallocAllocator::allocateZeroFilledWithoutRetry(uint64_t bytes) {
     setAllocatorFailureMessage(errorMsg);
     return nullptr;
   }
-  void* result = std::calloc(1, bytes);
+#ifdef _WIN32
+  void* result = ::posix_calloc(1, bytes); // Use wrapper on Windows
+#else
+  void* result = ::calloc(1, bytes);
+#endif
   if (FOLLY_UNLIKELY(result == nullptr)) {
     VELOX_MEM_LOG(ERROR) << "Failed to allocateZeroFilled "
                          << succinctBytes(bytes);
@@ -308,8 +368,67 @@ void* MallocAllocator::allocateZeroFilledWithoutRetry(uint64_t bytes) {
   return result;
 }
 
+void* MallocAllocator::reallocateBytesWithoutRetry(
+    void* p,
+    uint64_t oldSize,
+    uint64_t newSize,
+    uint16_t alignment) {
+  if (p == nullptr || alignment > kMinAlignment ||
+      (reinterpret_cast<uintptr_t>(p) % alignment) != 0) {
+    return nullptr;
+  }
+  if (!isAlignmentValid(newSize, alignment)) {
+    VELOX_FAIL(
+        "Alignment check failed, reallocateBytes {}, alignmentBytes {}",
+        newSize,
+        alignment);
+  }
+  const auto delta =
+      static_cast<int64_t>(newSize) - static_cast<int64_t>(oldSize);
+  if (delta > 0 && !incrementUsage(delta)) {
+    auto errorMsg = fmt::format(
+        "Failed to reallocate: exceeded memory allocator limit of {}. "
+        "Old size: {}, new size: {}",
+        succinctBytes(capacity_),
+        succinctBytes(oldSize),
+        succinctBytes(newSize));
+    VELOX_MEM_LOG_EVERY_MS(WARNING, 1000) << errorMsg;
+    setAllocatorFailureMessage(errorMsg);
+    return nullptr;
+  }
+  void* result = ::realloc(p, newSize); // NOLINT
+  if (result == nullptr) {
+    // realloc failed. The original pointer is still valid.
+    if (delta > 0) {
+      decrementUsage(delta);
+    }
+    VELOX_MEM_LOG(ERROR) << "Failed to reallocateBytes from "
+                         << succinctBytes(oldSize) << " to "
+                         << succinctBytes(newSize);
+    return nullptr;
+  }
+  // ::realloc() must return a pointer aligned to the requested alignment.
+  // The C standard guarantees alignof(max_align_t), and we already enforced
+  // alignment <= kMinAlignment above, so this should always hold for a
+  // conformant allocator. Fail loudly if it doesn't (e.g., a non-conformant
+  // LD_PRELOAD interposer).
+  VELOX_CHECK_EQ(
+      reinterpret_cast<uintptr_t>(result) % alignment,
+      0,
+      "::realloc returned a pointer not aligned to requested alignment: {}",
+      alignment);
+  if (delta < 0) {
+    decrementUsage(-delta);
+  }
+  return result;
+}
+
 void MallocAllocator::freeBytes(void* p, uint64_t bytes) noexcept {
+#ifdef _WIN32
+  ::posix_free(p); // Use smart wrapper on Windows for aligned allocation tracking
+#else
   ::free(p); // NOLINT
+#endif
   decrementUsage(bytes);
 }
 

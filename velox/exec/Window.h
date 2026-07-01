@@ -17,9 +17,9 @@
 
 #include "velox/exec/Operator.h"
 #include "velox/exec/RowContainer.h"
-#include "velox/exec/WindowBuild.h"
 #include "velox/exec/WindowFunction.h"
 #include "velox/exec/WindowPartition.h"
+#include "velox/exec/window/WindowBuild.h"
 
 namespace facebook::velox::exec {
 
@@ -66,6 +66,11 @@ class Window : public Operator {
 
   void reclaim(uint64_t targetBytes, memory::MemoryReclaimer::Stats& stats)
       override;
+
+  /// Runtime statistics holding total number of batches read from spilled data.
+  /// 0 if no spilling occurred.
+  static constexpr std::string_view kWindowSpillReadNumBatches{
+      "windowSpillReadNumBatches"};
 
  private:
   // Used for k preceding/following frames. Index is the column index if k is a
@@ -166,7 +171,7 @@ class Window : public Operator {
 
   // WindowBuild is used to store input rows and return WindowPartitions
   // for the processing.
-  std::unique_ptr<WindowBuild> windowBuild_;
+  std::unique_ptr<window::WindowBuild> windowBuild_;
 
   // The cached window plan node used for window function initialization. It is
   // reset after the initialization.

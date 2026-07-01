@@ -17,6 +17,7 @@
 #include <gtest/gtest.h>
 #include "velox/common/base/VeloxException.h"
 #include "velox/dwio/common/ColumnSelector.h"
+#include "velox/dwio/common/FlatMapHelper.h"
 #include "velox/type/Type.h"
 #include "velox/type/fbhive/HiveTypeParser.h"
 
@@ -394,17 +395,19 @@ TEST(ColumnSelectorTests, testFlatMapKeyFilterAllowed) {
 }
 
 TEST(ColumnSelectorTests, testPartitionKeysMark) {
-  const auto schema = std::dynamic_pointer_cast<const RowType>(
-      HiveTypeParser().parse("struct<"
-                             "id:bigint"
-                             "memo:string"
-                             "ds:string"
-                             "key:string>"));
+  const auto schema =
+      std::dynamic_pointer_cast<const RowType>(HiveTypeParser().parse(
+          "struct<"
+          "id:bigint"
+          "memo:string"
+          "ds:string"
+          "key:string>"));
 
-  const auto physicalSchema = std::dynamic_pointer_cast<const RowType>(
-      HiveTypeParser().parse("struct<"
-                             "id:bigint"
-                             "memo:string>"));
+  const auto physicalSchema =
+      std::dynamic_pointer_cast<const RowType>(HiveTypeParser().parse(
+          "struct<"
+          "id:bigint"
+          "memo:string>"));
 
   // use schema and physical schema to initialize a column selector
   // without filtering
@@ -456,14 +459,16 @@ TEST(ColumnSelectorTests, testPartitionKeysMark) {
     EXPECT_EQ(root->childAt(3)->getNode().expression, "gold");
 
     // test apply to real data file disk schema
-    const auto schemaMore = std::dynamic_pointer_cast<const RowType>(
-        HiveTypeParser().parse("struct<"
-                               "id:bigint"
-                               "memo:string"
-                               "extra:array<float>>"));
-    const auto schemaLess = std::dynamic_pointer_cast<const RowType>(
-        HiveTypeParser().parse("struct<"
-                               "id:bigint>"));
+    const auto schemaMore =
+        std::dynamic_pointer_cast<const RowType>(HiveTypeParser().parse(
+            "struct<"
+            "id:bigint"
+            "memo:string"
+            "extra:array<float>>"));
+    const auto schemaLess =
+        std::dynamic_pointer_cast<const RowType>(HiveTypeParser().parse(
+            "struct<"
+            "id:bigint>"));
 
     auto csMore = ColumnSelector::apply(cs, schemaMore);
     LOG(INFO) << "CS filter size: " << cs->getProjection().size();
@@ -510,14 +515,15 @@ TEST(ColumnSelectorTests, testPartitionKeysMark) {
 }
 
 TEST(ColumnSelectorTests, testProjectionUnchangedWhenReadSetChanged) {
-  const auto schema = std::dynamic_pointer_cast<const RowType>(
-      HiveTypeParser().parse("struct<"
-                             "id:bigint"
-                             "values:array<float>"
-                             "tags:map<int, string>"
-                             "notes:struct<f1:int, f2:double, f3:string>"
-                             "memo:string"
-                             "extra:string>"));
+  const auto schema =
+      std::dynamic_pointer_cast<const RowType>(HiveTypeParser().parse(
+          "struct<"
+          "id:bigint"
+          "values:array<float>"
+          "tags:map<int, string>"
+          "notes:struct<f1:int, f2:double, f3:string>"
+          "memo:string"
+          "extra:string>"));
   ColumnSelector cs(schema, std::vector<std::string>{"id", "values"});
   cs.setRead(cs.findColumn("notes"));
 
@@ -559,13 +565,14 @@ TEST(ColumnSelectorTests, testProjectionUnchangedWhenReadSetChanged) {
 }
 
 TEST(ColumnSelectorTests, testProjectOrder) {
-  const auto schema = std::dynamic_pointer_cast<const RowType>(
-      HiveTypeParser().parse("struct<"
-                             "id:bigint"
-                             "values:array<float>"
-                             "tags:map<int, string>"
-                             "notes:struct<f1:int, f2:double, f3:string>"
-                             "memo:string>"));
+  const auto schema =
+      std::dynamic_pointer_cast<const RowType>(HiveTypeParser().parse(
+          "struct<"
+          "id:bigint"
+          "values:array<float>"
+          "tags:map<int, string>"
+          "notes:struct<f1:int, f2:double, f3:string>"
+          "memo:string>"));
 
   // test filter with names with order of tags, memo and id
   {
@@ -642,14 +649,15 @@ TEST(ColumnSelectorTests, testProjectOrder) {
 }
 
 TEST(ColumnSelectorTests, testNonexistingColFilters) {
-  const auto schema = std::dynamic_pointer_cast<const RowType>(
-      HiveTypeParser().parse("struct<"
-                             "id:bigint"
-                             "values:array<float>"
-                             "tags:map<int, string>"
-                             "notes:struct<f1:int, f2:double, f3:string>"
-                             "memo:string"
-                             "extra:string>"));
+  const auto schema =
+      std::dynamic_pointer_cast<const RowType>(HiveTypeParser().parse(
+          "struct<"
+          "id:bigint"
+          "values:array<float>"
+          "tags:map<int, string>"
+          "notes:struct<f1:int, f2:double, f3:string>"
+          "memo:string"
+          "extra:string>"));
 
   EXPECT_THROW(
       ColumnSelector cs(
@@ -659,17 +667,56 @@ TEST(ColumnSelectorTests, testNonexistingColFilters) {
 }
 
 TEST(TestColumnSelector, fileColumnNamesReadAsLowerCaseDuplicateColFilters) {
-  const auto schema = std::dynamic_pointer_cast<const RowType>(
-      HiveTypeParser().parse("struct<"
-                             "id:bigint"
-                             "id:bigint"
-                             "values:array<float>"
-                             "tags:map<int, string>"
-                             "notes:struct<f1:int, f2:double, f3:string>"
-                             "memo:string"
-                             "extra:string>"));
+  const auto schema =
+      std::dynamic_pointer_cast<const RowType>(HiveTypeParser().parse(
+          "struct<"
+          "id:bigint"
+          "id:bigint"
+          "values:array<float>"
+          "tags:map<int, string>"
+          "notes:struct<f1:int, f2:double, f3:string>"
+          "memo:string"
+          "extra:string>"));
 
   EXPECT_THROW(
       ColumnSelector cs(schema, std::vector<std::string>{"id"}, nullptr, true),
       facebook::velox::VeloxException);
+}
+
+using facebook::velox::StringView;
+using namespace facebook::velox::dwio::common::flatmap;
+
+TEST(ColumnSelectorTests, prepareKeyPredicateStringViewOwnership) {
+  // Verify that KeyPredicate<StringView> correctly owns the string data from
+  // the JSON expression. Without the fix, convertDynamic<StringView> returned
+  // a StringView pointing to a local std::string that was destroyed on return,
+  // causing heap-use-after-free when the predicate was later evaluated.
+  // Keys must exceed SSO threshold (~22 chars) to trigger heap allocation,
+  // otherwise ASan cannot detect the use-after-free.
+  auto predicate = prepareKeyPredicate<StringView>(
+      R"(["key_alpha_long_name_for_testing", "key_beta_long_name_for_testing", "key_gamma_long_name_for_testing"])");
+
+  // Allocate strings to overwrite any freed memory from folly::dynamic.
+  std::vector<std::string> overwrite(
+      100, "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ");
+
+  EXPECT_TRUE(predicate(
+      KeyValue<StringView>(StringView("key_alpha_long_name_for_testing"))));
+  EXPECT_TRUE(predicate(
+      KeyValue<StringView>(StringView("key_beta_long_name_for_testing"))));
+  EXPECT_TRUE(predicate(
+      KeyValue<StringView>(StringView("key_gamma_long_name_for_testing"))));
+  EXPECT_FALSE(predicate(
+      KeyValue<StringView>(StringView("key_delta_long_name_for_testing"))));
+  EXPECT_FALSE(predicate(KeyValue<StringView>(StringView("other_long_key"))));
+}
+
+TEST(ColumnSelectorTests, prepareKeyPredicateStringViewRejectMode) {
+  auto predicate = prepareKeyPredicate<StringView>(
+      R"(["!rejected_key_long_name_for_testing"])");
+
+  EXPECT_TRUE(predicate(
+      KeyValue<StringView>(StringView("any_other_key_long_name_testing"))));
+  EXPECT_FALSE(predicate(
+      KeyValue<StringView>(StringView("rejected_key_long_name_for_testing"))));
 }

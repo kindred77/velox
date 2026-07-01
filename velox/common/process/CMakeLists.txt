@@ -19,6 +19,13 @@ velox_add_library(
   ThreadDebugInfo.cpp
   TraceContext.cpp
   TraceHistory.cpp
+  HEADERS
+  ProcessBase.h
+  StackTrace.h
+  ThreadDebugInfo.h
+  ThreadLocalRegistry.h
+  TraceContext.h
+  TraceHistory.h
 )
 
 velox_link_libraries(
@@ -28,12 +35,24 @@ velox_link_libraries(
 )
 
 # Profiler need not be part of the core Velox library
-add_library(velox_profiler OBJECT Profiler.cpp)
+if(WIN32)
+  add_library(velox_profiler STATIC Profiler.cpp)
+else()
+  add_library(velox_profiler OBJECT Profiler.cpp)
+  velox_add_test_headers(velox_profiler Profiler.h)
+endif()
 target_link_libraries(
   velox_profiler
   PUBLIC velox_flag_definitions Folly::folly
   PRIVATE fmt::fmt gflags::gflags glog::glog
 )
+
+if(MSVC)
+  velox_set_target_properties(velox_process PROPERTIES CXX_STANDARD 20)
+  # Force local vcpkg includes to be used before global vcpkg
+  velox_include_directories(velox_process BEFORE PRIVATE 
+    "${CMAKE_BINARY_DIR}/vcpkg_installed/x64-windows/include")
+endif()
 
 if(${VELOX_BUILD_TESTING})
   add_subdirectory(tests)

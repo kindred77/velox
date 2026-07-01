@@ -18,7 +18,7 @@
 
 #include "velox/dwio/parquet/reader/IntegerColumnReader.h"
 #include "velox/dwio/parquet/reader/ParquetColumnReader.h"
-#include "velox/dwio/parquet/thrift/ParquetThriftTypes.h"
+#include "velox/dwio/parquet/thrift/ParquetThrift.h"
 
 namespace facebook::velox::parquet {
 namespace {
@@ -96,22 +96,22 @@ class TimestampColumnReader : public IntegerColumnReader {
       const auto typeWithId =
           std::static_pointer_cast<const ParquetTypeWithId>(fileType_);
       if (auto logicalType = typeWithId->logicalType_) {
-        VELOX_CHECK(logicalType->__isset.TIMESTAMP);
-        const auto unit = logicalType->TIMESTAMP.unit;
-        if (unit.__isset.MILLIS) {
+        VELOX_CHECK(
+            logicalType->getType() == thrift::LogicalType::Type::TIMESTAMP);
+        const auto& unit = logicalType->get_TIMESTAMP().unit();
+        if (unit->getType() == thrift::TimeUnit::Type::MILLIS) {
           filePrecision_ = TimestampPrecision::kMilliseconds;
-        } else if (unit.__isset.MICROS) {
+        } else if (unit->getType() == thrift::TimeUnit::Type::MICROS) {
           filePrecision_ = TimestampPrecision::kMicroseconds;
-        } else if (unit.__isset.NANOS) {
+        } else if (unit->getType() == thrift::TimeUnit::Type::NANOS) {
           filePrecision_ = TimestampPrecision::kNanoseconds;
         } else {
           VELOX_UNREACHABLE();
         }
       } else if (auto convertedType = typeWithId->convertedType_) {
-        if (convertedType == thrift::ConvertedType::type::TIMESTAMP_MILLIS) {
+        if (convertedType == thrift::ConvertedType::TIMESTAMP_MILLIS) {
           filePrecision_ = TimestampPrecision::kMilliseconds;
-        } else if (
-            convertedType == thrift::ConvertedType::type::TIMESTAMP_MICROS) {
+        } else if (convertedType == thrift::ConvertedType::TIMESTAMP_MICROS) {
           filePrecision_ = TimestampPrecision::kMicroseconds;
         } else {
           VELOX_UNREACHABLE();
@@ -182,13 +182,14 @@ class TimestampColumnReader : public IntegerColumnReader {
       filters.reserve(multiRange->filters().size());
       for (const auto& filter : multiRange->filters()) {
         if (auto* range = dynamic_cast<common::TimestampRange*>(filter.get())) {
-          filters.emplace_back(std::make_unique<ParquetTimestampRange<T>>(
-              range->lower(),
-              range->upper(),
-              range->nullAllowed(),
-              filePrecision_));
+          filters.emplace_back(
+              std::make_unique<ParquetTimestampRange<T>>(
+                  range->lower(),
+                  range->upper(),
+                  range->nullAllowed(),
+                  filePrecision_));
         } else {
-          filters.emplace_back(filter->clone(range->nullAllowed()));
+          filters.emplace_back(filter->clone(filter->nullAllowed()));
         }
       }
       auto newMultiRange =

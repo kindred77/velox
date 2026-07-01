@@ -12,39 +12,120 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-velox_add_library(
-  velox_functions_prestosql
-  ArrayConcatRegistration.cpp
-  ArrayFunctionsRegistration.cpp
-  ArrayNGramsRegistration.cpp
-  BinaryFunctionsRegistration.cpp
-  BingTileFunctionsRegistration.cpp
-  BitwiseFunctionsRegistration.cpp
-  CheckedArithmeticRegistration.cpp
-  ComparisonFunctionsRegistration.cpp
-  DateTimeFunctionsRegistration.cpp
-  DataSizeFunctionsRegistration.cpp
-  EnumFunctionsRegistration.cpp
-  GeneralFunctionsRegistration.cpp
-  HyperLogFunctionsRegistration.cpp
-  IntegerFunctionsRegistration.cpp
-  FloatingPointFunctionsRegistration.cpp
-  JsonFunctionsRegistration.cpp
-  MapFunctionsRegistration.cpp
-  MathematicalFunctionsRegistration.cpp
-  MathematicalOperatorsRegistration.cpp
-  ProbabilityTrigonometricFunctionsRegistration.cpp
-  RegistrationFunctions.cpp
-  SfmSketchFunctionsRegistration.cpp
-  StringFunctionsRegistration.cpp
-  TDigestFunctionsRegistration.cpp
-  QDigestFunctionsRegistration.cpp
-  URLFunctionsRegistration.cpp
-)
+if(WIN32)
+  find_package(Java QUIET)
+  find_package(JNI QUIET)
+else()
+  find_package(Java REQUIRED)
+  find_package(JNI REQUIRED)
+endif()
+
+# Split registration into three smaller libraries on MSVC to avoid COFF 4GB lib limit.
+if(NOT VELOX_MONO_LIBRARY AND MSVC)
+  set(_SPLIT_PRESTO ON)
+else()
+  set(_SPLIT_PRESTO OFF)
+endif()
+
+if(_SPLIT_PRESTO)
+  velox_add_library(velox_functions_prestosql_p1
+    ArrayConcatRegistration.cpp
+    ArrayFunctionsRegistration.cpp
+    ArrayNGramsRegistration.cpp
+    ArraySplitIntoChunksRegistration.cpp
+    BinaryFunctionsRegistration.cpp
+    BingTileFunctionsRegistration.cpp
+    BitwiseFunctionsRegistration.cpp
+    CheckedArithmeticRegistration.cpp
+    ComparisonFunctionsRegistration.cpp
+    DateTimeFunctionsRegistration.cpp
+  )
+
+  velox_add_library(velox_functions_prestosql_p2
+    DataSizeFunctionsRegistration.cpp
+    EnumFunctionsRegistration.cpp
+    GeneralFunctionsRegistration.cpp
+    HyperLogFunctionsRegistration.cpp
+    IntegerFunctionsRegistration.cpp
+    FloatingPointFunctionsRegistration.cpp
+    JsonFunctionsRegistration.cpp
+    KHyperLogLogFunctionsRegistration.cpp
+    MapFunctionsRegistration.cpp
+    MathematicalFunctionsRegistration.cpp
+    MathematicalOperatorsRegistration.cpp
+    ProbabilityTrigonometricFunctionsRegistration.cpp
+  )
+endif()
+
+if(_SPLIT_PRESTO)
+  velox_add_library(
+    velox_functions_prestosql
+    RegistrationFunctions.cpp
+    SetDigestFunctionsRegistration.cpp
+    SfmSketchFunctionsRegistration.cpp
+    StringFunctionsRegistration.cpp
+    TDigestFunctionsRegistration.cpp
+    QDigestFunctionsRegistration.cpp
+    URLFunctionsRegistration.cpp
+    HEADERS
+    RegistrationFunctions.h
+  )
+else()
+  velox_add_library(
+    velox_functions_prestosql
+    ArrayConcatRegistration.cpp
+    ArrayFunctionsRegistration.cpp
+    ArrayNGramsRegistration.cpp
+    ArraySplitIntoChunksRegistration.cpp
+    BinaryFunctionsRegistration.cpp
+    BingTileFunctionsRegistration.cpp
+    BitwiseFunctionsRegistration.cpp
+    CheckedArithmeticRegistration.cpp
+    ComparisonFunctionsRegistration.cpp
+    DateTimeFunctionsRegistration.cpp
+    DataSizeFunctionsRegistration.cpp
+    EnumFunctionsRegistration.cpp
+    GeneralFunctionsRegistration.cpp
+    HyperLogFunctionsRegistration.cpp
+    IntegerFunctionsRegistration.cpp
+    FloatingPointFunctionsRegistration.cpp
+    JsonFunctionsRegistration.cpp
+    KHyperLogLogFunctionsRegistration.cpp
+    MapFunctionsRegistration.cpp
+    MathematicalFunctionsRegistration.cpp
+    MathematicalOperatorsRegistration.cpp
+    ProbabilityTrigonometricFunctionsRegistration.cpp
+    RegistrationFunctions.cpp
+    SetDigestFunctionsRegistration.cpp
+    SfmSketchFunctionsRegistration.cpp
+    StringFunctionsRegistration.cpp
+    TDigestFunctionsRegistration.cpp
+    QDigestFunctionsRegistration.cpp
+    URLFunctionsRegistration.cpp
+    HEADERS
+    RegistrationFunctions.h
+  )
+endif()
+
+if(_SPLIT_PRESTO)
+  target_link_libraries(velox_functions_prestosql velox_functions_prestosql_p1)
+  target_link_libraries(velox_functions_prestosql velox_functions_prestosql_p2)
+  target_link_libraries(velox_functions_prestosql_p1 fmt::fmt)
+  target_link_libraries(velox_functions_prestosql_p2 fmt::fmt)
+endif()
 
 if(VELOX_ENABLE_GEO)
   velox_compile_definitions(velox_functions_prestosql PRIVATE VELOX_ENABLE_GEO)
-  velox_sources(velox_functions_prestosql PRIVATE GeometryFunctionsRegistration.cpp)
+  set(_geo_srcs
+    GeometryFunctionsRegistration.cpp
+    S2FunctionsRegistration.cpp
+    SphericalGeographyFunctionsRegistration.cpp
+  )
+  if(_SPLIT_PRESTO)
+    velox_sources(velox_functions_prestosql_p1 PRIVATE ${_geo_srcs})
+  else()
+    velox_sources(velox_functions_prestosql PRIVATE ${_geo_srcs})
+  endif()
 endif()
 
 if(VELOX_ENABLE_FAISS)
@@ -54,9 +135,10 @@ if(VELOX_ENABLE_FAISS)
   )
 endif()
 
-# GCC 12 has a bug where it does not respect "pragma ignore" directives and ends
-# up failing compilation in an openssl header included by a hash-related
-# function.
+if(NOT WIN32 AND JNI_FOUND)
+  velox_include_directories(velox_functions_prestosql PRIVATE ${JNI_INCLUDE_DIRS})
+endif()
+
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND NOT VELOX_MONO_LIBRARY)
   target_compile_options(velox_functions_prestosql PRIVATE -Wno-deprecated-declarations)
 endif()
@@ -71,4 +153,8 @@ velox_link_libraries(
 
 if(NOT VELOX_MONO_LIBRARY)
   set_property(TARGET velox_functions_prestosql PROPERTY JOB_POOL_COMPILE high_memory_pool)
+endif()
+
+if(MSVC)
+  velox_compile_options(velox_functions_prestosql PRIVATE /bigobj)
 endif()

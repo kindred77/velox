@@ -16,7 +16,7 @@
 #pragma once
 
 #include "velox/exec/Aggregate.h"
-#include "velox/exec/AggregationHook.h"
+#include "velox/vector/AggregationHook.h"
 #include "velox/vector/DecodedVector.h"
 #include "velox/vector/FlatVector.h"
 #include "velox/vector/LazyVector.h"
@@ -221,7 +221,11 @@ class SimpleNumericAggregate : public exec::Aggregate {
       if (numSelected != arg->size()) {
         pushdownCustomIndices_.resize(numSelected);
         vector_size_t tgtIndex{0};
+#ifdef _MSC_VER
         rows.applyToSelected([&](vector_size_t i) {
+#else
+        rows.template applyToSelected([&](vector_size_t i) {
+#endif
           pushdownCustomIndices_[tgtIndex++] = indices[i];
         });
         indices = pushdownCustomIndices_.data();

@@ -48,8 +48,8 @@ int64_t widthBucket(
         lowerBin <= bin && bin <= upperBin,
         "Bin values are not sorted in ascending order");
     VELOX_USER_CHECK(
-        std::isfinite(bin) && std::isfinite(lowerBin) &&
-            std::isfinite(upperBin),
+        std::isfinite(static_cast<double>(bin)) && std::isfinite(static_cast<double>(lowerBin)) &&
+            std::isfinite(static_cast<double>(upperBin)),
         "Bin values must be finite");
 
     if (operand < bin) {
@@ -176,7 +176,7 @@ std::vector<double> toBinValues(
     VELOX_USER_CHECK(
         !simpleVector->isNullAt(offset + i), "Bin values cannot be null");
     auto value = simpleVector->valueAt(offset + i);
-    VELOX_USER_CHECK(std::isfinite(value), "Bin values must be finite");
+    VELOX_USER_CHECK(std::isfinite(static_cast<double>(value)), "Bin values must be finite");
     if (i > 0) {
       VELOX_USER_CHECK_GT(
           value,

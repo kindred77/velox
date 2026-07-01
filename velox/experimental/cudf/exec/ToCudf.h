@@ -19,19 +19,7 @@
 #include "velox/exec/Driver.h"
 #include "velox/exec/Operator.h"
 
-#include <gflags/gflags.h>
-
-DECLARE_bool(velox_cudf_enabled);
-DECLARE_string(velox_cudf_memory_resource);
-DECLARE_bool(velox_cudf_debug);
-DECLARE_bool(velox_cudf_table_scan);
-
 namespace facebook::velox::cudf_velox {
-
-static const std::string kCudfAdapterName = "cuDF";
-
-// QueryConfig key. Enable or disable cudf in task level.
-static const std::string kCudfEnabled = "cudf.enabled";
 
 class CompileState {
  public:
@@ -42,63 +30,22 @@ class CompileState {
     return driver_;
   }
 
+  // Get plan node by id lookup.
+  core::PlanNodePtr getPlanNode(const core::PlanNodeId& id) const;
+
   // Replaces sequences of Operators in the Driver given at construction with
   // cuDF equivalents. Returns true if the Driver was changed.
-  bool compile();
+  bool compile(bool allow_cpu_fallback);
 
   const exec::DriverFactory& driverFactory_;
   exec::Driver& driver_;
 };
 
-class CudfOptions {
- public:
-  static CudfOptions& getInstance() {
-    static CudfOptions instance;
-    return instance;
-  }
-
-  void setPrefix(const std::string& prefix) {
-    prefix_ = prefix;
-  }
-
-  const std::string& prefix() const {
-    return prefix_;
-  }
-
-  const bool cudfEnabled;
-  const std::string cudfMemoryResource;
-  const bool cudfTableScan;
-  // The initial percent of GPU memory to allocate for memory resource for one
-  // thread.
-  int memoryPercent;
-
- private:
-  CudfOptions()
-      : cudfEnabled(FLAGS_velox_cudf_enabled),
-        cudfMemoryResource(FLAGS_velox_cudf_memory_resource),
-        cudfTableScan(FLAGS_velox_cudf_table_scan),
-        memoryPercent(50),
-        prefix_("") {}
-  CudfOptions(const CudfOptions&) = delete;
-  CudfOptions& operator=(const CudfOptions&) = delete;
-  std::string prefix_;
-};
-
 /// Registers adapter to add cuDF operators to Drivers.
-void registerCudf(const CudfOptions& options = CudfOptions::getInstance());
+void registerCudf();
 void unregisterCudf();
 
 /// Returns true if cuDF is registered.
 bool cudfIsRegistered();
-
-/**
- * @brief Returns true if the velox_cudf_debug flag is set to true.
- */
-bool cudfDebugEnabled();
-
-/**
- * @brief Returns true if the velox_cudf_table_scan flag is set to true.
- */
-bool cudfTableScanEnabled();
 
 } // namespace facebook::velox::cudf_velox

@@ -12,17 +12,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+velox_add_library(
+  velox_spark_query_config
+  OBJECT
+  SparkConfigProvider.cpp
+  SparkQueryConfig.cpp
+  HEADERS
+  SparkConfigProvider.h
+  SparkQueryConfig.h
+)
+velox_link_libraries(velox_spark_query_config velox_config_property velox_core)
+
 add_subdirectory(specialforms)
 velox_add_library(
   velox_functions_spark_impl
   ArrayGetFunction.cpp
   ArraySort.cpp
+  AssertNotNull.cpp
+  SequenceFunction.cpp
+  Transform.cpp
   CharVarcharUtils.cpp
   Comparisons.cpp
   ConcatWs.cpp
   DecimalArithmetic.cpp
   DecimalCeil.cpp
   DecimalCompare.cpp
+  FilterFunction.cpp
+  FormatNumber.cpp
   Hash.cpp
   In.cpp
   LeastGreatest.cpp
@@ -32,7 +48,63 @@ velox_add_library(
   Size.cpp
   String.cpp
   TimestampUtils.cpp
+  Transform.cpp
   UnscaledValueFunction.cpp
+  XxHash64.cpp
+  HEADERS
+  AnsiMode.h
+  Arena.h
+  Arithmetic.h
+  ArrayAppend.h
+  ArrayConcat.h
+  ArrayFlattenFunction.h
+  ArrayInsert.h
+  ArrayMinMaxFunction.h
+  ArrayPrepend.h
+  ArraySort.h
+  AssertNotNull.h
+  Base64Function.h
+  Bitwise.h
+  CharTypeWriteSideCheck.h
+  CharVarcharUtils.h
+  Comparisons.h
+  ConcatWs.h
+  DateTimeFunctions.h
+  DecimalArithmetic.h
+  DecimalCeil.h
+  DecimalUtil.h
+  Factorial.h
+  FormatNumber.h
+  GetJsonObject.h
+  Hash.h
+  In.h
+  InitcapFunction.h
+  JsonObjectKeys.h
+  LambdaIndexUtil.h
+  LeastGreatest.h
+  LuhnCheckFunction.h
+  MaskFunction.h
+  MightContain.h
+  MonotonicallyIncreasingId.h
+  RaiseError.h
+  Rand.h
+  RandStr.h
+  ReadSidePaddingFunction.h
+  RegexFunctions.h
+  SimpleComparisonMatcher.h
+  Size.h
+  SparkPartitionId.h
+  Split.h
+  String.h
+  StringToMap.h
+  TimestampUtils.h
+  ToJson.h
+  ToPrettyString.h
+  UnBase64Function.h
+  UnscaledValueFunction.h
+  Uuid.h
+  VarcharTypeWriteSideCheck.h
+  XxHash64.h
 )
 
 velox_link_libraries(
@@ -58,7 +130,11 @@ endif()
 if(${VELOX_BUILD_TESTING})
   add_subdirectory(tests)
   add_subdirectory(coverage)
-  add_subdirectory(fuzzer)
+  # The Spark fuzzer drives a reference Spark via Spark Connect (gRPC), which is
+  # not available on Windows.
+  if(NOT WIN32)
+    add_subdirectory(fuzzer)
+  endif()
 endif()
 
 if(${VELOX_ENABLE_BENCHMARKS})

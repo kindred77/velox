@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-velox_add_library(velox_is_null_functions IsNull.cpp)
+velox_add_library(velox_is_null_functions IsNull.cpp HEADERS IsNull.h)
 
 velox_link_libraries(velox_is_null_functions velox_expression)
 
@@ -21,6 +21,11 @@ velox_add_library(
   Murmur3Hash32Base.cpp
   LambdaFunctionUtil.cpp
   RowsTranslationUtil.cpp
+  HEADERS
+  LambdaFunctionUtil.h
+  Murmur3Hash32Base.h
+  RowsTranslationUtil.h
+  XORShiftRandom.h
 )
 
 velox_link_libraries(velox_functions_util velox_vector velox_common_base)
@@ -29,9 +34,20 @@ velox_add_library(
   velox_functions_lib_date_time_formatter
   DateTimeFormatter.cpp
   DateTimeFormatterBuilder.cpp
+  HEADERS
+  DateTimeFormatter.h
+  DateTimeFormatterBuilder.h
 )
 
 velox_link_libraries(velox_functions_lib_date_time_formatter velox_type_tz)
+
+if(WIN32)
+  find_package(Java QUIET)
+  find_package(JNI QUIET)
+else()
+  find_package(Java REQUIRED)
+  find_package(JNI REQUIRED)
+endif()
 
 velox_add_library(
   velox_functions_lib
@@ -41,15 +57,55 @@ velox_add_library(
   CheckNestedNulls.cpp
   KllSketch.cpp
   MapConcat.cpp
+  MapFromEntries.cpp
   Re2Functions.cpp
   Repeat.cpp
+  Sequence.cpp
   Slice.cpp
   SimpleComparisonMatcher.cpp
   StringEncodingUtils.cpp
   SubscriptUtil.cpp
   TimeUtils.cpp
   Utf8Utils.cpp
+  HEADERS
+  ApproxMostFrequentStreamSummary.h
+  ArrayRemoveNullFunction.h
+  ArrayShuffle.h
+  ArraySort.h
+  CheckDuplicateKeys.h
+  CheckNestedNulls.h
+  CheckedArithmetic.h
+  CheckedArithmeticImpl.h
+  ComparatorUtil.h
+  FilterFunctionBase.h
+  JsonUtil.h
+  KllSketch-inl.h
+  KllSketch.h
+  MakeRowFromMap.h
+  MapConcat.h
+  MapFromEntries.h
+  Re2Functions.h
+  RegistrationHelpers.h
+  Repeat.h
+  SIMDComparisonUtil.h
+  Sequence.h
+  SimpleComparisonMatcher.h
+  Slice.h
+  StringEncodingUtils.h
+  SubscriptUtil.h
+  TimeUtils.h
+  ToHex.h
+  UpperLower.h
+  Utf8Utils.h
+  ZetaDistribution.h
 )
+
+if(WIN32)
+  # Windows: Never use JNI (removes jvm.lib dependency)
+  # Java/JNI not needed for Windows builds
+else()
+  velox_include_directories(velox_functions_lib PRIVATE ${JNI_INCLUDE_DIRS})
+endif()
 
 velox_link_libraries(
   velox_functions_lib
@@ -57,9 +113,14 @@ velox_link_libraries(
   velox_functions_util
   velox_vector
   velox_type_tz
+  velox_common_hyperloglog
   re2::re2
   Folly::folly
 )
+
+if(NOT WIN32 AND JNI_FOUND)
+  velox_link_libraries(velox_functions_lib ${JNI_LIBRARIES})
+endif()
 
 add_subdirectory(aggregates)
 add_subdirectory(sfm)
@@ -72,3 +133,22 @@ endif()
 if(${VELOX_ENABLE_BENCHMARKS})
   add_subdirectory(benchmarks)
 endif()
+
+velox_add_library(velox_transform_function_base INTERFACE HEADERS TransformFunctionBase.h)
+
+velox_add_library(velox_date_time_util INTERFACE HEADERS DateTimeUtil.h)
+
+velox_add_library(
+  velox_hll_accumulator
+  INTERFACE
+  HEADERS
+  HllAccumulator.h
+  KHyperLogLog.h
+  KHyperLogLogImpl.h
+)
+
+velox_add_library(velox_tdigest INTERFACE HEADERS TDigest.h)
+
+velox_add_library(velox_quantile_digest INTERFACE HEADERS QuantileDigest.h)
+
+velox_add_library(velox_setdigest INTERFACE HEADERS SetDigest.h SetDigestImpl.h)

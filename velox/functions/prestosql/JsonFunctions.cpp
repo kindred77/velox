@@ -33,6 +33,12 @@ template <typename T>
 static simdjson::error_code validate(T value) {
   SIMDJSON_ASSIGN_OR_RAISE(auto type, value.type());
   switch (type) {
+    case simdjson::ondemand::json_type::unknown: {
+      // In simdjson 4.0.7+, unknown type is returned for invalid JSON values
+      // like NaN, Infinity, etc. Return INCORRECT_TYPE to indicate invalid
+      // JSON.
+      return simdjson::INCORRECT_TYPE;
+    }
     case simdjson::ondemand::json_type::array: {
       SIMDJSON_ASSIGN_OR_RAISE(auto array, value.get_array());
       for (auto elementOrError : array) {
@@ -195,8 +201,10 @@ class JsonParseImpl {
       VectorPtr& localResult,
       bool nullOnError) const {
     // Initialize errors here so that we get the proper exception context.
+#ifndef _WIN32
     folly::call_once(
         initializeErrors_, [this] { simdjsonErrorsToExceptions(errors_); });
+#endif
 
     if (arg->isConstantEncoding()) {
       auto value = arg->as<ConstantVector<StringView>>()->valueAt(0);
@@ -221,7 +229,7 @@ class JsonParseImpl {
             localResult = BaseVector::createNullConstant(
                 JSON(), rows.end(), context.pool());
           } else {
-            context.setErrors(rows, errors_[error]);
+            context.setErrors(rows, getError(error));
           }
           return;
         }
@@ -312,7 +320,7 @@ class JsonParseImpl {
         auto size = prepareInput(value, needNormalizes[row]);
         if (auto error = parse(size, needNormalizes[row])) {
           if (!nullOnError) {
-            context.setVeloxExceptionError(row, errors_[error]);
+            context.setVeloxExceptionError(row, getError(error));
           } else {
             bits::setNull(rawNullsOnErrors, row, true);
           }
@@ -389,6 +397,12 @@ class JsonParseImpl {
   simdjson::error_code generateViews(T value) const {
     SIMDJSON_ASSIGN_OR_RAISE(auto type, value.type());
     switch (type) {
+      case simdjson::ondemand::json_type::unknown: {
+        // In simdjson 4.0.7+, unknown type is returned for invalid JSON values
+        // like NaN, Infinity, etc. Return INCORRECT_TYPE to indicate invalid
+        // JSON.
+        return simdjson::INCORRECT_TYPE;
+      }
       case simdjson::ondemand::json_type::array: {
         SIMDJSON_ASSIGN_OR_RAISE(auto array, value.get_array());
         return generateViewsFromArray<kNeedNormalize>(array);
@@ -543,6 +557,16 @@ class JsonParseImpl {
     fields_.clear();
     sortIndices_.clear();
     fastSortKeys_.clear();
+  }
+
+  const std::exception_ptr& getError(simdjson::error_code error) const {
+#ifdef _WIN32
+    if (!errors_[error]) {
+      simdjson::simdjson_error e(error);
+      errors_[error] = toVeloxException(std::make_exception_ptr(e));
+    }
+#endif
+    return errors_[error];
   }
 
   mutable folly::once_flag initializeErrors_;
@@ -761,6 +785,12 @@ struct JsonExtractImpl {
       // contents directly) and we might miss invalid JSON.
       SIMDJSON_ASSIGN_OR_RAISE(auto vtype, v.type());
       switch (vtype) {
+        case simdjson::ondemand::json_type::unknown: {
+          // In simdjson 4.0.7+, unknown type is returned for invalid JSON
+          // values like NaN, Infinity, etc. Return INCORRECT_TYPE to indicate
+          // invalid JSON.
+          return simdjson::INCORRECT_TYPE;
+        }
         case simdjson::ondemand::json_type::object: {
           SIMDJSON_ASSIGN_OR_RAISE(
               auto jsonStr, simdjson::to_json_string(v.get_object()));
@@ -787,7 +817,9 @@ struct JsonExtractImpl {
       return simdjson::SUCCESS;
     };
 
-    auto& extractor = SIMDJsonExtractor::getInstance(jsonPath);
+    // TODO: Remove explicit std::string_view cast.
+    auto& extractor =
+        SIMDJsonExtractor::getInstance(std::string_view(jsonPath));
     bool isDefinitePath = true;
     simdjson::padded_string paddedJson(json.data(), json.size());
 

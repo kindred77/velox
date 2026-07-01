@@ -1,4 +1,3 @@
-
 /*
  * Copyright (c) Facebook, Inc. and its affiliates.
  *
@@ -17,14 +16,16 @@
 
 #include "velox/expression/RegisterSpecialForm.h"
 
+#include "velox/expression/CaseExpr.h"
 #include "velox/expression/CastExpr.h"
 #include "velox/expression/CoalesceExpr.h"
+#include "velox/expression/CoalesceRewrite.h"
 #include "velox/expression/ConjunctExpr.h"
-#include "velox/expression/ExprConstants.h"
-#include "velox/expression/FunctionCallToSpecialForm.h"
+#include "velox/expression/ConjunctRewrite.h"
 #include "velox/expression/RowConstructor.h"
 #include "velox/expression/SpecialFormRegistry.h"
 #include "velox/expression/SwitchExpr.h"
+#include "velox/expression/SwitchRewrite.h"
 #include "velox/expression/TryExpr.h"
 
 namespace facebook::velox::exec {
@@ -47,10 +48,15 @@ void registerFunctionCallToSpecialForms() {
   registerFunctionCallToSpecialForm(
       expression::kSwitch, std::make_unique<SwitchCallToSpecialForm>());
   registerFunctionCallToSpecialForm(
+      expression::kCase, std::make_unique<CaseCallToSpecialForm>());
+  registerFunctionCallToSpecialForm(
       expression::kTry, std::make_unique<TryCallToSpecialForm>());
   registerFunctionCallToSpecialForm(
       expression::kRowConstructor,
       std::make_unique<RowConstructorCallToSpecialForm>());
-}
 
+  expression::CoalesceRewrite::registerRewrite();
+  expression::ConjunctRewrite::registerRewrite();
+  expression::SwitchRewrite::registerRewrite();
+}
 } // namespace facebook::velox::exec

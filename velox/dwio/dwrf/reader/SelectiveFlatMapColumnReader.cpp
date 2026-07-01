@@ -23,7 +23,6 @@
 #include "velox/vector/FlatMapVector.h"
 
 namespace facebook::velox::dwrf {
-
 namespace {
 
 template <typename T>
@@ -41,7 +40,7 @@ inline dwio::common::flatmap::KeyValue<StringView> extractKey<StringView>(
 template <typename T>
 std::string toString(const T& x) {
   if constexpr (std::is_same_v<T, StringView>) {
-    return x;
+    return std::string(x);
   } else {
     return std::to_string(x);
   }
@@ -203,19 +202,21 @@ class SelectiveFlatMapAsStructReader : public SelectiveStructColumnReaderBase {
       DwrfParams& params,
       common::ScanSpec& scanSpec)
       : SelectiveStructColumnReaderBase(
-            requestedType,
-            fileType,
-            params,
-            scanSpec),
-        keyNodes_(getKeyNodes<T>(
             columnReaderOptions,
             requestedType,
             fileType,
             params,
-            scanSpec,
-            dwio::common::flatmap::FlatMapOutput::kStruct)) {
+            scanSpec),
+        keyNodes_(
+            getKeyNodes<T>(
+                columnReaderOptions,
+                requestedType,
+                fileType,
+                params,
+                scanSpec,
+                dwio::common::flatmap::FlatMapOutput::kStruct)) {
     VELOX_CHECK(
-        !keyNodes_.empty(),
+        !scanSpec.children().empty(),
         "For struct encoding, keys to project must be configured");
     children_.resize(keyNodes_.size());
     for (auto& childSpec : scanSpec.children()) {
@@ -241,6 +242,7 @@ class SelectiveFlatMapAsMapReader : public SelectiveStructColumnReaderBase {
       DwrfParams& params,
       common::ScanSpec& scanSpec)
       : SelectiveStructColumnReaderBase(
+            columnReaderOptions,
             requestedType,
             fileType,
             params,
@@ -285,17 +287,19 @@ class SelectiveFlatMapReader
       DwrfParams& params,
       common::ScanSpec& scanSpec)
       : dwio::common::SelectiveFlatMapColumnReader(
-            requestedType,
-            fileType,
-            params,
-            scanSpec),
-        keyNodes_(getKeyNodes<T>(
             columnReaderOptions,
             requestedType,
             fileType,
             params,
-            scanSpec,
-            dwio::common::flatmap::FlatMapOutput::kFlatMap)),
+            scanSpec),
+        keyNodes_(
+            getKeyNodes<T>(
+                columnReaderOptions,
+                requestedType,
+                fileType,
+                params,
+                scanSpec,
+                dwio::common::flatmap::FlatMapOutput::kFlatMap)),
         rowsPerRowGroup_(formatData_->rowsPerRowGroup().value()) {
     // Instantiate and populate distinct keys vector.
     keysVector_ = BaseVector::create(
@@ -304,6 +308,14 @@ class SelectiveFlatMapReader
         &params.pool());
     auto rawKeys = keysVector_->values()->asMutable<T>();
     children_.resize(keyNodes_.size());
+
+    // Invalidate subscripts from previous stripes. The shared ScanSpec
+    // accumulates children across stripes via getOrCreateChild(). Keys
+    // absent in the current stripe must not be accessed via children_,
+    // so mark them constant so read() skips them.
+    for (auto& child : scanSpec.children()) {
+      child->setSubscript(kConstantChildSpecSubscript);
+    }
 
     for (int i = 0; i < keyNodes_.size(); ++i) {
       keyNodes_[i].reader->scanSpec()->setSubscript(i);

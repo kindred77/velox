@@ -14,7 +14,9 @@
 
 add_subdirectory(util)
 
-if(${VELOX_BUILD_TESTING})
+if(${VELOX_BUILD_TESTING} AND NOT WIN32)
+  # Parquet writer tests require arrow_testing library which is not
+  # available in our vcpkg static build on Windows.
   add_subdirectory(tests)
 endif()
 
@@ -37,17 +39,48 @@ velox_add_library(
   Properties.cpp
   Schema.cpp
   Statistics.cpp
+  StringTruncation.cpp
   Types.cpp
   Writer.cpp
+  HEADERS
+  ArrowSchema.h
+  ArrowSchemaInternal.h
+  ColumnPage.h
+  ColumnWriter.h
+  Encoding.h
+  Encryption.h
+  EncryptionInternal.h
+  Exception.h
+  FileDecryptorInternal.h
+  FileEncryptorInternal.h
+  FileWriter.h
+  Metadata.h
+  PageIndex.h
+  PathInternal.h
+  Platform.h
+  Properties.h
+  Schema.h
+  SchemaInternal.h
+  Statistics.h
+  StringTruncation.h
+  ThriftInternal.h
+  Types.h
+  Writer.h
 )
 
 velox_link_libraries(
   velox_dwio_arrow_parquet_writer_lib
   velox_dwio_arrow_parquet_writer_util_lib
   velox_dwio_parquet_common
-  velox_dwio_parquet_thrift
   velox_dwio_common
   velox_arrow_bridge
   arrow
   fmt::fmt
 )
+
+if(MSVC)
+  # Parquet writer is built as a static library on Windows
+  velox_compile_definitions(velox_dwio_arrow_parquet_writer_lib PRIVATE PARQUET_STATIC)
+  # Prevent glog ERROR macro conflict
+  velox_compile_definitions(velox_dwio_arrow_parquet_writer_lib PRIVATE GLOG_NO_ABBREVIATED_SEVERITIES)
+endif()

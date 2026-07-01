@@ -16,7 +16,6 @@
 
 #include "velox/type/HugeInt.h"
 #include <gtest/gtest.h>
-#include "velox/common/base/tests/GTestUtils.h"
 
 using namespace facebook;
 using namespace facebook::velox;
@@ -32,6 +31,19 @@ void testParse(int128_t hugeInt, const std::string& hugeString) {
   EXPECT_EQ(hugeInt, HugeInt::parse(hugeString));
   EXPECT_EQ(hugeString, std::to_string(hugeInt));
 }
+
+void testParseError(
+    const std::string& input,
+    const std::string& expectedMessage,
+    const std::string& expectedTemplate) {
+  try {
+    HugeInt::parse(input);
+    FAIL() << "Expected exception for input: " << input;
+  } catch (const VeloxRuntimeError& e) {
+    EXPECT_NE(e.message().find(expectedMessage), std::string::npos);
+    EXPECT_EQ(e.messageTemplate(), expectedTemplate);
+  }
+}
 } // namespace
 
 TEST(HugeIntTest, basic) {
@@ -40,7 +52,10 @@ TEST(HugeIntTest, basic) {
   // 0xF{16}F{16} = -1
   auto uint64Max = static_cast<int128_t>(std::numeric_limits<uint64_t>::max());
   int128_t hugeInt = -1;
-  testBasic(hugeInt, uint64Max, uint64Max);
+  testBasic(
+      hugeInt,
+      static_cast<uint64_t>(uint64Max),
+      static_cast<uint64_t>(uint64Max));
 
   hugeInt = std::numeric_limits<int128_t>::max() - 0x12345;
   uint64_t upper = 0x7FFFFFFFFFFFFFFF;
@@ -83,17 +98,24 @@ TEST(HugeIntTest, parse) {
   hugeInt = HugeInt::build(0x80DEADBEEFBADFEE, 0xDDEADBEEFBADFEED);
   testParse(hugeInt, "-168984969573469355505154650711096688915");
 
-  VELOX_ASSERT_THROW(
-      HugeInt::parse("1A"), "Invalid character A in the string.");
-  VELOX_ASSERT_THROW(
-      HugeInt::parse(""), "Empty string cannot be converted to int128_t");
-  VELOX_ASSERT_THROW(
-      testParse(hugeInt, "-170141183460469231731687303715884105729"),
-      "out of range of int128_t");
-  VELOX_ASSERT_THROW(
-      testParse(hugeInt, "170141183460469231731687303715884105728"),
-      "out of range of int128_t");
-  VELOX_ASSERT_THROW(
-      testParse(hugeInt, "170141183460469231731687303715884105730"),
-      "out of range of int128_t");
+  testParseError(
+      "1A",
+      "Invalid character A in the string.",
+      "Invalid character {} in the string.");
+  testParseError(
+      "",
+      "Empty string cannot be converted to int128_t",
+      "Empty string cannot be converted to int128_t.");
+  testParseError(
+      "-170141183460469231731687303715884105729",
+      "out of range of int128_t",
+      "Value is out of range of int128_t: {}");
+  testParseError(
+      "170141183460469231731687303715884105728",
+      "out of range of int128_t",
+      "Value is out of range of int128_t: {}");
+  testParseError(
+      "170141183460469231731687303715884105730",
+      "out of range of int128_t",
+      "Value is out of range of int128_t: {}");
 }

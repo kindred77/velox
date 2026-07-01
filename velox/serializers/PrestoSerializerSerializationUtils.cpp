@@ -16,10 +16,15 @@
 
 #include "velox/serializers/PrestoSerializerSerializationUtils.h"
 
+#include "velox/type/HugeInt.h"
 #include "velox/vector/BiasVector.h"
 #include "velox/vector/DictionaryVector.h"
 #include "velox/vector/FlatVector.h"
 #include "velox/vector/VectorTypeUtils.h"
+
+#if defined(_MSC_VER)
+#include "velox/common/base/Builtins.h"
+#endif
 
 namespace facebook::velox::serializer::presto::detail {
 namespace {
@@ -139,6 +144,7 @@ void serializeWrappedRanges(
     VectorStream* stream,
     Scratch& scratch) {
   std::vector<IndexRange> newRanges;
+  newRanges.reserve(rangesTotalSize(ranges));
   const bool mayHaveNulls = vector->mayHaveNulls();
   const VectorPtr& wrapped = BaseVector::wrappedVectorShared(vector);
   for (int32_t i = 0; i < ranges.size(); ++i) {
@@ -373,6 +379,11 @@ void serializeRowVectorRanges(
   }
   auto rowVector = vector->as<RowVector>();
   std::vector<IndexRange> childRanges;
+  size_t totalOffsets = 0;
+  for (const auto& range : ranges) {
+    totalOffsets += range.size;
+  }
+  childRanges.reserve(totalOffsets);
   for (int32_t i = 0; i < ranges.size(); ++i) {
     auto begin = ranges[i].begin;
     auto end = begin + ranges[i].size;
@@ -400,8 +411,12 @@ void serializeArrayVectorRanges(
   auto arrayVector = vector->as<ArrayVector>();
   auto rawSizes = arrayVector->rawSizes();
   auto rawOffsets = arrayVector->rawOffsets();
+  size_t totalOffsets = 0;
+  for (const auto& range : ranges) {
+    totalOffsets += range.size;
+  }
   std::vector<IndexRange> childRanges;
-  childRanges.reserve(ranges.size());
+  childRanges.reserve(totalOffsets);
   for (int32_t i = 0; i < ranges.size(); ++i) {
     int32_t begin = ranges[i].begin;
     int32_t end = begin + ranges[i].size;
@@ -529,8 +544,9 @@ void serializeIPPrefix(
       // the ipaddress porition as big endian whereas Velox stores it as little
       auto javaIPPrefix =
           toJavaIPPrefixType(ip->valueAt(rows[i]), prefix->valueAt(rows[i]));
-      stream->values().appendStringView(std::string_view(
-          (const char*)javaIPPrefix.data(), javaIPPrefix.size()));
+      stream->values().appendStringView(
+          std::string_view(
+              (const char*)javaIPPrefix.data(), javaIPPrefix.size()));
     }
     return;
   }
@@ -558,8 +574,13 @@ void copyWords(
     const T* values,
     Conv&& conv = {}) {
   for (auto i = 0; i < numIndices; ++i) {
-    folly::storeUnaligned(
-        destination + i * sizeof(T), conv(values[indices[i]]));
+#ifdef _MSC_VER
+    T result = static_cast<T>(conv(values[indices[i]]));
+    std::memcpy(destination + i * sizeof(T), &result, sizeof(T));
+#else
+    folly::storeUnaligned<T>(
+        destination + i * sizeof(T), static_cast<T>(conv(values[indices[i]])));
+#endif
   }
 }
 
@@ -576,8 +597,14 @@ void copyWordsWithRows(
     return;
   }
   for (auto i = 0; i < numIndices; ++i) {
-    folly::storeUnaligned(
-        destination + i * sizeof(T), conv(values[rows[indices[i]]]));
+#ifdef _MSC_VER
+    T result = static_cast<T>(conv(values[rows[indices[i]]]));
+    std::memcpy(destination + i * sizeof(T), &result, sizeof(T));
+#else
+    folly::storeUnaligned<T>(
+        destination + i * sizeof(T),
+        static_cast<T>(conv(values[rows[indices[i]]])));
+#endif
   }
 }
 
@@ -630,30 +657,35 @@ void appendNonNull(
   } else {
     AppendWindow<T> window(out, scratch);
     auto* output = window.get(numNonNull);
-    if (stream->isLongDecimal()) {
-      copyWordsWithRows(
-          output,
-          rows.data(),
-          nonNullIndices,
-          numNonNull,
-          values,
-          toJavaDecimalValue);
-    } else if (stream->isUuid()) {
-      copyWordsWithRows(
-          output,
-          rows.data(),
-          nonNullIndices,
-          numNonNull,
-          values,
-          toJavaUuidValue);
-    } else if (stream->isIpAddress()) {
-      copyWordsWithRows(
-          output,
-          rows.data(),
-          nonNullIndices,
-          numNonNull,
-          values,
-          reverseIpAddressByteOrder);
+    if constexpr (std::is_same_v<T, int128_t>) {
+      if (stream->isLongDecimal()) {
+        copyWordsWithRows(
+            output,
+            rows.data(),
+            nonNullIndices,
+            numNonNull,
+            values,
+            toJavaDecimalValue);
+      } else if (stream->isUuid()) {
+        copyWordsWithRows(
+            output,
+            rows.data(),
+            nonNullIndices,
+            numNonNull,
+            values,
+            toJavaUuidValue);
+      } else if (stream->isIpAddress()) {
+        copyWordsWithRows(
+            output,
+            rows.data(),
+            nonNullIndices,
+            numNonNull,
+            values,
+            reverseIpAddressByteOrder);
+      } else {
+        copyWordsWithRows(
+            output, rows.data(), nonNullIndices, numNonNull, values);
+      }
     } else {
       copyWordsWithRows(
           output, rows.data(), nonNullIndices, numNonNull, values);
@@ -679,18 +711,23 @@ void serializeFlatVector(
       stream->appendNonNull(rows.size());
       AppendWindow<T> window(stream->values(), scratch);
       auto* output = window.get(rows.size());
-      if (stream->isLongDecimal()) {
-        copyWords(
-            output, rows.data(), rows.size(), rawValues, toJavaDecimalValue);
-      } else if (stream->isUuid()) {
-        copyWords(output, rows.data(), rows.size(), rawValues, toJavaUuidValue);
-      } else if (stream->isIpAddress()) {
-        copyWords(
-            output,
-            rows.data(),
-            rows.size(),
-            rawValues,
-            reverseIpAddressByteOrder);
+      if constexpr (std::is_same_v<T, int128_t>) {
+        if (stream->isLongDecimal()) {
+          copyWords(
+              output, rows.data(), rows.size(), rawValues, toJavaDecimalValue);
+        } else if (stream->isUuid()) {
+          copyWords(
+              output, rows.data(), rows.size(), rawValues, toJavaUuidValue);
+        } else if (stream->isIpAddress()) {
+          copyWords(
+              output,
+              rows.data(),
+              rows.size(),
+              rawValues,
+              reverseIpAddressByteOrder);
+        } else {
+          copyWords(output, rows.data(), rows.size(), rawValues);
+        }
       } else {
         copyWords(output, rows.data(), rows.size(), rawValues);
       }
@@ -761,7 +798,7 @@ void serializeFlatVector<TypeKind::BOOLEAN>(
     uint64_t word = bitsToBytes(reinterpret_cast<uint8_t*>(valueBits)[i]);
     auto* target = output + i * 8;
     if (i < numBytes - 1) {
-      folly::storeUnaligned(target, word);
+      folly::storeUnaligned<uint64_t>(target, word);
     } else {
       memcpy(target, &word, numValueBits - i * 8);
     }

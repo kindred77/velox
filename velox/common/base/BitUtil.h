@@ -20,11 +20,26 @@
 
 #include <folly/CPortability.h>
 
+// Provide __builtin_popcount* on MSVC (not compiler builtins)
+#if defined(_MSC_VER)
+#include <folly/portability/Builtins.h>
+#endif
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <span>
 #include <string>
+
+#ifdef _MSC_VER
+#include "velox/type/windows/Int128.h"
+#else
+namespace facebook::velox {
+using int128_t = __int128_t;
+using uint128_t = __uint128_t;
+}
+#endif
 
 #ifdef __BMI2__
 #include <x86intrin.h>
@@ -94,6 +109,14 @@ inline void setBit(T* bits, uint64_t idx, bool value) {
   value ? setBit(bits, idx) : clearBit(bits, idx);
 }
 
+/// Branchless: sets the bit at idx if value is true, no-op if false.
+/// Assumes target memory is pre-zeroed for unset bits.
+template <typename T>
+inline void maybeSetBit(T* bits, uint64_t idx, bool value) {
+  auto* bitsAs8Bit = reinterpret_cast<uint8_t*>(bits);
+  bitsAs8Bit[idx / 8] |= (static_cast<uint8_t>(value) << (idx % 8));
+}
+
 inline void negateBit(void* bits, uint64_t idx) {
   auto* bitsAs8Bit = reinterpret_cast<uint8_t*>(bits);
   bitsAs8Bit[idx / 8] ^= (1 << (idx % 8));
@@ -125,7 +148,7 @@ constexpr inline T divRoundUp(T value, U factor) {
 }
 
 constexpr inline uint64_t lowMask(int32_t bits) {
-  return (1UL << bits) - 1;
+  return bits >= 64 ? ~uint64_t{0} : (1ULL << bits) - 1;
 }
 
 constexpr inline uint64_t highMask(int32_t bits) {
@@ -241,7 +264,7 @@ forEachWord(int32_t begin, int32_t end, PartialWordFunc partialWordFunc) {
   int32_t firstIndex = begin / 64;
   int32_t lastIndex = (roundUp(end, 64) - 64) / 64;
   for (auto index = firstIndex; index <= lastIndex; ++index) {
-    uint64_t mask = ~0UL;
+    uint64_t mask = ~0ULL;
     if (index == firstIndex && begin != firstIndex * 64) {
       // We do not start at 64 bit boundary, and off the bits below start.
       mask = highMask((firstIndex + 1) * 64 - begin);
@@ -270,7 +293,7 @@ void forBatches(
     int32_t begin,
     int32_t end,
     Callable func) {
-  constexpr int64_t unitMask = kWidth == 64 ? ~0UL : lowMask(kWidth);
+  constexpr int64_t unitMask = kWidth == 64 ? ~0ULL : lowMask(kWidth);
   static_assert(kWidth <= 64 && 64 % kWidth == 0);
   bits::forEachWord(begin, end, [&](auto index, uint64_t mask) {
     uint64_t active = bits[index] & mask;
@@ -462,11 +485,58 @@ void forEachBit(
       });
 }
 
+template <typename Callable, typename CallableBatch64>
+void forEachBit(
+    const uint64_t* bits,
+    int32_t begin,
+    int32_t end,
+    bool isSet,
+    Callable func,
+    CallableBatch64 batchFunc) {
+  static constexpr uint64_t kAllSet = -1ULL;
+  forEachWord(
+      begin,
+      end,
+      [isSet, bits, func](int32_t idx, uint64_t mask) {
+        auto word = (isSet ? bits[idx] : ~bits[idx]) & mask;
+        if (!word) {
+          return;
+        }
+        while (word) {
+          func(idx * 64 + __builtin_ctzll(word));
+          word &= word - 1;
+        }
+      },
+      [isSet, bits, func, batchFunc](int32_t idx) {
+        auto word = (isSet ? bits[idx] : ~bits[idx]);
+        if (kAllSet == word) {
+          const size_t start = idx * 64;
+          const size_t end = (idx + 1) * 64;
+          batchFunc(start, end);
+        } else {
+          while (word) {
+            func(idx * 64 + __builtin_ctzll(word));
+            word &= word - 1;
+          }
+        }
+      });
+}
+
 /// Invokes a function for each set bit.
 template <typename Callable>
 inline void
 forEachSetBit(const uint64_t* bits, int32_t begin, int32_t end, Callable func) {
   forEachBit(bits, begin, end, true, func);
+}
+
+template <typename Callable, typename CallableBatch64>
+inline void forEachSetBit(
+    const uint64_t* bits,
+    int32_t begin,
+    int32_t end,
+    Callable func,
+    CallableBatch64 batchFunc) {
+  forEachBit(bits, begin, end, true, func, batchFunc);
 }
 
 /// Invokes a function for each unset bit.
@@ -724,7 +794,7 @@ bool inline hasIntersection(
 
 template <typename T = uint64_t>
 inline int32_t countLeadingZeros(T word) {
-  static_assert(std::is_same_v<T, uint64_t> || std::is_same_v<T, __uint128_t>);
+  static_assert(std::is_same_v<T, uint64_t> || std::is_same_v<T, facebook::velox::uint128_t>);
   /// Built-in Function: int __builtin_clz (unsigned int x) returns the number
   /// of leading 0-bits in x, starting at the most significant bit position. If
   /// x is 0, the result is undefined.
@@ -734,7 +804,7 @@ inline int32_t countLeadingZeros(T word) {
   if constexpr (std::is_same_v<T, uint64_t>) {
     return __builtin_clzll(word);
   } else {
-    uint64_t hi = word >> 64;
+    uint64_t hi = static_cast<uint64_t>(word >> 64);
     uint64_t lo = static_cast<uint64_t>(word);
     return (hi == 0) ? 64 + __builtin_clzll(lo) : __builtin_clzll(hi);
   }
@@ -753,7 +823,7 @@ inline uint64_t nextPowerOfTwo(uint64_t size) {
   return 2 * lower;
 }
 
-inline bool isPowerOfTwo(uint64_t size) {
+constexpr bool isPowerOfTwo(uint64_t size) {
   return (size & (size - 1)) == 0;
 }
 
@@ -835,7 +905,7 @@ inline T loadBits(const uint64_t* source, uint64_t bitOffset, uint8_t numBits) {
     return word >> bit;
   }
   uint8_t lastByte = reinterpret_cast<const uint8_t*>(address)[sizeof(T)];
-  uint64_t lastBits = static_cast<T>(lastByte) << (kBitSize - bit);
+  T lastBits = static_cast<T>(lastByte) << (kBitSize - bit);
   return (word >> bit) | lastBits;
 }
 
@@ -851,7 +921,7 @@ storeBits(uint64_t* target, uint64_t offset, uint64_t word, uint8_t numBits) {
   T* address =
       reinterpret_cast<T*>(reinterpret_cast<uint64_t>(target) + (offset / 8));
   auto bitOffset = offset & 7;
-  uint64_t mask = (numBits == 64 ? ~0UL : ((1UL << numBits) - 1)) << bitOffset;
+  uint64_t mask = (numBits == 64 ? ~0ULL : ((1ULL << numBits) - 1)) << bitOffset;
   *address = (*address & ~mask) | (mask & (word << bitOffset));
   if (numBits + bitOffset > kBitSize) {
     uint8_t* lastByteAddress = reinterpret_cast<uint8_t*>(address) + sizeof(T);
@@ -992,6 +1062,20 @@ inline void padToAlignment(
 
 /// Returns value with the order of the bytes reversed; for example, 0xaabb
 /// becomes 0xbbaa. Byte here always means exactly 8 bits.
+
+#ifdef _MSC_VER
+inline facebook::velox::int128_t builtin_bswap128(facebook::velox::int128_t value) {
+  // MSVC doesn't have __builtin_bswap128, so we implement it using two 64-bit swaps
+  uint64_t high = value.high();
+  uint64_t low = value.low();
+  
+  // Swap bytes in each 64-bit part and swap their positions
+  return facebook::velox::int128_t(
+    static_cast<int64_t>(_byteswap_uint64(low)),   // low becomes high, swapped
+    _byteswap_uint64(high)                         // high becomes low, swapped
+  );
+}
+#else
 inline __int128_t builtin_bswap128(__int128_t value) {
 #if defined __has_builtin
 #if __has_builtin(__builtin_bswap128)
@@ -1006,6 +1090,7 @@ inline __int128_t builtin_bswap128(__int128_t value) {
 #undef VELOX_HAS_BUILTIN_BSWAP_INT128
 #endif
 }
+#endif
 
 /// Store `bits' into the memory region pointed by `byte', at `index' (bit
 /// index).  If `kSize' is 8, we store the whole byte directly; otherwise it
@@ -1027,6 +1112,118 @@ void storeBitsToByte(uint8_t bits, uint8_t* bytes, unsigned index) {
   }
 }
 
+/// Returns the number of bits required to store the value.
+/// For a value of 0, returns 1.
+inline int bitsRequired(uint64_t value) noexcept {
+  return 64 - __builtin_clzll(value | 1);
+}
+
+/// Packs bools into bitmap. bitmap must point to a region large enough.
+/// Does not clear bitmap first — bit i is set if bools[i] is true OR
+/// bit i was already set.
+void packBitmap(std::span<const bool> bools, char* bitmap);
+
+/// Finds the index of the n'th set bit in [begin, end) in bitmap.
+/// Returns end if not found. Returns begin if begin >= end or n == 0.
+uint32_t
+findSetBit(const char* bitmap, uint32_t begin, uint32_t end, uint32_t n);
+
+/// Debug: prints bits of a numeric type in nibble groups.
+template <typename T>
+std::string printBits(T c) {
+  std::string result;
+  for (int i = 0; i < (sizeof(T) << 3); ++i) {
+    if (i > 0 && i % 4 == 0) {
+      result += ' ';
+    }
+    if (c & 1) {
+      result += '1';
+    } else {
+      result += '0';
+    }
+    c >>= 1;
+  }
+  // We actually want little endian order.
+  std::reverse(result.begin(), result.end());
+  return result;
+}
+
+/// Read-only view over a bitmap stored as char*.
+class Bitmap {
+ public:
+  Bitmap(const void* bitmap, uint32_t size)
+      : bitmap_{static_cast<char*>(const_cast<void*>(bitmap))}, size_{size} {}
+
+  bool test(uint32_t pos) const {
+    return isBitSet(reinterpret_cast<const uint8_t*>(bitmap_), pos);
+  }
+
+  uint32_t size() const {
+    return size_;
+  }
+
+  const void* bits() const {
+    return bitmap_;
+  }
+
+ protected:
+  char* bitmap_;
+  uint32_t size_;
+};
+
+/// Mutable bitmap builder.
+class BitmapBuilder : public Bitmap {
+ public:
+  BitmapBuilder(void* bitmap, uint32_t size) : Bitmap{bitmap, size} {}
+
+  void set(uint32_t pos) {
+    setBit(reinterpret_cast<uint8_t*>(bitmap_), pos);
+  }
+
+  void maybeSet(uint32_t pos, bool bit) {
+    maybeSetBit(bitmap_, pos, bit);
+  }
+
+  void set(uint32_t begin, uint32_t end) {
+    fillBits(
+        reinterpret_cast<uint64_t*>(bitmap_),
+        static_cast<int32_t>(begin),
+        static_cast<int32_t>(end),
+        true);
+  }
+
+  void clear(uint32_t begin, uint32_t end) {
+    fillBits(
+        reinterpret_cast<uint64_t*>(bitmap_),
+        static_cast<int32_t>(begin),
+        static_cast<int32_t>(end),
+        false);
+  }
+
+  /// Copy the specified range from the source bitmap into this one. It
+  /// guarantees |begin| is the beginning bit offset, but may copy more beyond
+  /// |end|.
+  void copy(const Bitmap& other, uint32_t begin, uint32_t end);
+};
+
 } // namespace bits
 } // namespace velox
 } // namespace facebook
+
+// Define bswap functions at global scope for MSVC compatibility
+// (GCC/Clang provide these as compiler intrinsics)
+#ifdef _MSC_VER
+#include <stdlib.h>
+
+inline uint16_t __builtin_bswap16(uint16_t value) {
+  return _byteswap_ushort(value);
+}
+
+inline uint32_t __builtin_bswap32(uint32_t value) {
+  return _byteswap_ulong(value);
+}
+
+inline uint64_t __builtin_bswap64(uint64_t value) {
+  return _byteswap_uint64(value);
+}
+#endif

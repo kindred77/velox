@@ -19,8 +19,38 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <vector>
+#include <mutex>
 
+#ifdef _MSC_VER
+#include <intrin.h>
+inline size_t count_trailing_zeros(uint64_t x) {
+  if (x == 0) return 64;
+  unsigned long index;
+  _BitScanForward64(&index, x);
+  return static_cast<size_t>(index);
+}
+
+inline size_t count_trailing_zeros_32bits(uint32_t x) {
+  if (x == 0) return 32;
+  unsigned long index;
+  _BitScanForward(&index, x);
+  return static_cast<size_t>(index);
+}
+
+inline size_t count_leading_zeros(uint64_t x) {
+  if (x == 0) return 64;
+  unsigned long index;
+  _BitScanReverse64(&index, x);
+  return 63 - static_cast<size_t>(index);
+}
+
+inline size_t count_leading_zeros_32bits(uint32_t x) {
+  if (x == 0) return 32;
+  unsigned long index;
+  _BitScanReverse(&index, x);
+  return 31 - static_cast<size_t>(index);
+}
+#else
 inline size_t count_trailing_zeros(uint64_t x) {
   return x == 0 ? 64 : __builtin_ctzll(x);
 }
@@ -36,6 +66,7 @@ inline size_t count_leading_zeros(uint64_t x) {
 inline size_t count_leading_zeros_32bits(uint32_t x) {
   return x == 0 ? 32 : __builtin_clz(x);
 }
+#endif
 
 namespace facebook::velox {
 
@@ -88,15 +119,4 @@ using tsan_lock_guard = TsanEmptyLockGuard<T>;
 
 #endif
 
-template <typename T>
-inline void resizeTsanAtomic(
-    std::vector<tsan_atomic<T>>& vector,
-    int32_t newSize) {
-  std::vector<tsan_atomic<T>> newVector(newSize);
-  auto numCopy = std::min<int32_t>(newSize, vector.size());
-  for (auto i = 0; i < numCopy; ++i) {
-    newVector[i] = tsanAtomicValue(vector[i]);
-  }
-  vector = std::move(newVector);
-}
 } // namespace facebook::velox

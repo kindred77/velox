@@ -23,6 +23,34 @@ namespace {
 
 class DecimalRoundTest : public SparkFunctionBaseTest {
  protected:
+  /// Computes result precision and scale for decimal rounding. Matches Spark's
+  /// logic from version 3.3+.
+  static std::pair<uint8_t, uint8_t> getResultPrecisionScale(
+      uint8_t precision,
+      uint8_t scale,
+      int32_t roundScale) {
+    const int32_t integralLeastNumDigits = precision - scale + 1;
+    if (roundScale < 0) {
+      const auto newPrecision = std::max(
+          integralLeastNumDigits,
+          -std::max(
+              roundScale,
+              -static_cast<int32_t>(LongDecimalType::kMaxPrecision)) +
+              1);
+      return {
+          std::min(
+              newPrecision,
+              static_cast<int32_t>(LongDecimalType::kMaxPrecision)),
+          0};
+    }
+    const uint8_t newScale = std::min(static_cast<int32_t>(scale), roundScale);
+    return {
+        std::min(
+            integralLeastNumDigits + newScale,
+            static_cast<int32_t>(LongDecimalType::kMaxPrecision)),
+        newScale};
+  }
+
   core::CallTypedExprPtr createDecimalRound(
       const TypePtr& inputType,
       const std::optional<int32_t>& scaleOpt,
@@ -35,26 +63,27 @@ class DecimalRoundTest : public SparkFunctionBaseTest {
       if (castScale) {
         // It is a common case in Spark for the second argument to be cast from
         // bigint to integer.
-        inputs.emplace_back(std::make_shared<core::CastTypedExpr>(
-            INTEGER(),
-            std::make_shared<core::ConstantTypedExpr>(
-                BIGINT(), variant((int64_t)scale)),
-            true /*nullOnFailure*/));
+        inputs.emplace_back(
+            std::make_shared<core::CastTypedExpr>(
+                INTEGER(),
+                std::make_shared<core::ConstantTypedExpr>(
+                    BIGINT(), variant((int64_t)scale)),
+                true /*nullOnFailure*/));
       } else {
-        inputs.emplace_back(std::make_shared<core::ConstantTypedExpr>(
-            INTEGER(), variant(scale)));
+        inputs.emplace_back(
+            std::make_shared<core::ConstantTypedExpr>(
+                INTEGER(), variant(scale)));
       }
     }
 
     const auto [inputPrecision, inputScale] =
         getDecimalPrecisionScale(*inputType);
     const auto [resultPrecision, resultScale] =
-        DecimalRoundCallToSpecialForm::getResultPrecisionScale(
-            inputPrecision, inputScale, scale);
+        getResultPrecisionScale(inputPrecision, inputScale, scale);
     return std::make_shared<const core::CallTypedExpr>(
         DECIMAL(resultPrecision, resultScale),
         std::move(inputs),
-        DecimalRoundCallToSpecialForm::kRoundDecimal);
+        kRoundDecimal);
   }
 
   void testDecimalRound(

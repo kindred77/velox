@@ -23,6 +23,14 @@
 
 #include <type_traits>
 
+#ifdef _WIN32
+#include <malloc.h>
+// Windows doesn't have aligned_alloc, use _aligned_malloc instead
+inline void* aligned_alloc(size_t alignment, size_t size) {
+  return _aligned_malloc(size, alignment);
+}
+#endif
+
 namespace facebook::velox {
 
 /// Class template similar to std::vector with no default construction and a
@@ -135,6 +143,22 @@ class raw_vector {
     size_ = 0;
   }
 
+  /// Releases unused capacity. If empty, frees all memory.
+  void shrink_to_fit() {
+    if (size_ == 0) {
+      free();
+      capacity_ = 0;
+      return;
+    }
+    if (calculateCapacity(size_) < capacity_) {
+      auto* newData = allocateData(size_);
+      memcpy(newData, data_, size_ * sizeof(T));
+      free();
+      data_ = newData;
+      capacity_ = calculateCapacity(size_);
+    }
+  }
+
   void resize(int64_t size) {
     if (LIKELY(size <= capacity_)) {
       size_ = size;
@@ -212,9 +236,12 @@ class raw_vector {
     // Clear the word below the pointer so that we do not get read of
     // uninitialized when reading a partial word that extends below
     // the pointer.
+    // Suppress GCC14 warning. "error: writing 8 bytes into a region of size 0"
+    VELOX_SUPPRESS_STRINGOP_OVERFLOW_WARNING
     *reinterpret_cast<int64_t*>(
         reinterpret_cast<uint8_t*>(getDataFromBuffer(buffer)) -
         sizeof(int64_t)) = 0;
+    VELOX_UNSUPPRESS_STRINGOP_OVERFLOW_WARNING
     return getDataFromBuffer(buffer);
   }
 
@@ -226,7 +253,11 @@ class raw_vector {
     if (pool_ != nullptr) {
       pool_->free(buffer, bufferSize(capacity_));
     } else {
+#ifdef _WIN32
+      _aligned_free(buffer);
+#else
       ::free(buffer);
+#endif
     }
     data_ = nullptr;
   }
@@ -243,7 +274,11 @@ class raw_vector {
         if (pool_ != nullptr) {
           pool_->free(newBuffer, bufferSize(newCapacity));
         } else {
+#ifdef _WIN32
+          _aligned_free(newBuffer);
+#else
           ::free(newBuffer);
+#endif
         }
         throw;
       }

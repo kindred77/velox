@@ -16,6 +16,7 @@
 #include <folly/container/F14Map.h>
 #include <gtest/gtest.h>
 #include "velox/duckdb/conversion/DuckParser.h"
+#include "velox/parse/Expressions.h"
 #include "velox/parse/IExpr.h"
 
 namespace facebook::velox::core {
@@ -64,6 +65,45 @@ TEST_F(ExprTest, hashMap) {
     EXPECT_EQ(exprs.at(expr2), 6);
     EXPECT_EQ(exprs.at(expr3), 5);
   }
+}
+
+TEST_F(ExprTest, tryAsRootColumn) {
+  // Top-level field access on an input column.
+  {
+    auto expr = parse("a");
+    const auto* field = FieldAccessExpr::tryAsRootColumn(expr);
+    ASSERT_NE(field, nullptr);
+    EXPECT_EQ(field->name(), "a");
+  }
+
+  // Dereference (a.b) is a FieldAccess whose input is not an InputExpr.
+  {
+    auto expr = parse("a.b");
+    EXPECT_EQ(FieldAccessExpr::tryAsRootColumn(expr), nullptr);
+  }
+
+  // Non-FieldAccess expressions are not root columns.
+  {
+    EXPECT_EQ(FieldAccessExpr::tryAsRootColumn(parse("a + 1")), nullptr);
+    EXPECT_EQ(FieldAccessExpr::tryAsRootColumn(parse("42")), nullptr);
+    EXPECT_EQ(
+        FieldAccessExpr::tryAsRootColumn(parse("cast(a as bigint)")), nullptr);
+  }
+}
+
+TEST_F(ExprTest, dropAlias) {
+  EXPECT_EQ(parse("a + b")->dropAlias()->toString(), R"(plus("a","b"))");
+  EXPECT_EQ(parse("a + b as c")->dropAlias()->toString(), R"(plus("a","b"))");
+
+  EXPECT_EQ(
+      parse("cast(a as date)")->dropAlias()->toString(),
+      R"(cast("a" as DATE))");
+  EXPECT_EQ(
+      parse("cast(a as date) as b")->dropAlias()->toString(),
+      R"(cast("a" as DATE))");
+
+  EXPECT_EQ(parse("a + 10")->dropAlias()->toString(), R"(plus("a",10))");
+  EXPECT_EQ(parse("a + 10 as b")->dropAlias()->toString(), R"(plus("a",10))");
 }
 
 } // namespace

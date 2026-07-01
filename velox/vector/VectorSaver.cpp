@@ -15,6 +15,12 @@
  */
 #include "velox/vector/VectorSaver.h"
 #include <fstream>
+#ifdef _WIN32
+#include <filesystem>
+#include <random>
+#else
+#include <cstdlib>
+#endif
 #include "velox/vector/ComplexVector.h"
 #include "velox/vector/FlatVector.h"
 #include "velox/vector/LazyVector.h"
@@ -69,6 +75,7 @@ bool read<bool>(std::istream& in) {
 template <>
 std::string read<std::string>(std::istream& in) {
   auto size = read<int32_t>(in);
+  VELOX_CHECK_GE(size, 0, "Invalid serialized string size: {}", size);
   std::string data;
   data.resize(size);
   in.read(data.data(), size);
@@ -93,7 +100,8 @@ void writeEncoding(VectorEncoding::Simple encoding, std::ostream& out) {
       write<int32_t>(static_cast<int8_t>(Encoding::kLazy), out);
       return;
     default:
-      VELOX_UNSUPPORTED("Unsupported encoding: {}", mapSimpleToName(encoding));
+      VELOX_UNSUPPORTED(
+          "Unsupported encoding: {}", mapSimpleToName(encoding));
   }
 }
 
@@ -248,10 +256,11 @@ void writeStringViews(
   std::vector<BufferMetadata> sortedStringBuffers;
   sortedStringBuffers.reserve(stringBuffers.size());
   for (int64_t i = 0; i < stringBuffers.size(); ++i) {
-    sortedStringBuffers.push_back(BufferMetadata{
-        stringBuffers[i]->as<char>(),
-        stringBuffers[i]->as<char>() + stringBuffers[i]->size(),
-        i});
+    sortedStringBuffers.push_back(
+        BufferMetadata{
+            stringBuffers[i]->as<char>(),
+            stringBuffers[i]->as<char>() + stringBuffers[i]->size(),
+            i});
   }
 
   std::sort(
@@ -797,12 +806,28 @@ std::string restoreStringFromFile(const char* filePath) {
 std::optional<std::string> generateFolderPath(
     const char* basePath,
     const char* prefix) {
+#ifdef _WIN32
+  // Windows implementation using std::filesystem
+  std::random_device rd;
+  std::mt19937 gen(rd());
+  std::uniform_int_distribution<> dis(0, 999999);
+  
+  for (int attempts = 0; attempts < 100; ++attempts) {
+    auto path = fmt::format("{}/velox_{}_{:06d}", basePath, prefix, dis(gen));
+    std::error_code ec;
+    if (std::filesystem::create_directories(path, ec)) {
+      return path;
+    }
+  }
+  return std::nullopt;
+#else
   auto path = fmt::format("{}/velox_{}_XXXXXX", basePath, prefix);
   auto createdPath = mkdtemp(path.data());
   if (createdPath == nullptr) {
     return std::nullopt;
   }
   return path;
+#endif
 }
 
 void saveSelectivityVector(const SelectivityVector& rows, std::ostream& out) {

@@ -17,8 +17,10 @@
 #include <string>
 #include "velox/functions/Registerer.h"
 #include "velox/functions/prestosql/GeometryFunctions.h"
+#include "velox/functions/prestosql/GooglePolylineFunctions.h"
 #include "velox/functions/prestosql/types/BingTileType.h"
 #include "velox/functions/prestosql/types/GeometryRegistration.h"
+#include "velox/functions/prestosql/types/SphericalGeographyRegistration.h"
 
 namespace facebook::velox::functions {
 
@@ -31,10 +33,35 @@ void registerConstructors(const std::string& prefix) {
       {{prefix + "ST_GeomFromBinary"}});
   registerFunction<StAsTextFunction, Varchar, Geometry>(
       {{prefix + "ST_AsText"}});
+  registerFunction<SphericalAsTextFunction, Varchar, SphericalGeography>(
+      {{prefix + "ST_AsText"}});
   registerFunction<StAsBinaryFunction, Varbinary, Geometry>(
       {{prefix + "ST_AsBinary"}});
   registerFunction<StPointFunction, Geometry, double, double>(
       {{prefix + "ST_Point"}});
+  registerFunction<StLineFromTextFunction, Geometry, Varchar>(
+      {{prefix + "ST_LineFromText"}});
+  registerFunction<StLineStringFunction, Geometry, Array<Geometry>>(
+      {{prefix + "ST_LineString"}});
+  registerFunction<StMultiPointFunction, Geometry, Array<Geometry>>(
+      {{prefix + "ST_MultiPoint"}});
+  registerFunction<ToSphericalGeographyFunction, SphericalGeography, Geometry>(
+      {{prefix + "to_spherical_geography"}});
+  registerFunction<ToGeometryFunction, Geometry, SphericalGeography>(
+      {{prefix + "to_geometry"}});
+  registerFunction<
+      StSphericalCentroidFunction,
+      SphericalGeography,
+      SphericalGeography>({{prefix + "st_centroid"}});
+  registerFunction<
+      StSphericalDistanceFunction,
+      double,
+      SphericalGeography,
+      SphericalGeography>({{prefix + "st_distance"}});
+  registerFunction<StSphericalLengthFunction, double, SphericalGeography>(
+      {{prefix + "st_length"}});
+  registerFunction<StSphericalAreaFunction, double, SphericalGeography>(
+      {{prefix + "st_area"}});
 }
 
 void registerRelationPredicates(const std::string& prefix) {
@@ -120,7 +147,7 @@ void registerAccessors(const std::string& prefix) {
       {{prefix + "ST_InteriorRingN"}});
   registerFunction<StNumGeometriesFunction, int32_t, Geometry>(
       {{prefix + "ST_NumGeometries"}});
-  registerFunction<StNumInteriorRingFunction, int32_t, Geometry>(
+  registerFunction<StNumInteriorRingFunction, int64_t, Geometry>(
       {{prefix + "ST_NumInteriorRing"}});
   registerFunction<StConvexHullFunction, Geometry, Geometry>(
       {{prefix + "ST_ConvexHull"}});
@@ -143,7 +170,7 @@ void registerAccessors(const std::string& prefix) {
       std::make_unique<StCoordDimFunction>());
   registerFunction<StPointsFunction, Array<Geometry>, Geometry>(
       {{prefix + "ST_Points"}});
-  registerFunction<StNumPointsFunction, int32_t, Geometry>(
+  registerFunction<StNumPointsFunction, int64_t, Geometry>(
       {{prefix + "ST_NumPoints"}});
   registerFunction<StInteriorRingsFunction, Array<Geometry>, Geometry>(
       {{prefix + "ST_InteriorRings"}});
@@ -188,15 +215,37 @@ void registerBingTileGeometryFunctions(const std::string& prefix) {
       int32_t>({{prefix + "geometry_to_dissolved_bing_tiles"}});
 }
 
+void registerGooglePolylineFunctions(const std::string& prefix) {
+  registerFunction<GooglePolylineEncodeFunction, Varchar, Array<Geometry>>(
+      {{prefix + "google_polyline_encode"}});
+
+  registerFunction<
+      GooglePolylineEncodeFunction,
+      Varchar,
+      Array<Geometry>,
+      int64_t>({{prefix + "google_polyline_encode"}});
+
+  registerFunction<GooglePolylineDecodeFunction, Array<Geometry>, Varchar>(
+      {{prefix + "google_polyline_decode"}});
+
+  registerFunction<
+      GooglePolylineDecodeFunction,
+      Array<Geometry>,
+      Varchar,
+      int64_t>({{prefix + "google_polyline_decode"}});
+}
+
 } // namespace
 
 void registerGeometryFunctions(const std::string& prefix) {
   registerGeometryType();
+  registerSphericalGeographyType();
   registerConstructors(prefix);
   registerRelationPredicates(prefix);
   registerOverlayOperations(prefix);
   registerAccessors(prefix);
   registerBingTileGeometryFunctions(prefix);
+  registerGooglePolylineFunctions(prefix);
 }
 
 } // namespace facebook::velox::functions

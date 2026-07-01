@@ -463,7 +463,7 @@ struct ArrayCumSumFunction {
         if constexpr (std::is_floating_point_v<NativeType>) {
           sum += in[i].value();
         } else {
-          sum = checkedPlus<NativeType>(sum, in[i].value());
+          sum = functions::checkedPlus<NativeType>(sum, in[i].value());
         }
         out.add_item() = sum;
       } else {
@@ -485,7 +485,7 @@ struct ArrayCumSumFunction {
       if constexpr (std::is_floating_point_v<NativeType>) {
         sum += item;
       } else {
-        sum = checkedPlus<NativeType>(sum, item);
+        sum = functions::checkedPlus<NativeType>(sum, item);
       }
       out.add_item() = sum;
     }
@@ -686,24 +686,22 @@ template <typename TExec, typename T>
 struct ArrayConcatFunction {
   VELOX_DEFINE_FUNCTION_TYPES(TExec)
 
-  static constexpr int32_t kMinArity = 2;
-  static constexpr int32_t kMaxArity = 254;
+  static constexpr int32_t kMaxArity = 252;
 
   void call(
       out_type<Array<T>>& out,
+      const arg_type<Array<T>>& array1,
+      const arg_type<Array<T>>& array2,
       const arg_type<Variadic<Array<T>>>& arrays) {
-    VELOX_USER_CHECK_GE(
-        arrays.size(),
-        kMinArity,
-        "There must be {} or more arguments to concat",
-        kMinArity);
     VELOX_USER_CHECK_LE(
         arrays.size(), kMaxArity, "Too many arguments for concat function");
-    int64_t elementCount = 0;
+    int64_t elementCount = array1.size() + array2.size();
     for (const auto& array : arrays) {
       elementCount += array.value().size();
     }
     out.reserve(elementCount);
+    out.add_items(array1);
+    out.add_items(array2);
     for (const auto& array : arrays) {
       out.add_items(array.value());
     }
@@ -1030,6 +1028,46 @@ struct ArrayNGramsFunctionString {
   }
 };
 
+/// Splits the input array into chunks of the given size. If the array is not
+/// evenly divisible, the last chunk contains the remaining elements.
+///
+/// array_split_into_chunks(array(T), sz) -> array(array(T))
+template <typename TExecParams, typename T>
+struct ArraySplitIntoChunksFunction {
+  VELOX_DEFINE_FUNCTION_TYPES(TExecParams);
+
+  static constexpr int32_t kMaxNumChunks = 10'000;
+
+  FOLLY_ALWAYS_INLINE void call(
+      out_type<velox::Array<velox::Array<T>>>& out,
+      const arg_type<velox::Array<T>>& input,
+      const int32_t& sz) {
+    VELOX_USER_CHECK_GT(
+        sz, 0, "Invalid slice size: {}. Size must be greater than zero.", sz);
+
+    const auto inputSize = input.size();
+    VELOX_USER_CHECK_GT(inputSize, 0, "Cannot split an empty array.");
+
+    VELOX_USER_CHECK_LE(
+        inputSize / sz,
+        kMaxNumChunks,
+        "Cannot split array of size: {} into more than 10000 parts.",
+        inputSize);
+
+    for (auto i = 0; i < inputSize; i += sz) {
+      auto& chunk = out.add_item();
+      const auto end = std::min<int64_t>(i + sz, inputSize);
+      for (auto j = i; j < end; ++j) {
+        if (!input[j].has_value()) {
+          chunk.add_null();
+        } else {
+          chunk.push_back(input[j].value());
+        }
+      }
+    }
+  }
+};
+
 /// This class implements the array union function.
 ///
 /// DEFINITION:
@@ -1043,6 +1081,7 @@ struct ArrayUnionFunction {
   template <typename Out, typename In>
   void call(Out& out, const In& inputArray1, const In& inputArray2) {
     util::floating_point::HashSetNaNAware<typename In::element_t> elementSet;
+    elementSet.reserve(inputArray1.size() + inputArray2.size());
     bool nullAdded = false;
     auto addItems = [&](auto& inputArray) {
       for (const auto& item : inputArray) {

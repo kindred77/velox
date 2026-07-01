@@ -51,37 +51,72 @@ CREATE_TYPE_TRAIT(ROW, STRUCT)
 
 void ProtoUtils::writeType(
     const Type& type,
-    proto::Footer& footer,
-    proto::Type* parent) {
-  auto self = footer.add_types();
+    FooterWriteWrapper& footer,
+    TypeWriteWrapper* parent,
+    const AttributeProvider& attributeProvider) {
+  auto self = footer.addTypes();
+  const uint32_t typeId = footer.typesSize() - 1;
   if (parent) {
-    parent->add_subtypes(footer.types_size() - 1);
+    parent->addSubtypes(static_cast<int>(typeId));
   }
+
   auto kind =
       VELOX_STATIC_FIELD_DYNAMIC_DISPATCH(SchemaType, kind, type.kind());
-  self->set_kind(kind);
+  auto typeKindWrapper = TypeKindWrapper(&kind);
+  self.setKind(typeKindWrapper);
+
+  // Stamp per-type attributes (e.g. Iceberg field ids) before recursing into
+  // children. An empty result keeps the wire format byte-identical to the
+  // pre-attributes serialization for callers that do not provide attributes.
+  if (attributeProvider) {
+    for (const auto& [key, value] : attributeProvider(typeId)) {
+      self.addAttribute(key, value);
+    }
+  }
+
   switch (type.kind()) {
     case TypeKind::ROW: {
       auto& row = type.asRow();
       for (size_t i = 0; i < row.size(); ++i) {
-        self->add_fieldnames(row.nameOf(i));
-        writeType(*row.childAt(i), footer, self);
+        self.addFieldnames(row.nameOf(i));
+        writeType(*row.childAt(i), footer, &self, attributeProvider);
       }
       break;
     }
     case TypeKind::ARRAY:
-      writeType(*type.asArray().elementType(), footer, self);
+      writeType(
+          *type.asArray().elementType(), footer, &self, attributeProvider);
       break;
     case TypeKind::MAP: {
       auto& map = type.asMap();
-      writeType(*map.keyType(), footer, self);
-      writeType(*map.valueType(), footer, self);
+      writeType(*map.keyType(), footer, &self, attributeProvider);
+      writeType(*map.valueType(), footer, &self, attributeProvider);
       break;
     }
     default:
       DWIO_ENSURE(type.isPrimitiveType());
       break;
   }
+}
+
+std::unordered_map<uint32_t, std::vector<std::pair<std::string, std::string>>>
+ProtoUtils::readAttributes(const FooterWrapper& footer) {
+  std::unordered_map<uint32_t, std::vector<std::pair<std::string, std::string>>>
+      result;
+  for (int32_t i = 0; i < footer.typesSize(); ++i) {
+    const auto type = footer.types(i);
+    const auto numAttributes = type.attributesSize();
+    if (numAttributes == 0) {
+      continue;
+    }
+    std::vector<std::pair<std::string, std::string>> attributes;
+    attributes.reserve(numAttributes);
+    for (int32_t j = 0; j < numAttributes; ++j) {
+      attributes.emplace_back(type.attribute(j));
+    }
+    result.emplace(static_cast<uint32_t>(i), std::move(attributes));
+  }
+  return result;
 }
 
 std::shared_ptr<const Type> ProtoUtils::fromFooter(

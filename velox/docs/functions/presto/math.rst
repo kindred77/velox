@@ -3,6 +3,7 @@ Mathematical Functions
 ====================================
 
 .. function:: abs(x) -> [same as x]
+   :noindex:
 
     Returns the absolute value of ``x``.
 
@@ -11,6 +12,7 @@ Mathematical Functions
     Returns the cube root of ``x``.
 
 .. function:: ceil(x) -> [same as x]
+   :noindex:
 
     This is an alias for :func:`ceiling`.
 
@@ -39,6 +41,7 @@ Mathematical Functions
         SELECT cosine_similarity(MAP(ARRAY[], ARRAY[]), MAP(ARRAY['a', 'b'], ARRAY[2, 3])); -- NaN
 
 .. function:: cosine_similarity(array(double), array(double)) -> double
+   :noindex:
 
     Returns the `cosine similarity <https://en.wikipedia.org/wiki/Cosine_similarity>`_ between the vectors represented as array(double).
     If any input array is empty, the function returns NaN. If the input arrays have different sizes, the function throws VeloxUserError.
@@ -52,6 +55,7 @@ Mathematical Functions
         SELECT cosine_similarity(ARRAY[], ARRAY[]); -- NaN
 
 .. function:: cosine_similarity(array(real), array(real)) -> real
+   :noindex:
 
     Returns the `cosine similarity <https://en.wikipedia.org/wiki/Cosine_similarity>`_ between the vectors represented as array(real).
     If any input array is empty, the function returns NaN. If the input arrays have different sizes, the function throws VeloxUserError.
@@ -70,11 +74,13 @@ Mathematical Functions
         SELECT l2_squared(ARRAY[], ARRAY[]); -- NaN
 
 .. function:: l2_squared(array(double), array(double)) -> double
+   :noindex:
 
     Returns the squared `Euclidean distance <https://en.wikipedia.org/wiki/Euclidean_distance>`_ between the vectors represented as array(double).
     If any input array is empty, the function returns NaN. If the input arrays have different sizes, the function throws VeloxUserError.
 
 .. function:: dot_product(array(real), array(real)) -> real
+   :noindex:
 
     Returns the `Dot Product <https://en.wikipedia.org/wiki/Dot_product>`_ between the vectors represented as array(real).
     If any input array is empty, the function returns NaN. If the input arrays have different sizes, the function throws VeloxUserError.
@@ -88,6 +94,7 @@ Mathematical Functions
         SELECT dot_product(ARRAY[], ARRAY[]); -- NaN
 
 .. function:: dot_product(array(double), array(double)) -> double
+   :noindex:
 
     Returns the `Dot Product <https://en.wikipedia.org/wiki/Dot_product>`_ between the vectors represented as array(double).
     If any input array is empty, the function returns NaN. If the input arrays have different sizes, the function throws VeloxUserError.
@@ -97,6 +104,7 @@ Mathematical Functions
     Converts angle x in radians to degrees.
 
 .. function:: divide(x, y) -> [same as x]
+   :noindex:
 
     Returns the results of dividing x by y. The types of x and y must be the same.
     The result of dividing by zero depends on the input types. For integral types,
@@ -113,6 +121,7 @@ Mathematical Functions
     Returns Euler's number raised to the power of ``x``.
 
 .. function:: floor(x) -> [same as x]
+   :noindex:
 
     Returns ``x`` rounded down to the nearest integer.
 
@@ -133,6 +142,7 @@ Mathematical Functions
     Returns the base 10 logarithm of ``x``.
 
 .. function:: minus(x, y) -> [same as x]
+   :noindex:
 
     Returns the result of subtracting y from x. The types of x and y must be the same.
     For integral types, overflow results in an error.
@@ -142,11 +152,13 @@ Mathematical Functions
     Returns the modulus (remainder) of ``n`` divided by ``m``.
 
 .. function:: multiply(x, y) -> [same as x]
+   :noindex:
 
     Returns the result of multiplying x by y. The types of x and y must be the same.
     For integral types, overflow results in an error.
 
 .. function:: negate(x) -> [same as x]
+   :noindex:
 
     Returns the additive inverse of x, e.g. the number that, when added to x, yields zero.
 
@@ -155,6 +167,7 @@ Mathematical Functions
     Returns the value of Pi.
 
 .. function:: plus(x, y) -> [same as x]
+   :noindex:
 
     Returns the result of adding x to y. The types of x and y must be the same.
     For integral types, overflow results in an error.
@@ -185,6 +198,7 @@ Mathematical Functions
     Returns a pseudo-random value in the range 0.0 <= x < n.
 
 .. function:: round(x) -> [same as x]
+   :noindex:
 
     Returns ``x`` rounded to the nearest integer.
 
@@ -202,6 +216,7 @@ Mathematical Functions
     Returns a cryptographically secure random value in the range 0.0 <= x < 1.0.
 
 .. function:: secure_random(lower, upper) -> [same as input]
+   :noindex:
 
     Returns a cryptographically secure random value in the range lower <= x < upper, where lower < upper.
 
@@ -226,6 +241,7 @@ Mathematical Functions
     Returns the base-``radix`` representation of ``x``. ``radix`` must be between 2 and 36.
 
 .. function:: truncate(x) -> [same as x]
+   :noindex:
 
     Returns x rounded to integer by dropping digits after decimal point.
     Supported types of ``x`` are: REAL and DOUBLE.
@@ -383,6 +399,10 @@ Probability Functions: cdf
     Compute the Poisson cdf with given lambda (mean) parameter:  P(N <= value; lambda).
     The lambda parameter must be a positive real number (of type DOUBLE) and value must be a non-negative integer.
 
+.. function:: t_cdf(df, value) -> double
+
+    Compute the Student's t cdf with given degrees of freedom:  P(N < value; df).
+    The degrees of freedom must be a positive real number and value must be a real value.
 
 .. function:: weibull_cdf(a, b, value) -> double
 
@@ -422,13 +442,6 @@ Probability Functions: inverse_cdf
     for the cumulative probability (p): P(N < n). The numerator and denominator df parameters must be positive real numbers.
     The probability ``p`` must lie on the interval [0, 1].
 
-.. function:: inverse_normal_cdf(mean, sd, p) -> double
-
-    Compute the inverse of the Normal cdf with given mean and standard
-    deviation (sd) for the cumulative probability (p): P(N < n). The mean must be
-    a real value and the standard deviation must be a real and positive value (both of type DOUBLE).
-    The probability p must lie on the interval (0, 1).
-
 .. function:: inverse_gamma_cdf(shape, scale, p) -> double
 
     Compute the inverse of the Gamma cdf with given shape and scale parameters for the cumulative
@@ -453,6 +466,12 @@ Probability Functions: inverse_cdf
 
     Compute the inverse of the Chi-square cdf with given df (degrees of freedom) parameter for the cumulative
     probability (p): P(N < n). The df parameter must be positive real values.
+    The probability p must lie on the interval [0, 1].
+
+.. function:: inverse_t_cdf(df, p) -> double
+
+    Compute the inverse of the Student's t cdf with given degrees of freedom for the cumulative
+    probability (p): P(N < n). The degrees of freedom must be a positive real value.
     The probability p must lie on the interval [0, 1].
 
 ====================================

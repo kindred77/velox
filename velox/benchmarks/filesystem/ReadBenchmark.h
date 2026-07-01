@@ -16,10 +16,6 @@
 
 #include <iostream>
 
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-
 #include <folly/Random.h>
 #include <folly/Synchronized.h>
 #include <folly/executors/IOThreadPoolExecutor.h>
@@ -180,8 +176,9 @@ class ReadBenchmark {
             } else {
               std::vector<folly::Range<char*>> ranges;
               for (auto start = 0; start < rangeSize; start += size + gap) {
-                ranges.push_back(folly::Range<char*>(
-                    globalScratch.buffer.data() + start, size));
+                ranges.push_back(
+                    folly::Range<char*>(
+                        globalScratch.buffer.data() + start, size));
                 if (gap && start + gap < rangeSize) {
                   ranges.push_back(folly::Range<char*>(nullptr, gap));
                 }
@@ -262,7 +259,6 @@ class ReadBenchmark {
   static constexpr int32_t kWrite = -10000;
   // 0 means no op, kWrite means being written, other numbers are reader counts.
   std::string writeBatch_;
-  int32_t fd_;
   std::unique_ptr<folly::IOThreadPoolExecutor> executor_;
   std::unique_ptr<ReadFile> readFile_;
   folly::Random::DefaultGenerator rng_;

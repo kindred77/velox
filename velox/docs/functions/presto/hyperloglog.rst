@@ -67,6 +67,14 @@ Functions
     the range of ``[0.0040625, 0.26000]``.
 
 .. function:: merge(HyperLogLog) -> HyperLogLog
+   :noindex:
 
     Returns the ``HyperLogLog`` of the aggregate union of the individual ``hll``
     HyperLogLog structures.
+
+.. function:: merge_hll(array(HyperLogLog)) -> HyperLogLog
+
+    Returns the ``HyperLogLog`` of the union of an array of ``HyperLogLog`` structures.
+
+    * Returns ``NULL`` if the input array is ``NULL``, empty, or contains only ``NULL`` elements
+    * Ignores ``NULL`` elements and merges only valid ``HyperLogLog`` structures when the array contains a mix of ``NULL`` and non-null elements

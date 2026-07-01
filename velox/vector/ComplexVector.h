@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <atomic>
+
 #include <folly/container/F14Map.h>
 #include <folly/hash/Hash.h>
 #include <glog/logging.h>
@@ -66,10 +68,8 @@ class RowVector : public BaseVector {
             rowType->nameOf(i),
             i,
             type->childAt(i)->toString());
-        BaseVector::inMemoryBytes_ += child->inMemoryBytes();
       }
     }
-    updateContainsLazyNotLoaded();
   }
 
   static std::shared_ptr<RowVector> createEmpty(
@@ -184,15 +184,7 @@ class RowVector : public BaseVector {
         nullCount_);
   }
 
-  uint64_t retainedSize() const override {
-    auto size = BaseVector::retainedSize();
-    for (auto& child : children_) {
-      if (child) {
-        size += child->retainedSize();
-      }
-    }
-    return size;
-  }
+  void transferOrCopyTo(velox::memory::MemoryPool* pool) override;
 
   uint64_t estimateFlatSize() const override;
 
@@ -230,11 +222,18 @@ class RowVector : public BaseVector {
 
   VectorPtr slice(vector_size_t offset, vector_size_t length) const override;
 
-  bool containsLazyNotLoaded() const {
-    return containsLazyNotLoaded_;
-  }
+  /// Whether any child is a lazy vector that has not been loaded yet. The
+  /// result is cached and computed lazily on first access to avoid scanning
+  /// children when the flag is never read (common for intermediate RowVectors).
+  /// Safe to call concurrently even when the cached flag is dirty; see
+  /// containsLazyNotLoaded_ for why it is atomic.
+  bool containsLazyNotLoaded() const;
 
-  void updateContainsLazyNotLoaded() const;
+  /// Invalidates the cached containsLazyNotLoaded flag, causing it to be
+  /// recomputed on next access. Must be called after directly manipulating or
+  /// replacing children (e.g. setting lazy fields, wrapping children in
+  /// dictionaries).
+  void invalidateContainsLazyNotLoaded() const;
 
   void validate(const VectorValidateOptions& options) const override;
 
@@ -293,22 +292,49 @@ class RowVector : public BaseVector {
       vector_size_t count,
       vector_size_t childSize);
 
+  uint64_t retainedSizeImpl(uint64_t& totalStringBufferSize) const override {
+    auto size = BaseVector::retainedSizeImpl();
+    for (auto& child : children_) {
+      if (child) {
+        size += child->retainedSize(totalStringBufferSize);
+      }
+    }
+    return size;
+  }
+
   const size_t childrenSize_;
   mutable std::vector<VectorPtr> children_;
 
-  // Flag to indicate if any children of this vector contain lazy vector that
-  // has not been loaded.  Used to optimize recursive laziness check.  This will
-  // be initialized in the constructor, and should be updated by calling
-  // updateContainsLazyNotLoaded whenever a new lazy child is set (e.g. in table
-  // scan), or a lazy child is loaded (e.g. in LazyVector::ensureLoadedRows and
-  // loadedVector).
-  mutable bool containsLazyNotLoaded_;
+  void computeContainsLazyNotLoaded() const;
+
+  // Whether any child contains an unloaded lazy vector. -1 means dirty (needs
+  // recomputation on next access), 0 means false, 1 means true. Computed lazily
+  // on first read by computeContainsLazyNotLoaded().
+  //
+  // Atomic because that first-read recomputation can run concurrently on the
+  // same vector. isLazyNotLoaded() does not recurse into ARRAY/MAP children, so
+  // a RowVector nested inside an ARRAY/MAP keeps a dirty flag that is never
+  // evaluated at the ARRAY/MAP layer; a later code path can then read it from
+  // several driver threads at once when the same base vector is shared (e.g.
+  // MinMaxByNTest.groupByRow with ARRAY<ROW<..>> partitioned via
+  // LocalPartition). The race is benign -- there are no real lazy children so
+  // it always resolves to 0 -- but TSAN flags the unsynchronized read+write, so
+  // we load/store with memory_order_relaxed, which is free on x86.
+  //
+  // The cleaner fix is to forbid unloaded lazy ARRAY/MAP children at
+  // construction (a VELOX_CHECK in the ArrayVector/MapVector constructors).
+  // That barrier runs on the single constructing thread and would populate the
+  // nested Row's flag eagerly, removing the need for this to be atomic. We
+  // cannot add it yet: some internal code points still build ARRAY/MAP over
+  // lazy children. Until those callers are fixed the flag stays atomic.
+  mutable std::atomic<int8_t> containsLazyNotLoaded_{-1};
 
   // Flag to indicate all children has been loaded (non-recursively).  Used to
   // optimize loadedVector calls.  If this is true, we don't recurse into
   // children to check if they are loaded.  Will be set to true when
-  // loadedVector is called, and reset to false when updateContainsLazyNotLoaded
-  // is called (i.e. some children are likely updated to lazy).
+  // loadedVector is called, and reset to false when
+  // invalidateContainsLazyNotLoaded is called (i.e. some children are likely
+  // updated to lazy).
   mutable bool childrenLoaded_ = false;
 
   // For some non-selective reader, we need to keep the original vector that is
@@ -371,6 +397,8 @@ struct ArrayVectorBase : BaseVector {
     offsets_->asMutable<vector_size_t>()[i] = offset;
     sizes_->asMutable<vector_size_t>()[i] = size;
   }
+
+  void transferOrCopyTo(velox::memory::MemoryPool* pool) override;
 
   /// Check if there is any overlapping [offset, size] ranges.
   bool hasOverlappingRanges() const {
@@ -464,10 +492,11 @@ class ArrayVector : public ArrayVectorBase {
             nullCount,
             std::move(offsets),
             std::move(lengths)),
-        elements_(BaseVector::getOrCreateEmpty(
-            std::move(elements),
-            type->childAt(0),
-            pool)) {
+        elements_(
+            BaseVector::getOrCreateEmpty(
+                std::move(elements),
+                type->childAt(0),
+                pool)) {
     VELOX_CHECK_EQ(type->kind(), TypeKind::ARRAY);
     VELOX_CHECK(
         elements_->type()->kindEquals(type->childAt(0)),
@@ -521,10 +550,7 @@ class ArrayVector : public ArrayVectorBase {
         nullCount_);
   }
 
-  uint64_t retainedSize() const override {
-    return BaseVector::retainedSize() + offsets_->capacity() +
-        sizes_->capacity() + elements_->retainedSize();
-  }
+  void transferOrCopyTo(velox::memory::MemoryPool* pool) override;
 
   uint64_t estimateFlatSize() const override;
 
@@ -552,6 +578,11 @@ class ArrayVector : public ArrayVectorBase {
   void validate(const VectorValidateOptions& options) const override;
 
  private:
+  uint64_t retainedSizeImpl(uint64_t& totalStringBufferSize) const override {
+    return BaseVector::retainedSizeImpl() + offsets_->capacity() +
+        sizes_->capacity() + elements_->retainedSize(totalStringBufferSize);
+  }
+
   VectorPtr elements_;
 };
 
@@ -580,14 +611,16 @@ class MapVector : public ArrayVectorBase {
             nullCount,
             std::move(offsets),
             std::move(sizes)),
-        keys_(BaseVector::getOrCreateEmpty(
-            std::move(keys),
-            type->childAt(0),
-            pool)),
-        values_(BaseVector::getOrCreateEmpty(
-            std::move(values),
-            type->childAt(1),
-            pool)),
+        keys_(
+            BaseVector::getOrCreateEmpty(
+                std::move(keys),
+                type->childAt(0),
+                pool)),
+        values_(
+            BaseVector::getOrCreateEmpty(
+                std::move(values),
+                type->childAt(1),
+                pool)),
         sortedKeys_{sortedKeys} {
     VELOX_CHECK_EQ(type->kind(), TypeKind::MAP);
 
@@ -666,10 +699,7 @@ class MapVector : public ArrayVectorBase {
         sortedKeys_);
   }
 
-  uint64_t retainedSize() const override {
-    return BaseVector::retainedSize() + offsets_->capacity() +
-        sizes_->capacity() + keys_->retainedSize() + values_->retainedSize();
-  }
+  void transferOrCopyTo(velox::memory::MemoryPool* pool) override;
 
   uint64_t estimateFlatSize() const override;
 
@@ -740,6 +770,12 @@ class MapVector : public ArrayVectorBase {
   template <TypeKind kKeyTypeKind>
   std::shared_ptr<MapVector> updateImpl(
       const folly::Range<DecodedVector*>& others) const;
+
+  uint64_t retainedSizeImpl(uint64_t& totalStringBufferSize) const override {
+    return BaseVector::retainedSizeImpl() + offsets_->capacity() +
+        sizes_->capacity() + keys_->retainedSize(totalStringBufferSize) +
+        values_->retainedSize(totalStringBufferSize);
+  }
 
   VectorPtr keys_;
   VectorPtr values_;

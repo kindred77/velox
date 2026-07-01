@@ -20,9 +20,11 @@
 #include "velox/common/file/FileSystems.h"
 #include "velox/dwio/common/exception/Exception.h"
 
+#ifndef _WIN32
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#endif
 
 namespace facebook::velox::dwio::common {
 namespace {
@@ -43,6 +45,15 @@ std::unique_ptr<FileSink> localFileSink(
   if (filePath.starts_with(kFileSep)) {
     return std::make_unique<LocalFileSink>(filePath, options);
   }
+#ifdef _WIN32
+  // Windows: match drive letter paths (e.g., C:\path or C:/path)
+  if (filePath.length() >= 3 &&
+      std::isalpha(static_cast<unsigned char>(filePath[0])) &&
+      filePath[1] == ':' &&
+      (filePath[2] == '\\' || filePath[2] == '/')) {
+    return std::make_unique<LocalFileSink>(filePath, options);
+  }
+#endif
   return nullptr;
 }
 } // namespace
@@ -56,7 +67,7 @@ void FileSink::write(DataBuffer<char> buffer) {
 void FileSink::writeWithLogging(std::vector<DataBuffer<char>>& buffers) {
   uint64_t timeUs{0};
   {
-    MicrosecondTimer timer(&timeUs);
+    MicrosecondWallTimer timer(&timeUs);
     write(buffers);
   }
   metricLogger_->logWrite(
@@ -70,7 +81,7 @@ void FileSink::writeImpl(
   const uint64_t oldSize = size_;
   uint64_t writeTimeUs{0};
   {
-    MicrosecondTimer timer(&writeTimeUs);
+    MicrosecondWallTimer timer(&writeTimeUs);
     for (auto& buf : buffers) {
       // NOTE: we need to update 'size_' after each 'callback' invocation as
       // some file sink implementation like MemorySink depends on the updated
@@ -111,10 +122,13 @@ WriteFileSink::WriteFileSink(
     std::unique_ptr<WriteFile> writeFile,
     std::string name,
     MetricsLogPtr metricLogger,
-    IoStatistics* stats)
+    IoStatistics* stats,
+    velox::IoStats* fileSystemStats)
     : FileSink(
           std::move(name),
-          {.metricLogger = std::move(metricLogger), .stats = stats}),
+          {.metricLogger = std::move(metricLogger),
+           .stats = stats,
+           .fileSystemStats = fileSystemStats}),
       writeFile_{std::move(writeFile)} {
   VELOX_CHECK_NOT_NULL(writeFile_);
 }
@@ -139,7 +153,7 @@ LocalFileSink::LocalFileSink(const std::string& name, const Options& options)
     : FileSink{name, options}, writeFile_() {
   const auto dir = fs::path(name_).parent_path();
   if (!fs::exists(dir)) {
-    VELOX_CHECK(velox::common::generateFileDirectory(dir.c_str()));
+    VELOX_CHECK(velox::common::generateFileDirectory(dir.string().c_str()));
   }
   auto fs = filesystems::getFileSystem(name_, nullptr);
   writeFile_ = fs->openFileForWrite(name_);
@@ -152,7 +166,7 @@ LocalFileSink::LocalFileSink(
     : FileSink{name, options}, writeFile_() {
   const auto dir = fs::path(name_).parent_path();
   if (!fs::exists(dir)) {
-    VELOX_CHECK(velox::common::generateFileDirectory(dir.c_str()));
+    VELOX_CHECK(velox::common::generateFileDirectory(dir.string().c_str()));
   }
 }
 

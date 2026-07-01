@@ -15,10 +15,25 @@
 velox_add_library(
   velox_dwio_parquet_common
   BloomFilter.cpp
-  XxHasher.cpp
   LevelComparison.cpp
   LevelConversion.cpp
+  XxHasher.cpp
+  HEADERS
+  BitStreamUtilsInternal.h
+  BloomFilter.h
+  Hasher.h
+  LevelComparison.h
+  LevelConversion.h
+  LevelConversionUtil.h
+  ParquetConfig.h
+  RleEncodingInternal.h
+  XxHasher.h
 )
+
+# Fix sockaddr_un redefinition between folly and Windows SDK
+if(WIN32)
+  velox_compile_definitions(velox_dwio_parquet_common PRIVATE _AFUNIX_)
+endif()
 
 velox_link_libraries(
   velox_dwio_parquet_common
@@ -30,6 +45,5 @@ velox_link_libraries(
   fmt::fmt
   Folly::folly
   Snappy::snappy
-  thrift
   zstd::zstd
 )

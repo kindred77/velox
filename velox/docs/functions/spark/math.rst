@@ -2,12 +2,17 @@
 Mathematical Functions
 ======================
 
-.. spark:function:: abs(x) -> [same as x]
+.. spark:function:: abs(x) -> [same as x] (ANSI compliant)
 
     Returns the absolute value of ``x``. When ``x`` is negative minimum
-    value of integral type, returns the same value as ``x`` following
-    the behavior when Spark ANSI mode is disabled.
+    value of integral type returns the same value as ``x`` following
+    the behavior when Spark ANSI mode is disabled and throws exception
+    when Spark ANSI mode is enabled. ::
 
+        SELECT abs(-42); -- 42
+        SELECT abs(3.14); -- 3.14
+        SELECT abs(-128); -- 128 (with ANSI mode disabled)
+        SELECT abs(-128); -- Overflow exception (with ANSI mode enabled for TINYINT)
 .. spark:function:: acos(x) -> double
 
     Returns the inverse cosine (a.k.a. arc cosine) of ``x``.
@@ -78,7 +83,14 @@ Mathematical Functions
     Returns the result of adding x to y. The types of x and y must be the same.
     For integral types, overflow results in an error. Corresponds to Spark's operator ``+`` with ``failOnError`` as true.
 
-.. function:: checked_divide(x, y) -> [same as x]
+.. function:: checked_div(x, y) -> bigint
+
+    Returns the result of integer division of ``x`` by ``y``, truncating toward zero.
+    Supported types are integral types, ``x`` and ``y`` must have the same type.
+    Division by zero or overflow results in an error. This function operates in ANSI mode (error on invalid input).
+    Corresponds to Spark's operator ``div`` with ``spark.sql.ansi.enabled`` set to true.
+
+.. spark:function:: checked_divide(x, y) -> [same as x]
 
     Returns the results of dividing x by y. The types of x and y must be the same.
     Division by zero results in an error. Corresponds to Spark's operator ``/`` with ``failOnError`` as true.
@@ -109,9 +121,100 @@ Mathematical Functions
 
     Returns the cosecant of ``x``.
 
+.. spark:function:: decimal_ceil(x, scale) -> decimal
+
+    Rounds the decimal value ``x`` up (toward positive infinity) to the
+    specified target ``scale``. The first argument must be a DECIMAL and the
+    second must be a constant INTEGER representing the desired number of digits
+    after the decimal point.
+
+    When ``scale`` is negative, rounds up to a power of 10 (e.g., scale = -2
+    rounds up to the nearest hundred). When ``scale`` >= the input
+    scale, returns the value unchanged. Values that overflow the result
+    precision return NULL.
+
+    **Result type rules:**
+
+    The result type is determined by the input type ``DECIMAL(p, s)`` and
+    the target ``scale`` (n):
+
+    * When n >= 0: result is ``DECIMAL(min(p - s + 1 + min(s, n), 38), min(s, n))``.
+      The ``+1`` accounts for carry (e.g., ``ceil(9.9, 0)`` = 10 needs an extra digit).
+      The result scale is ``min(s, n)`` — it never pads with trailing zeros beyond the
+      input scale.
+    * When n < 0: result is ``DECIMAL(min(max(p - s + 1, |n| + 1), 38), 0)``.
+      The result scale is always 0. ``|n| + 1`` digits are needed because rounding
+      to the nearest 10^|n| can produce a value one digit wider.
+
+    See `Spark's RoundBase.dataType <https://github.com/apache/spark/blob/master/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/expressions/mathExpressions.scala>`_.
+
+    Examples (type annotations for clarity, not executable SQL)::
+
+        -- scale 0: round up to integer
+        SELECT decimal_ceil(DECIMAL(4,3) 1.234, 0); -- 2 (DECIMAL(2,0))
+        SELECT decimal_ceil(DECIMAL(4,3) -1.234, 0); -- -1 (DECIMAL(2,0))
+
+        -- scale 1: one fractional digit
+        SELECT decimal_ceil(DECIMAL(4,3) 1.234, 1); -- 1.3 (DECIMAL(3,1))
+        SELECT decimal_ceil(DECIMAL(4,3) -1.234, 1); -- -1.2 (DECIMAL(3,1))
+
+        -- scale 2: two fractional digits
+        SELECT decimal_ceil(DECIMAL(4,3) 1.234, 2); -- 1.24 (DECIMAL(4,2))
+
+        -- scale >= input scale: identity (no rounding needed)
+        SELECT decimal_ceil(DECIMAL(3,1) 10.1, 5); -- 10.1 (DECIMAL(4,1))
+
+        -- negative scale: round up to power of 10
+        SELECT decimal_ceil(DECIMAL(3,1) 99.0, -1); -- 100 (DECIMAL(4,0))
+
+.. spark:function:: decimal_floor(x, scale) -> decimal
+
+    Rounds the decimal value ``x`` down (toward negative infinity) to the
+    specified target ``scale``. The first argument must be a DECIMAL and the
+    second must be a constant INTEGER representing the desired number of digits
+    after the decimal point.
+
+    When ``scale`` is negative, rounds down to a power of 10 (e.g., scale = -2
+    rounds down to the nearest hundred). When ``scale`` >= the input
+    scale, returns the value unchanged. Values that overflow the result
+    precision return NULL.
+
+    **Result type rules:**
+
+    Same as ``decimal_ceil`` — see above.
+
+    Examples (type annotations for clarity, not executable SQL)::
+
+        -- scale 0: round down to integer
+        SELECT decimal_floor(DECIMAL(4,3) 1.234, 0); -- 1 (DECIMAL(2,0))
+        SELECT decimal_floor(DECIMAL(4,3) -1.234, 0); -- -2 (DECIMAL(2,0))
+
+        -- scale 1: one fractional digit
+        SELECT decimal_floor(DECIMAL(4,3) 1.234, 1); -- 1.2 (DECIMAL(3,1))
+        SELECT decimal_floor(DECIMAL(4,3) -1.234, 1); -- -1.3 (DECIMAL(3,1))
+
+        -- scale 2: two fractional digits
+        SELECT decimal_floor(DECIMAL(4,3) 1.234, 2); -- 1.23 (DECIMAL(4,2))
+
+        -- scale >= input scale: identity (no rounding needed)
+        SELECT decimal_floor(DECIMAL(3,1) 10.1, 5); -- 10.1 (DECIMAL(4,1))
+
+        -- negative scale: round down to power of 10
+        SELECT decimal_floor(DECIMAL(3,1) 99.0, -1); -- 90 (DECIMAL(4,0))
+
 .. spark:function:: degrees(x) -> double
 
     Converts angle x in radians to degrees.
+
+.. spark:function:: div(x, y) -> bigint
+
+    Returns the results of dividing x by y. Performs the integer division truncates toward zero.
+    Supported types are integral types, x and y must have the same type.
+    Division by zero or overflow results in null. ::
+
+        SELECT 3 div 2; -- 1
+        SELECT 1L div 2L; -- 0
+        SELECT 3 div 0; -- NULL
 
 .. spark:function:: divide(x, y) -> double
 
@@ -256,8 +359,8 @@ Mathematical Functions
     `spark.partition_id` to each thread (in a deterministic way) .
     ``seed`` must be constant. NULL ``seed`` is identical to zero ``seed``. ::
 
-        SELECT rand(0);    -- 0.5488135024422883
-        SELECT rand(NULL); -- 0.5488135024422883
+        SELECT rand(0);    -- 0.7604953758285915
+        SELECT rand(NULL); -- 0.7604953758285915
 
 .. spark:function:: random() -> double
 
@@ -267,10 +370,12 @@ Mathematical Functions
 
     An alias for ``rand(seed)``.
 
-.. spark:function:: remainder(n, m) -> [same as n]
+.. spark:function:: remainder(n, m) -> [same as n] (ANSI compliant)
 
     Returns the modulus (remainder) of ``n`` divided by ``m``. Corresponds to Spark's operator ``%``.
     Supported types are: TINYINT, SMALLINT, INTEGER, BIGINT, REAL and DOUBLE.
+    When ``m`` is zero, returns NULL following the behavior when Spark ANSI mode
+    is disabled, and throws an exception when Spark ANSI mode is enabled.
 
 .. spark:function:: rint(x) -> double
 

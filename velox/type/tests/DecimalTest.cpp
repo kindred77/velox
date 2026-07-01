@@ -135,11 +135,12 @@ void testCastFromString(
     int toScale,
     const std::vector<T>& expectedUnscaleValues) {
   for (int i = 0; i < inputs.size(); ++i) {
-    SCOPED_TRACE(fmt::format(
-        "Index: {}, input: {}, expectedUnscaleValue: {}.",
-        i,
-        inputs[i],
-        expectedUnscaleValues[i]));
+    SCOPED_TRACE(
+        fmt::format(
+            "Index: {}, input: {}, expectedUnscaleValue: {}.",
+            i,
+            inputs[i],
+            expectedUnscaleValues[i]));
     T decimalValue;
     auto status = DecimalUtil::castFromString<T>(
         StringView(inputs[i]), toPrecision, toScale, decimalValue);
@@ -314,16 +315,23 @@ TEST(DecimalTest, valueInPrecisionRange) {
   ASSERT_TRUE(DecimalUtil::valueInPrecisionRange<int64_t>(999, 3));
   ASSERT_FALSE(DecimalUtil::valueInPrecisionRange<int64_t>(1000, 3));
   ASSERT_FALSE(DecimalUtil::valueInPrecisionRange<int64_t>(1234, 3));
-  ASSERT_TRUE(DecimalUtil::valueInPrecisionRange<int64_t>(
-      DecimalUtil::kShortDecimalMax, ShortDecimalType::kMaxPrecision));
-  ASSERT_FALSE(DecimalUtil::valueInPrecisionRange<int64_t>(
-      DecimalUtil::kShortDecimalMax + 1, ShortDecimalType::kMaxPrecision));
-  ASSERT_TRUE(DecimalUtil::valueInPrecisionRange<int128_t>(
-      DecimalUtil::kLongDecimalMax, LongDecimalType::kMaxPrecision));
-  ASSERT_FALSE(DecimalUtil::valueInPrecisionRange<int128_t>(
-      DecimalUtil::kLongDecimalMax + 1, LongDecimalType::kMaxPrecision));
-  ASSERT_FALSE(DecimalUtil::valueInPrecisionRange<int128_t>(
-      DecimalUtil::kLongDecimalMin - 1, LongDecimalType::kMaxPrecision));
+  ASSERT_TRUE(
+      DecimalUtil::valueInPrecisionRange<int64_t>(
+          static_cast<int64_t>(DecimalUtil::kShortDecimalMax),
+          ShortDecimalType::kMaxPrecision));
+  ASSERT_FALSE(
+      DecimalUtil::valueInPrecisionRange<int64_t>(
+          static_cast<int64_t>(DecimalUtil::kShortDecimalMax + 1),
+          ShortDecimalType::kMaxPrecision));
+  ASSERT_TRUE(
+      DecimalUtil::valueInPrecisionRange<int128_t>(
+          DecimalUtil::kLongDecimalMax, LongDecimalType::kMaxPrecision));
+  ASSERT_FALSE(
+      DecimalUtil::valueInPrecisionRange<int128_t>(
+          DecimalUtil::kLongDecimalMax + 1, LongDecimalType::kMaxPrecision));
+  ASSERT_FALSE(
+      DecimalUtil::valueInPrecisionRange<int128_t>(
+          DecimalUtil::kLongDecimalMin - 1, LongDecimalType::kMaxPrecision));
 }
 
 TEST(DecimalTest, computeAverage) {
@@ -573,9 +581,17 @@ TEST(DecimalTest, castToString) {
   testcastToString<int64_t>(-12, 5, 5, 8, "-0.00012");
   testcastToString<int64_t>(-12, 5, 5, 8, "-0.00012");
   testcastToString<int64_t>(
-      DecimalUtil::kShortDecimalMax, 18, 0, 19, std::string(18, '9'));
+      static_cast<int64_t>(DecimalUtil::kShortDecimalMax),
+      18,
+      0,
+      19,
+      std::string(18, '9'));
   testcastToString<int64_t>(
-      DecimalUtil::kShortDecimalMin, 18, 0, 19, "-" + std::string(18, '9'));
+      static_cast<int64_t>(DecimalUtil::kShortDecimalMin),
+      18,
+      0,
+      19,
+      "-" + std::string(18, '9'));
 
   testcastToString<int128_t>(
       HugeInt::parse("-18446744073709551616"),
@@ -789,6 +805,28 @@ TEST(DecimalTest, castFromStringError) {
       "9e", 12, 2, "Value is not a number. The exponent part is empty.");
   testCastFromString<int64_t>(
       "09{xi+yD", 12, 2, "Value is not a number. Chars are invalid.");
+}
+
+TEST(DecimalTest, castFromStringNegativeExponent) {
+  testCastFromString<int128_t>(
+      std::vector<std::string>{
+          "123E-2",
+          "123E-3",
+          "567E-3",
+          "567E-4",
+          "5E-1",
+          "4E-1",
+          "-5E-1",
+          "-4E-1",
+          "500E-3",
+          "499E-3",
+          "6E-120",
+          "99999999999999999999999999999999999999E-38",
+          "50000000000000000000000000000000000000E-38",
+          "49999999999999999999999999999999999999E-38"},
+      38,
+      0,
+      std::vector<int128_t>{1, 0, 1, 0, 1, 0, -1, 0, 1, 0, 0, 1, 1, 0});
 }
 } // namespace
 } // namespace facebook::velox

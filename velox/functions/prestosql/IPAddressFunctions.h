@@ -69,7 +69,8 @@ struct IPPrefixFunction {
       out_type<IPPrefix>& result,
       const arg_type<Varchar>& ipString,
       const arg_type<int64_t>& prefixBits) {
-    auto tryIp = folly::IPAddress::tryFromString(ipString);
+    // TODO: Remove explicit std::string_view cast.
+    auto tryIp = folly::IPAddress::tryFromString(std::string_view(ipString));
     if (tryIp.hasError()) {
       VELOX_USER_FAIL("Cannot cast value to IPADDRESS: {}", ipString);
     }
@@ -98,7 +99,7 @@ struct IPPrefixFunction {
 
     int128_t intAddr;
     std::reverse(canonicalBytes.begin(), canonicalBytes.end());
-    memcpy(&intAddr, &canonicalBytes, ipaddress::kIPAddressBytes);
+    intAddr = HugeInt::deserializeNative(canonicalBytes.data());
     return std::make_tuple(intAddr, static_cast<int8_t>(prefixBits));
   }
 };
@@ -195,8 +196,9 @@ struct IPPrefixCollapseFunction {
 
     for (const auto& ipPrefix : ipPrefixes) {
       if (ipPrefix.has_value()) {
-        prefixes.push_back(std::make_tuple(
-            *ipPrefix->template at<0>(), *ipPrefix->template at<1>()));
+        prefixes.push_back(
+            std::make_tuple(
+                *ipPrefix->template at<0>(), *ipPrefix->template at<1>()));
       } else {
         // ip_prefix_collapse does not support null elements. Thus we throw here
         // with the same error message as Presto java.
@@ -265,7 +267,12 @@ struct IPPrefixCollapseFunction {
         (num < 0) ? static_cast<uint128_t>(-num) : static_cast<uint128_t>(num);
 
     // Find the position of the highest bit using logarithm (base 2)
+#ifdef _MSC_VER
+    // MSVC: std::log2 doesn't accept int128_t, convert to double
+    return static_cast<int64_t>(std::log2(static_cast<double>(abs_num))) + 1;
+#else
     return static_cast<int64_t>(std::log2(abs_num)) + 1;
+#endif
   }
 
   FOLLY_ALWAYS_INLINE static int64_t getLowestSetBit(int128_t x) {
@@ -275,12 +282,21 @@ struct IPPrefixCollapseFunction {
 
     // Check the lower 64 bits
     static constexpr uint64_t mask = 0xFFFFFFFFFFFFFFFF;
+#ifdef _MSC_VER
+    uint64_t low_bits = static_cast<uint64_t>(x & mask);
+    if (low_bits) {
+      return __builtin_ctzll(low_bits);
+    }
+    // Check the upper 64 bits
+    return __builtin_ctzll(static_cast<uint64_t>(x >> 64)) + 64;
+#else
     if (x & mask) {
       return __builtin_ctzll(x & mask);
     }
 
     // Check the upper 64 bits
     return __builtin_ctzll(x >> 64) + 64;
+#endif
   }
 
   FOLLY_ALWAYS_INLINE static int64_t findRangeBits(
@@ -338,7 +354,7 @@ struct IPPrefixCollapseFunction {
       ipPrefixSlices.emplace_back(firstIpAddress, prefixLength);
 
       int128_t ipCount = static_cast<int128_t>(1)
-          << static_cast<int128_t>(ipVersionMaxBits - prefixLength);
+          << static_cast<int>(ipVersionMaxBits - prefixLength);
       firstIpAddress += ipCount;
     }
     return ipPrefixSlices;
@@ -423,10 +439,11 @@ struct IPPrefixSubnetsFunction {
 
     if (newPrefixLength < 0 || (inputIsIpV4 && newPrefixLength > 32) ||
         (!inputIsIpV4 && newPrefixLength > 128)) {
-      VELOX_USER_FAIL(fmt::format(
-          "Invalid prefix length for IPv{}: {}",
-          inputIsIpV4 ? 4 : 6,
-          newPrefixLength));
+      VELOX_USER_FAIL(
+          fmt::format(
+              "Invalid prefix length for IPv{}: {}",
+              inputIsIpV4 ? 4 : 6,
+              newPrefixLength));
     }
 
     int8_t inputPrefixLength = *prefix.template at<1>();
@@ -599,6 +616,40 @@ struct IsPrivateIPFunction {
   }
 };
 
+template <typename T>
+struct IPVersionFromIPAddressFunction {
+  VELOX_DEFINE_FUNCTION_TYPES(T);
+
+  FOLLY_ALWAYS_INLINE void call(
+      out_type<int64_t>& result,
+      const arg_type<IPAddress>& ip) {
+    result = isIPv4(*ip) ? 4 : 6;
+  }
+};
+
+template <typename T>
+struct IPVersionFromIPPrefixFunction {
+  VELOX_DEFINE_FUNCTION_TYPES(T);
+
+  FOLLY_ALWAYS_INLINE void call(
+      out_type<int64_t>& result,
+      const arg_type<IPPrefix>& ipPrefix) {
+    result = isIPv4(*ipPrefix.template at<0>()) ? 4 : 6;
+  }
+};
+
+template <typename T>
+struct IPPrefixMaskLenFunction {
+  VELOX_DEFINE_FUNCTION_TYPES(T);
+
+  FOLLY_ALWAYS_INLINE void call(
+      out_type<int64_t>& result,
+      const arg_type<IPPrefix>& ipPrefix) {
+    result =
+        static_cast<int64_t>(static_cast<uint8_t>(*ipPrefix.template at<1>()));
+  }
+};
+
 void registerIPAddressFunctions(const std::string& prefix) {
   registerIPAddressType();
   registerIPPrefixType();
@@ -622,6 +673,12 @@ void registerIPAddressFunctions(const std::string& prefix) {
       {prefix + "ip_prefix_subnets"});
   registerFunction<IsPrivateIPFunction, bool, IPAddress>(
       {prefix + "is_private_ip"});
+  registerFunction<IPVersionFromIPAddressFunction, int64_t, IPAddress>(
+      {prefix + "ip_version"});
+  registerFunction<IPVersionFromIPPrefixFunction, int64_t, IPPrefix>(
+      {prefix + "ip_version"});
+  registerFunction<IPPrefixMaskLenFunction, int64_t, IPPrefix>(
+      {prefix + "ip_prefix_masklen"});
 }
 
 } // namespace facebook::velox::functions

@@ -17,12 +17,12 @@
 #include "velox/functions/lib/aggregates/MinMaxAggregateBase.h"
 
 #include <limits>
-#include "velox/exec/AggregationHook.h"
 #include "velox/functions/lib/CheckNestedNulls.h"
 #include "velox/functions/lib/aggregates/Compare.h"
 #include "velox/functions/lib/aggregates/SimpleNumericAggregate.h"
 #include "velox/functions/lib/aggregates/SingleValueAccumulator.h"
 #include "velox/type/FloatingPointUtil.h"
+#include "velox/vector/AggregationHook.h"
 
 namespace facebook::velox::functions::aggregate {
 
@@ -30,6 +30,21 @@ namespace {
 
 template <typename T>
 struct MinMaxTrait : public std::numeric_limits<T> {};
+
+#ifdef _MSC_VER
+// std::numeric_limits doesn't support int128_t on Windows
+template <>
+struct MinMaxTrait<int128_t> {
+  static inline int128_t lowest() {
+    // Most negative 128-bit signed integer
+    return static_cast<int128_t>(1) << 127;
+  }
+  static inline int128_t max() {
+    // Most positive 128-bit signed integer
+    return ~lowest();
+  }
+};
+#endif
 
 template <typename T>
 class SimpleNumericMinMaxAggregate : public SimpleNumericAggregate<T, T, T> {
@@ -327,7 +342,7 @@ class MinMaxAggregateBase : public exec::Aggregate {
       auto indices = decoded.indices();
       rows.applyToSelected([&](vector_size_t i) {
         velox::functions::checkNestedNulls(
-            decoded, indices, i, throwOnNestedNulls_);
+            decoded, i, indices[i], throwOnNestedNulls_);
       });
     }
 
@@ -406,7 +421,7 @@ class MinMaxAggregateBase : public exec::Aggregate {
 
     rows.applyToSelected([&](vector_size_t i) {
       if (velox::functions::checkNestedNulls(
-              decoded, indices, i, throwOnNestedNulls_)) {
+              decoded, i, indices[i], throwOnNestedNulls_)) {
         return;
       }
 
@@ -427,7 +442,6 @@ class MinMaxAggregateBase : public exec::Aggregate {
       const VectorPtr& arg,
       TCompareTest compareTest) {
     DecodedVector decoded(*arg, rows, true);
-    auto indices = decoded.indices();
     auto baseVector = decoded.base();
     const CompareFlags compareFlags{
         true, // nullsFirst
@@ -436,23 +450,39 @@ class MinMaxAggregateBase : public exec::Aggregate {
         nullHandlingMode};
 
     if (decoded.isConstantMapping()) {
+      vector_size_t baseIndex = decoded.index(0);
       if (velox::functions::checkNestedNulls(
-              decoded, indices, 0, throwOnNestedNulls_)) {
+              decoded, 0, baseIndex, throwOnNestedNulls_)) {
         return;
       }
 
       auto accumulator = value<SingleValueAccumulator>(group);
       if (!accumulator->hasValue() ||
           compareTest(compare(accumulator, decoded, 0, compareFlags))) {
-        accumulator->write(baseVector, indices[0], allocator_);
+        accumulator->write(baseVector, baseIndex, allocator_);
       }
       return;
     }
 
     auto accumulator = value<SingleValueAccumulator>(group);
+    if (decoded.isIdentityMapping()) {
+      rows.applyToSelected([&](vector_size_t i) {
+        if (velox::functions::checkNestedNulls(
+                decoded, i, i, throwOnNestedNulls_)) {
+          return;
+        }
+        if (!accumulator->hasValue() ||
+            compareTest(compare(accumulator, decoded, i, compareFlags))) {
+          accumulator->write(baseVector, i, allocator_);
+        }
+      });
+      return;
+    }
+
+    auto indices = decoded.indices();
     rows.applyToSelected([&](vector_size_t i) {
       if (velox::functions::checkNestedNulls(
-              decoded, indices, i, throwOnNestedNulls_)) {
+              decoded, i, indices[i], throwOnNestedNulls_)) {
         return;
       }
       if (!accumulator->hasValue() ||
@@ -573,11 +603,12 @@ class MinAggregate : public MinMaxAggregateBase {
   }
 };
 
+} // namespace
+
 template <
-    template <typename T>
-    class TSimpleNumericAggregate,
-    template <CompareFlags::NullHandlingMode nullHandlingMode>
-    typename TAggregate>
+    template <typename T> class TSimpleNumericAggregate,
+    template <
+        CompareFlags::NullHandlingMode nullHandlingMode> typename TAggregate>
 exec::AggregateFunctionFactory getMinMaxFunctionFactoryInternal(
     const std::string& name,
     CompareFlags::NullHandlingMode nullHandlingMode,
@@ -647,8 +678,6 @@ exec::AggregateFunctionFactory getMinMaxFunctionFactoryInternal(
   return factory;
 }
 
-} // namespace
-
 exec::AggregateFunctionFactory getMinFunctionFactory(
     const std::string& name,
     CompareFlags::NullHandlingMode nullHandlingMode,
@@ -666,4 +695,5 @@ exec::AggregateFunctionFactory getMaxFunctionFactory(
       SimpleNumericMaxAggregate,
       MaxAggregate>(name, nullHandlingMode, precision);
 }
+
 } // namespace facebook::velox::functions::aggregate

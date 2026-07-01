@@ -34,7 +34,7 @@ template <>
 struct CppToType<int128_t> : public CppToTypeBase<TypeKind::HUGEINT> {};
 
 template <>
-struct CppToType<__uint128_t> : public CppToTypeBase<TypeKind::HUGEINT> {};
+struct CppToType<uint128_t> : public CppToTypeBase<TypeKind::HUGEINT> {};
 
 template <>
 struct CppToType<int64_t> : public CppToTypeBase<TypeKind::BIGINT> {};
@@ -92,7 +92,18 @@ template <>
 struct CppToType<Timestamp> : public CppToTypeBase<TypeKind::TIMESTAMP> {};
 
 template <>
-struct CppToType<Time> : public CppToTypeBase<TypeKind::BIGINT> {};
+struct CppToType<Time> : public CppToTypeBase<TypeKind::BIGINT> {
+  static auto create() {
+    return TIME();
+  }
+};
+
+template <>
+struct CppToType<TimeMicroUtc> : public CppToTypeBase<TypeKind::BIGINT> {
+  static auto create() {
+    return TIME_MICRO_UTC();
+  }
+};
 
 // TODO: maybe do something smarter than just matching any shared_ptr, e.g. we
 // can declare "registered" types explicitly

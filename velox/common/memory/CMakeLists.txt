@@ -15,6 +15,12 @@ if(${VELOX_BUILD_TESTING})
   add_subdirectory(tests)
 endif()
 
+if(WIN32)
+  set(WINDOWS_MEMORY_SOURCES windows/PosixMemoryCompat.cpp)
+else()
+  set(WINDOWS_MEMORY_SOURCES "")
+endif()
+
 velox_add_library(
   velox_memory
   Allocation.cpp
@@ -22,6 +28,7 @@ velox_add_library(
   ArbitrationOperation.cpp
   ArbitrationParticipant.cpp
   ByteStream.cpp
+  CustomMemoryResource.cpp
   HashStringAllocator.cpp
   MallocAllocator.cpp
   Memory.cpp
@@ -33,7 +40,32 @@ velox_add_library(
   RawVector.cpp
   SharedArbitrator.cpp
   StreamArena.cpp
+  ${WINDOWS_MEMORY_SOURCES}
+  HEADERS
+  Allocation.h
+  AllocationPool.h
+  ArbitrationOperation.h
+  ArbitrationParticipant.h
+  ByteStream.h
+  CompactDoubleList.h
+  CustomMemoryResource.h
+  HashStringAllocator.h
+  MallocAllocator.h
+  Memory.h
+  MemoryAllocator.h
+  MemoryArbitrator.h
+  MemoryPool.h
+  MmapAllocator.h
+  MmapArena.h
+  RawVector.h
+  Scratch.h
+  SharedArbitrator.h
+  StreamArena.h
 )
+
+if(WIN32)
+  velox_compile_options(velox_memory PRIVATE /std:c++20)
+endif()
 
 velox_link_libraries(
   velox_memory
@@ -50,3 +82,12 @@ velox_link_libraries(
     glog::glog
   PRIVATE velox_test_util re2::re2
 )
+
+velox_add_library(
+  velox_custom_memory_resource_registry
+  CustomMemoryResourceRegistry.cpp
+  HEADERS
+  CustomMemoryResourceRegistry.h
+)
+
+velox_link_libraries(velox_custom_memory_resource_registry velox_memory velox_scoped_registry)

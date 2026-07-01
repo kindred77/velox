@@ -28,11 +28,9 @@ namespace facebook::velox {
 namespace config {
 class ConfigBase;
 }
+class IoStats;
 class ReadFile;
 class WriteFile;
-namespace filesystems::File {
-class IoStats;
-}
 } // namespace facebook::velox
 
 namespace facebook::velox::filesystems {
@@ -48,10 +46,10 @@ struct FileOptions {
   /// etc.
   static constexpr folly::StringPiece kFileCreateConfig{"file-create-config"};
 
-  std::unordered_map<std::string, std::string> values;
+  std::unordered_map<std::string, std::string> values{};
   memory::MemoryPool* pool{nullptr};
   /// If specified then can be trusted to be the file size.
-  std::optional<int64_t> fileSize;
+  std::optional<int64_t> fileSize{};
 
   /// Whether to create parent directories if they don't exist.
   ///
@@ -68,13 +66,17 @@ struct FileOptions {
   /// IO mode if set.
   bool bufferIo{true};
 
+  /// Whether to use io_uring for direct-I/O positioned read batches. Only
+  /// interpreted by the local filesystem and valid when bufferIo is false.
+  bool useIoUring{false};
+
   /// Property bag to set onto files/directories. Think something similar to
   /// ioctl(2). For other remote filesystems, this can be PutObjectTagging in
   /// S3.
   std::optional<std::unordered_map<std::string, std::string>> properties{
       std::nullopt};
 
-  File::IoStats* stats{nullptr};
+  IoStats* stats{nullptr};
 
   /// A raw string that client can encode as anything they want to describe the
   /// file. For example, extraFileInfo can contain serialized file descriptors
@@ -88,6 +90,10 @@ struct FileOptions {
 
   /// A token provider that can be used to get tokens for accessing the file.
   std::shared_ptr<TokenProvider> tokenProvider{nullptr};
+
+  /// File read operations metadata that can be passed to the underlying file
+  /// system for tracking and logging purposes.
+  folly::F14FastMap<std::string, std::string> fileReadOps{};
 };
 
 /// Defines directory options
@@ -110,49 +116,6 @@ struct FileSystemOptions {
   bool readAheadEnabled{false};
 };
 
-/// Free form statistics for a file system. The keys are arbitrary strings, and
-/// values are RuntimeMetric. The underlying filesystem implementation can use
-/// this class to record observability about filesystem operations.
-namespace File {
-class IoStats {
- public:
-  IoStats() = default;
-
-  void addCounter(const std::string& name, RuntimeCounter counter) {
-    auto locked = stats_.wlock();
-    auto it = locked->find(name);
-    if (it == locked->end()) {
-      auto [ptr, inserted] = locked->emplace(name, RuntimeMetric(counter.unit));
-      VELOX_CHECK(inserted);
-      ptr->second.addValue(counter.value);
-    } else {
-      VELOX_CHECK_EQ(it->second.unit, counter.unit);
-      it->second.addValue(counter.value);
-    }
-  }
-
-  void merge(const IoStats& other) {
-    auto otherStats = other.stats();
-    auto locked = stats_.wlock();
-    for (const auto& [name, metric] : otherStats) {
-      auto it = locked->find(name);
-      if (it == locked->end()) {
-        locked->emplace(name, metric);
-      } else {
-        it->second.merge(metric);
-      }
-    }
-  }
-
-  folly::F14FastMap<std::string, RuntimeMetric> stats() const {
-    return stats_.copy();
-  }
-
- private:
-  folly::Synchronized<folly::F14FastMap<std::string, RuntimeMetric>> stats_;
-};
-} // namespace File
-
 /// An abstract FileSystem
 class FileSystem {
  public:
@@ -167,6 +130,7 @@ class FileSystem {
   /// for local file system.
   virtual std::string_view extractPath(std::string_view path) const {
     VELOX_NYI();
+    return {}; // Dummy return for MSVC
   }
 
   /// Returns a ReadFile handle for a given file path
@@ -196,6 +160,7 @@ class FileSystem {
   /// Returns true if it is a directory.
   virtual bool isDirectory(std::string_view path) const {
     VELOX_UNSUPPORTED("isDirectory not implemented");
+    return false; // Dummy return for MSVC
   }
 
   /// Returns the list of files or folders in a path. Currently, this method
@@ -227,6 +192,7 @@ class FileSystem {
       std::string_view /*path*/,
       std::string_view /*propertyKey*/) {
     VELOX_UNSUPPORTED("getDirectoryProperty not implemented");
+    return {};
   }
 
  protected:

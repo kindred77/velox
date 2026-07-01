@@ -34,10 +34,12 @@ namespace facebook::velox {
 template <typename T>
 class SequenceVector : public SimpleVector<T> {
  public:
+#ifdef VELOX_ENABLE_LOAD_SIMD_VALUE_BUFFER
   static constexpr bool can_simd =
       (std::is_same_v<T, int64_t> || std::is_same_v<T, int32_t> ||
        std::is_same_v<T, int16_t> || std::is_same_v<T, int8_t> ||
        std::is_same_v<T, size_t>);
+#endif
 
   SequenceVector(
       velox::memory::MemoryPool* pool,
@@ -81,14 +83,15 @@ class SequenceVector : public SimpleVector<T> {
     }
   }
 
-  const T valueAtFast(vector_size_t idx) const;
+  typename SimpleVector<T>::TValueAt valueAtFast(vector_size_t idx) const;
 
-  const T valueAt(vector_size_t idx) const override {
+  typename SimpleVector<T>::TValueAt valueAt(vector_size_t idx) const override {
     return valueAtFast(idx);
   }
 
   std::unique_ptr<SimpleVector<uint64_t>> hashAll() const override;
 
+#ifdef VELOX_ENABLE_LOAD_SIMD_VALUE_BUFFER
   /**
    * Loads a 256bit vector of data at the virtual byteOffset given
    * Note this method is implemented on each vector type, but is intentionally
@@ -97,6 +100,7 @@ class SequenceVector : public SimpleVector<T> {
    * @param byteOffset - the byte offset to laod from
    */
   xsimd::batch<T> loadSIMDValueBufferAt(size_t index) const;
+#endif
 
   /**
    * Returns a shared_ptr to the underlying byte buffer holding the values for
@@ -144,10 +148,6 @@ class SequenceVector : public SimpleVector<T> {
     return sequenceLengths_;
   }
 
-  uint64_t retainedSize() const override {
-    return sequenceValues_->retainedSize() + sequenceLengths_->capacity();
-  }
-
   bool isScalar() const override {
     return sequenceValues_->isScalar();
   }
@@ -188,6 +188,8 @@ class SequenceVector : public SimpleVector<T> {
 
   VectorPtr slice(vector_size_t, vector_size_t) const override {
     VELOX_NYI();
+    // Unreachable, but required for MSVC
+    return nullptr;
   }
 
   bool isNullsWritable() const override {
@@ -210,11 +212,20 @@ class SequenceVector : public SimpleVector<T> {
         BaseVector::storageByteCount_);
   }
 
+  void transferOrCopyTo(velox::memory::MemoryPool* /*pool*/) override {
+    VELOX_NYI("{} unsupported", __FUNCTION__);
+  }
+
  private:
   // Prepares for use after construction.
   void setInternalState();
 
   bool checkLoadRange(size_t idx, size_t count) const;
+
+  uint64_t retainedSizeImpl(uint64_t& totalStringBufferSize) const override {
+    return sequenceValues_->retainedSize(totalStringBufferSize) +
+        sequenceLengths_->capacity();
+  }
 
   VectorPtr sequenceValues_;
   SimpleVector<T>* scalarSequenceValues_ = nullptr;

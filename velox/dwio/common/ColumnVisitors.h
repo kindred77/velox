@@ -408,6 +408,70 @@ class ColumnVisitor {
   inline void addNull();
   inline void addOutputRow(vector_size_t row);
 
+  /// Bulk variant of process() with SIMD paths for AlwaysTrue and
+  /// deterministic integer filters; otherwise per-row fallback.
+  template <bool hasFilter, bool hasHook, bool scatter>
+  FOLLY_ALWAYS_INLINE void processRun(
+      const T* input,
+      int32_t numInput,
+      const int32_t* scatterRows,
+      int32_t* filterHits,
+      T* values,
+      int32_t& numValues) {
+    DCHECK_EQ(input, values + numValues);
+    if constexpr (
+        !hasFilter && !hasHook && !scatter && isDense &&
+        std::is_same_v<TFilter, velox::common::AlwaysTrue>) {
+      rowIndex_ += numInput;
+      numValues += numInput;
+      return;
+    }
+    if constexpr (
+        hasFilter && !hasHook && !scatter && isDense &&
+        TFilter::deterministic &&
+        (std::is_same_v<T, int32_t> || std::is_same_v<T, int64_t> ||
+         std::is_same_v<T, int16_t>)) {
+      const int32_t firstRow = currentRow();
+      constexpr int32_t kWidth = xsimd::batch<T>::size;
+      int32_t i = 0;
+      while (i + kWidth <= numInput) {
+        auto batch = xsimd::load_unaligned(input + i);
+        processFixedFilter<
+            T,
+            /*filterOnly=*/false,
+            /*scatter=*/false,
+            /*dense=*/true>(
+            batch,
+            kWidth,
+            firstRow + i,
+            filter_,
+            [&](int32_t /*offset*/) {
+              return simd::loadGatherIndices<T>(rows_ + rowIndex_ + i);
+            },
+            values,
+            filterHits,
+            numValues);
+        i += kWidth;
+      }
+      for (; i < numInput; ++i) {
+        if (velox::common::applyFilter(filter_, input[i])) {
+          values[numValues] = input[i];
+          filterHits[numValues] = firstRow + i;
+          ++numValues;
+        }
+      }
+      rowIndex_ += numInput;
+      return;
+    }
+    bool atEnd = false;
+    for (int32_t i = 0; i < numInput; ++i) {
+      process(input[i], atEnd);
+      if (atEnd) {
+        return;
+      }
+    }
+  }
+
   const TFilter& filter() {
     return filter_;
   }
@@ -491,7 +555,7 @@ class ColumnVisitor {
 
  protected:
   const TFilter& filter_;
-  SelectiveColumnReader* reader_;
+  SelectiveColumnReader* const reader_;
   const bool allowNulls_;
   const vector_size_t* rows_;
   vector_size_t numRows_;
@@ -763,6 +827,15 @@ class DictionaryColumnVisitor
                                                                          : 2),
         state_(reader->scanState().rawState) {}
 
+  // Re-reads the cached scan-state snapshot from the reader. Nimble rebuilds
+  // the per-chunk filter dictionary at each chunk boundary during a multi-chunk
+  // dictionary read; the visitor must re-snapshot so valueInDictionary() sees
+  // the current chunk's dictionary rather than the stale copy captured at
+  // construction.
+  void refreshScanState() {
+    state_ = this->reader().scanState().rawState;
+  }
+
   FOLLY_ALWAYS_INLINE bool isInDict() {
     if (inDict()) {
       return bits::isBitSet(inDict(), super::currentRow());
@@ -928,8 +1001,9 @@ class DictionaryColumnVisitor
           (simd::reinterpretBatch<uint32_t>(cache) &
            xsimd::batch<uint32_t>(1)) != xsimd::batch<uint32_t>(0));
 #else
-      auto unknowns = simd::toBitMask(xsimd::batch_bool<int32_t>(
-          simd::reinterpretBatch<uint32_t>((cache & (kUnknown << 24)) << 1)));
+      auto unknowns = simd::toBitMask(
+          xsimd::batch_bool<int32_t>(simd::reinterpretBatch<uint32_t>(
+              (cache & (kUnknown << 24)) << 1)));
       auto passed = simd::toBitMask(
           xsimd::batch_bool<int32_t>(simd::reinterpretBatch<uint32_t>(cache)));
 #endif
@@ -1175,7 +1249,7 @@ ColumnVisitor<T, TFilter, ExtractValues, isDense, hasBulkPath>::
   }
   auto result = DictionaryColumnVisitor<T, TFilter, ExtractValues, isDense>(
       filter_, reader_, RowSet(rows_ + rowIndex_, numRows_), values_);
-  result.numValuesBias_ = numValuesBias_;
+  result.setNumValuesBias(numValuesBias_);
   return result;
 }
 
@@ -1227,7 +1301,14 @@ class StringDictionaryColumnVisitor
     vector_size_t previous =
         isDense && TFilter::deterministic ? 0 : super::currentRow();
     if constexpr (!DictSuper::hasFilter()) {
-      super::filterPassed(index);
+      // Hooks are LazyVector-level and have no access to the dictionary.
+      // They must receive decoded StringView values, not dictionary indices.
+      if constexpr (super::kHasHook) {
+        super::values_.addValue(
+            super::rowIndex_ + super::numValuesBias_, valueInDictionary(index));
+      } else {
+        super::filterPassed(index);
+      }
     } else {
       // check the dictionary cache
       if (TFilter::deterministic &&
@@ -1329,8 +1410,9 @@ class StringDictionaryColumnVisitor
           (simd::reinterpretBatch<uint32_t>(cache) &
            xsimd::batch<uint32_t>(1)) != xsimd::batch<uint32_t>(0));
 #else
-      auto unknowns = simd::toBitMask(xsimd::batch_bool<int32_t>(
-          simd::reinterpretBatch<uint32_t>((cache & (kUnknown << 24)) << 1)));
+      auto unknowns = simd::toBitMask(
+          xsimd::batch_bool<int32_t>(simd::reinterpretBatch<uint32_t>(
+              (cache & (kUnknown << 24)) << 1)));
       auto passed = simd::toBitMask(
           xsimd::batch_bool<int32_t>(simd::reinterpretBatch<uint32_t>(cache)));
 #endif
@@ -1419,7 +1501,7 @@ class StringDictionaryColumnVisitor
     }
   }
 
-  folly::StringPiece valueInDictionary(int64_t index) {
+  StringView valueInDictionary(int64_t index) {
     auto stripeDictSize = DictSuper::state_.dictionary.numValues;
     if (index < stripeDictSize) {
       return reinterpret_cast<const StringView*>(
@@ -1576,7 +1658,7 @@ class StringColumnReadWithVisitorHelper {
       ExtractValues extractValues,
       F readWithVisitor) {
     readWithVisitor(
-        ColumnVisitor<folly::StringPiece, TFilter, ExtractValues, kIsDense>(
+        ColumnVisitor<std::string_view, TFilter, ExtractValues, kIsDense>(
             *static_cast<const TFilter*>(filter),
             &reader_,
             rows_,

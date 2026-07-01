@@ -1,0 +1,39 @@
+You need use MSVC tool chain(vs2022) and vcpkg(with x64-windows-static-md triplet).
+
+Use visual studio toolchains in Clion, and add cmake options below:
+-DCMAKE_BUILD_TYPE=Debug
+-DCMAKE_TOOLCHAIN_FILE=E:/mywork/projects/cpp/vcpkg/scripts/buildsystems/vcpkg.cmake
+-DVELOX_ENABLE_DUCKDB=OFF
+-DVELOX_BUILD_TEST_UTILS=OFF
+-DVELOX_BUILD_TESTING=OFF
+-DVELOX_ENABLE_TPCH_CONNECTOR=OFF
+-DVELOX_ENABLE_TPCDS_CONNECTOR=OFF
+-DVELOX_ENABLE_ICEBERG_FUNCTIONS=OFF
+-DVELOX_ENABLE_PARQUET=ON
+-DVELOX_ENABLE_GEO=OFF
+-DVCPKG_MANIFEST_DIR=E:/mywork/projects/cpp/velox/windows/vcpkg
+-DVCPKG_TARGET_TRIPLET=x64-windows-static-md
+-DVCPKG_MANIFEST_INSTALL=OFF
+-DVCPKG_INSTALLED_DIR=E:/mywork/projects/cpp/vcpkg/installed
+-DFLEX_INCLUDE_DIR=E:/mywork/projects/cpp/velox/velox/expression/signature_parser/generated
+-DVELOX_MONO_LIBRARY=OFF
+
+If you want to build in cmd.exe,
+call "D:\software\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat x64" first.
+then cmake:
+  cmake -DCMAKE_BUILD_TYPE=Debug
+    -DCMAKE_TOOLCHAIN_FILE=E:/mywork/projects/cpp/vcpkg/scripts/buildsystems/vcpkg.cmake
+    -DVELOX_ENABLE_DUCKDB=OFF -DVELOX_BUILD_TEST_UTILS=OFF -DVELOX_BUILD_TESTING=OFF
+    -DMSVC_TOOLCHAIN=TRUE -DVELOX_ENABLE_TPCH_CONNECTOR=OFF -DVELOX_ENABLE_TPCDS_CONNECTOR=OFF
+    -DVELOX_ENABLE_ICEBERG_FUNCTIONS=OFF -DVELOX_ENABLE_PARQUET=OFF -DVELOX_ENABLE_GEO=OFF
+    -DVCPKG_MANIFEST_DIR=E:/mywork/projects/cpp/velox/windows/vcpkg
+    -DVCPKG_TARGET_TRIPLET=x64-windows-static-md
+    -DVCPKG_MANIFEST_INSTALL=OFF
+    -DVELOX_MONO_LIBRARY=OFF
+    -DVCPKG_INSTALLED_DIR=E:/mywork/projects/cpp/vcpkg/installed
+    -DFLEX_INCLUDE_DIR=E:/mywork/projects/cpp/velox/velox/expression/signature_parser/generated
+    -G Ninja -S E:\mywork\projects\cpp\velox -B E:\mywork\projects\cpp\velox\cmake-build-debug-vs2022
+
+then build with ninja.
+
+In Clion, you should use the VS toolchains, with amd64 Architecture and Empty platform.

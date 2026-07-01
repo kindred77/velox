@@ -19,6 +19,7 @@
 #include <folly/Optional.h>
 #include <glog/logging.h>
 #include <chrono>
+#include <cmath>
 #include <exception>
 #include <functional>
 #include <stdexcept>
@@ -28,10 +29,7 @@
 #include "velox/dwio/common/RandGen.h"
 #include "velox/dwio/common/exception/Exception.h"
 
-namespace facebook {
-namespace velox {
-namespace dwio {
-namespace common {
+namespace facebook::velox::dwio::common {
 
 class retriable_error : public std::runtime_error {
  public:
@@ -216,8 +214,11 @@ class RetryModule {
             }
 
             const float abortCheckInterval = 1000;
-            std::this_thread::sleep_for(
-                RetryDuration(std::min(ms, abortCheckInterval)));
+            // Cast to integer milliseconds for MSVC compatibility.
+            // MSVC sleep_for with duration<float> can have precision issues.
+            auto sleepMs = static_cast<int64_t>(
+                std::ceil(std::min(ms, abortCheckInterval)));
+            std::this_thread::sleep_for(std::chrono::milliseconds(sleepMs));
             ms -= abortCheckInterval;
           }
         } else {
@@ -229,7 +230,4 @@ class RetryModule {
   }
 };
 
-} // namespace common
-} // namespace dwio
-} // namespace velox
-} // namespace facebook
+} // namespace facebook::velox::dwio::common

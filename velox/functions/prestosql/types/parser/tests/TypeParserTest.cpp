@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <fmt/format.h>
 #include <gtest/gtest.h>
 
 #include "velox/common/base/tests/GTestUtils.h"
@@ -42,6 +43,11 @@ static const TypePtr& JSON() {
 }
 
 static const TypePtr& TIMESTAMP_WITH_TIME_ZONE() {
+  static const TypePtr instance{new CustomType()};
+  return instance;
+}
+
+static const TypePtr& TIME_WITH_TIME_ZONE() {
   static const TypePtr instance{new CustomType()};
   return instance;
 }
@@ -76,6 +82,9 @@ class TypeParserTest : public ::testing::Test {
     registerCustomType(
         "timestamp with time zone",
         std::make_unique<const TypeFactory>(TIMESTAMP_WITH_TIME_ZONE()));
+    registerCustomType(
+        "time with time zone",
+        std::make_unique<const TypeFactory>(TIME_WITH_TIME_ZONE()));
   }
 };
 
@@ -102,8 +111,18 @@ TEST_F(TypeParserTest, varbinary) {
   ASSERT_EQ(*parseType("varbinary"), *VARBINARY());
 }
 
+TEST_F(TypeParserTest, timestamp) {
+  ASSERT_EQ(*parseType("timestamp"), *TIMESTAMP());
+  ASSERT_EQ(*parseType("timestamp utc"), *TIMESTAMP_UTC());
+}
+
 TEST_F(TypeParserTest, time) {
   ASSERT_EQ(*parseType("time"), *TIME());
+  ASSERT_EQ(*parseType("time micro utc"), *TIME_MICRO_UTC());
+}
+
+TEST_F(TypeParserTest, timeWithTimeZoneType) {
+  ASSERT_EQ(*parseType("time with time zone"), *TIME_WITH_TIME_ZONE());
 }
 
 TEST_F(TypeParserTest, arrayType) {
@@ -208,8 +227,9 @@ TEST_F(TypeParserTest, rowType) {
       *ROW({"12 tb", "b", "c"}, {BIGINT(), BIGINT(), BIGINT()}));
 
   ASSERT_EQ(
-      *parseType("row(\"a\" bigint, \"b\" array(varchar), "
-                 "\"c\" timestamp with time zone)"),
+      *parseType(
+          "row(\"a\" bigint, \"b\" array(varchar), "
+          "\"c\" timestamp with time zone)"),
       *ROW(
           {"a", "b", "c"},
           {BIGINT(), ARRAY(VARCHAR()), TIMESTAMP_WITH_TIME_ZONE()}));
@@ -269,11 +289,6 @@ TEST_F(TypeParserTest, rowType) {
 }
 
 TEST_F(TypeParserTest, typesWithSpaces) {
-  // Type is not registered.
-  VELOX_ASSERT_UNSUPPORTED_THROW(
-      parseType("row(time time with time zone)"),
-      "Failed to parse type [time with time zone]. Type not registered.");
-
   ASSERT_EQ(
       *parseType("timestamp with time zone"), *TIMESTAMP_WITH_TIME_ZONE());
 
@@ -284,10 +299,6 @@ TEST_F(TypeParserTest, typesWithSpaces) {
 
   ASSERT_EQ(
       *parseType("row(double double precision)"), *ROW({"double"}, {DOUBLE()}));
-
-  VELOX_ASSERT_THROW(
-      parseType("row(time with time zone)"),
-      "Failed to parse type [with time zone]");
 
   ASSERT_EQ(*parseType("row(double precision)"), *ROW({DOUBLE()}));
 
@@ -351,9 +362,10 @@ TEST_F(TypeParserTest, decimalType) {
 // Checks that type names can also be field names.
 TEST_F(TypeParserTest, fieldNames) {
   ASSERT_EQ(
-      *parseType("row(bigint bigint, map bigint, row bigint, array bigint, "
-                 "decimal bigint, function bigint, struct bigint, "
-                 "varchar map(bigint, tinyint), varbinary array(bigint))"),
+      *parseType(
+          "row(bigint bigint, map bigint, row bigint, array bigint, "
+          "decimal bigint, function bigint, struct bigint, "
+          "varchar map(bigint, tinyint), varbinary array(bigint))"),
       *ROW(
           {"bigint",
            "map",
@@ -399,12 +411,23 @@ TEST_F(TypeParserTest, bigintEnumBasic) {
           "test.enum.mood:BigintEnum(test.enum.mood{\"CURIOUS\":-2, \"HAPPY\":106071912278278})"),
       *BIGINT_ENUM(moodWithLargeValue));
 
-  // Enum name that is not in the form catalog.namespace.enum_name.
-  LongEnumParameter otherEnumInfo(
-      "someEnumType", {{"CURIOUS", 2}, {"HAPPY", 0}});
+  // Enum name with special characters.
+  LongEnumParameter enumInfoWithSpecialChar(
+      "test.en\\um.\"mood", {{"CURIOUS", 2}, {"HAPPY", 0}});
+  auto enumWithSpecialCharString =
+      "test.en\\um.\"mood:BigintEnum(test.en\\um.\"mood{\"CURIOUS\": 2, \"HAPPY\": 0})";
+  ASSERT_EQ(
+      *parseType(enumWithSpecialCharString),
+      *BIGINT_ENUM(enumInfoWithSpecialChar));
+
+  // Enum names should be in the format catalog.namespace.enum_name. This is
+  // because enum types are part of a UserDefinedType, which has a
+  // 3-part QualifiedObjectName as the type name.
   auto otherEnumString =
       "someEnumType:BigintEnum(someEnumType{\"CURIOUS\": 2, \"HAPPY\": 0})";
-  ASSERT_EQ(*parseType(otherEnumString), *BIGINT_ENUM(otherEnumInfo));
+  VELOX_ASSERT_THROW(
+      parseType(otherEnumString),
+      "Failed to parse type [someEnumType:BigintEnum(someEnumType{\"CURIOUS\": 2, \"HAPPY\": 0})]. syntax error, unexpected COLON, expecting WORD");
 
   // Array type with enum values.
   ASSERT_EQ(
@@ -490,19 +513,29 @@ TEST_F(TypeParserTest, varcharEnumBasic) {
           "test.enum.mood:VarcharEnum(test.enum.mood{\"CURIOUS\":\"ONXW2ZKWMFWHKZI=\", \"HAPPY\":\"ONXW2ZJAOZQWY5LF\" , \"SAD\":\"KNHU2RJAKZAUYVKF\"})"),
       *VARCHAR_ENUM(moodInfo));
 
-  // Enum name that is not in the form catalog.namespace.enum_name.
-  VarcharEnumParameter otherEnumInfo(
-      "someEnumType",
+  auto sameEnumDiffOrderMap =
+      "test.enum.mood:VarcharEnum(test.enum.mood{\"HAPPY\":\"ONXW2ZJAOZQWY5LF\" , \"CURIOUS\":\"ONXW2ZKWMFWHKZI=\", \"SAD\":\"KNHU2RJAKZAUYVKF\"})";
+  ASSERT_EQ(*parseType(sameEnumDiffOrderMap), *VARCHAR_ENUM(moodInfo));
+
+  // Enum name with special characters.
+  VarcharEnumParameter moodInfoSpecialChars(
+      "test.enum.\"mood/someMood\"",
       {{"CURIOUS", "someValue"},
        {"HAPPY", "some value"},
        {"SAD", "SOME VALUE"}});
+  ASSERT_EQ(
+      *parseType(
+          "test.enum.\"mood/someMood\":VarcharEnum(test.enum.\"mood/someMood\"{\"CURIOUS\":\"ONXW2ZKWMFWHKZI=\", \"HAPPY\":\"ONXW2ZJAOZQWY5LF\" , \"SAD\":\"KNHU2RJAKZAUYVKF\"})"),
+      *VARCHAR_ENUM(moodInfoSpecialChars));
+
+  // Enum names should be in the format catalog.namespace.enum_name. This is
+  // because enum types are part of a UserDefinedType, which has a
+  // 3-part QualifiedObjectName as the type name.
   auto otherEnumString =
       "someEnumType:VarcharEnum(someEnumType{\"CURIOUS\":\"ONXW2ZKWMFWHKZI=\", \"HAPPY\":\"ONXW2ZJAOZQWY5LF\" , \"SAD\":\"KNHU2RJAKZAUYVKF\"})";
-  ASSERT_EQ(*parseType(otherEnumString), *VARCHAR_ENUM(otherEnumInfo));
-
-  auto sameEnumDiffOrderMap =
-      "someEnumType:VarcharEnum(someEnumType{\"HAPPY\":\"ONXW2ZJAOZQWY5LF\" , \"CURIOUS\":\"ONXW2ZKWMFWHKZI=\", \"SAD\":\"KNHU2RJAKZAUYVKF\"})";
-  ASSERT_EQ(*parseType(sameEnumDiffOrderMap), *VARCHAR_ENUM(otherEnumInfo));
+  VELOX_ASSERT_THROW(
+      parseType(otherEnumString),
+      "Failed to parse type [someEnumType:VarcharEnum(someEnumType{\"CURIOUS\":\"ONXW2ZKWMFWHKZI=\", \"HAPPY\":\"ONXW2ZJAOZQWY5LF\" , \"SAD\":\"KNHU2RJAKZAUYVKF\"})]. syntax error, unexpected COLON, expecting WORD");
 
   // Array type with enum values.
   ASSERT_EQ(
@@ -529,6 +562,54 @@ TEST_F(TypeParserTest, varcharEnumBasic) {
       *parseType(
           "row(c0 test.enum.mood:VarcharEnum(test.enum.mood{\"CURIOUS\":\"ONXW2ZKWMFWHKZI=\", \"HAPPY\":\"ONXW2ZJAOZQWY5LF\" , \"SAD\":\"KNHU2RJAKZAUYVKF\"}))"),
       *ROW({"c0"}, {VARCHAR_ENUM(moodInfo)}));
+}
+
+TEST_F(TypeParserTest, enumKindCaseInsensitive) {
+  registerBigintEnumType();
+  registerVarcharEnumType();
+
+  // The enum kind ("BigintEnum"/"VarcharEnum") is matched case-insensitively,
+  // consistent with the caseless lexer and Presto's case-insensitive
+  // TypeSignature contract. This matters because a serialized signature may be
+  // lowercased before it is parsed back.
+  LongEnumParameter moodInfo("test.enum.mood", {{"CURIOUS", 2}, {"HAPPY", 0}});
+  for (const auto& kind : {"bigintenum", "BIGINTENUM", "BigIntEnum"}) {
+    ASSERT_EQ(
+        *parseType(
+            fmt::format(
+                R"(test.enum.mood:{}(test.enum.mood{{"CURIOUS":2, "HAPPY":0}}))",
+                kind)),
+        *BIGINT_ENUM(moodInfo))
+        << "kind: " << kind;
+  }
+
+  // A fully lowercased signature (kind and keys) parses to the same type:
+  // keys are canonicalized back to uppercase by the parser.
+  ASSERT_EQ(
+      *parseType(
+          R"(test.enum.mood:bigintenum(test.enum.mood{"curious":2, "happy":0}))"),
+      *BIGINT_ENUM(moodInfo));
+
+  // Base32 values reused from varcharEnumBasic: "ONXW2ZKWMFWHKZI=" decodes to
+  // "someValue" and "ONXW2ZJAOZQWY5LF" to "some value".
+  VarcharEnumParameter colorInfo(
+      "test.enum.color", {{"RED", "someValue"}, {"BLUE", "some value"}});
+  for (const auto& kind : {"varcharenum", "VARCHARENUM", "VarCharEnum"}) {
+    ASSERT_EQ(
+        *parseType(
+            fmt::format(
+                R"(test.enum.color:{}(test.enum.color{{"RED":"ONXW2ZKWMFWHKZI=", "BLUE":"ONXW2ZJAOZQWY5LF"}}))",
+                kind)),
+        *VARCHAR_ENUM(colorInfo))
+        << "kind: " << kind;
+  }
+
+  // A fully lowercased varchar signature parses too: the base32 value decoder
+  // is case-insensitive and keys canonicalize to uppercase.
+  ASSERT_EQ(
+      *parseType(
+          R"(test.enum.color:varcharenum(test.enum.color{"red":"onxw2zkwmfwhkzi=", "blue":"onxw2zjaozqwy5lf"}))"),
+      *VARCHAR_ENUM(colorInfo));
 }
 
 TEST_F(TypeParserTest, invalidVarcharEnums) {
@@ -564,7 +645,7 @@ TEST_F(TypeParserTest, invalidVarcharEnums) {
   VELOX_ASSERT_THROW(
       parseType(
           "test.enum.mood:VarcharEnum(test.enum.mood\"CURIOUS\":\"2\", \"HAPPY\":\"happy\"})"),
-      "Failed to parse type [test.enum.mood:VarcharEnum(test.enum.mood\"CURIOUS\":\"2\", \"HAPPY\":\"happy\"})]. syntax error, unexpected QUOTED_ID, expecting LBRACE");
+      "Failed to parse type [test.enum.mood:VarcharEnum(test.enum.mood\"CURIOUS\":\"2\", \"HAPPY\":\"happy\"})]. syntax error, unexpected COLON, expecting LBRACE");
 
   // Invalid enum type with values of different types.
   VELOX_ASSERT_THROW(

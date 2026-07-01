@@ -36,7 +36,7 @@ re2::StringPiece toStringPiece(const T& s) {
 namespace detail {
 
 Expected<RE2*> ReCache::tryFindOrCompile(const StringView& pattern) {
-  const std::string key = pattern;
+  const auto key = std::string(pattern);
 
   auto reIt = cache_.find(key);
   if (reIt != cache_.end()) {
@@ -870,8 +870,9 @@ class LikeWithRe2 final : public exec::VectorFunction {
     VELOX_CHECK(args.size() == 2 || args.size() == 3);
 
     if (!validPattern_) {
-      auto error = std::make_exception_ptr(std::invalid_argument(
-          "Escape character must be followed by '%', '_' or the escape character itself"));
+      auto error = std::make_exception_ptr(
+          std::invalid_argument(
+              "Escape character must be followed by '%', '_' or the escape character itself"));
       context.setErrors(rows, error);
       return;
     }
@@ -942,8 +943,12 @@ class LikeGeneric final : public exec::VectorFunction {
     auto applyRow = [&](const StringView& input,
                         const StringView& pattern,
                         const std::optional<char>& escapeChar) -> bool {
+      // Copy the pattern to a local string to protect against potential
+      // use-after-free if the underlying string buffer is reclaimed by memory
+      // arbitration under memory pressure.
+      std::string patternCopy(pattern.data(), pattern.size());
       PatternMetadata patternMetadata =
-          determinePatternKind(std::string_view(pattern), escapeChar);
+          determinePatternKind(patternCopy, escapeChar);
 
       if (isAscii) {
         switch (patternMetadata.patternKind()) {
@@ -1728,7 +1733,7 @@ std::shared_ptr<exec::VectorFunction> makeRe2Extract(
             groupIdTypeKind == TypeKind::BIGINT,
         "{} requires third argument of type INTEGER or BIGINT, but got {}",
         name,
-        mapTypeKindToName(groupIdTypeKind));
+        TypeKindName::toName(groupIdTypeKind));
   }
 
   BaseVector* constantPattern = inputArgs[1].constantValue.get();
@@ -1865,7 +1870,11 @@ std::vector<std::string> PatternMetadata::parseSubstrings(
   if (RE2::FullMatch(full, fullPattern)) {
     while (RE2::PartialMatch(full, subPattern, &cur)) {
       substrings.push_back(std::string(cur));
-      full = re2::StringPiece(cur.end(), full.end() - cur.end());
+      // Advance `full` to start just past `cur`. Use data()/size() pointer
+      // arithmetic rather than iterators: newer re2 aliases StringPiece to
+      // std::string_view, whose iterators are not raw pointers under MSVC.
+      const char* curEnd = cur.data() + cur.size();
+      full = re2::StringPiece(curEnd, full.data() + full.size() - curEnd);
     }
   }
   return substrings;
@@ -2160,16 +2169,18 @@ PatternMetadata determinePatternKind(
           return PatternMetadata::prefix(
               std::string(unescapedPattern, 0, firstSubPatternLength));
         } else if (lastSubPatternKind == SubPatternKind::kLiteralString) {
-          return PatternMetadata::suffix(std::string(
-              unescapedPattern, lastSubPatternStart, lastSubPatternLength));
+          return PatternMetadata::suffix(
+              std::string(
+                  unescapedPattern, lastSubPatternStart, lastSubPatternLength));
         } else if (
             numSubPatterns == 3 &&
             firstSubPatternKind == SubPatternKind::kAnyCharsWildcard &&
             lastSubPatternKind == SubPatternKind::kAnyCharsWildcard) {
-          return PatternMetadata::substring(std::string(
-              unescapedPattern,
-              subPatternRanges[1].first,
-              subPatternRanges[1].second));
+          return PatternMetadata::substring(
+              std::string(
+                  unescapedPattern,
+                  subPatternRanges[1].first,
+                  subPatternRanges[1].second));
         }
       }
 
@@ -2279,10 +2290,15 @@ std::shared_ptr<exec::VectorFunction> makeLike(
 
   PatternMetadata patternMetadata = PatternMetadata::generic();
   try {
-    // Fast path for substrings search.
-    if (!escapeChar.has_value()) {
-      auto substrings =
-          PatternMetadata::parseSubstrings(std::string_view(pattern));
+    // Fast path for substrings search. The escape character can be ignored
+    // when it does not appear in the pattern, so callers that always supply
+    // an escape argument still hit this path as long as the escape character
+    // is not actually used in the pattern.
+    const auto patternView = std::string_view(pattern);
+    const bool escapeIsInert = !escapeChar.has_value() ||
+        patternView.find(escapeChar.value()) == std::string_view::npos;
+    if (escapeIsInert) {
+      auto substrings = PatternMetadata::parseSubstrings(patternView);
       if (substrings.size() > 0) {
         patternMetadata = PatternMetadata::substrings(std::move(substrings));
         return std::make_shared<OptimizedLike<PatternKind::kSubstrings>>(
@@ -2290,8 +2306,7 @@ std::shared_ptr<exec::VectorFunction> makeLike(
       }
     }
 
-    patternMetadata =
-        determinePatternKind(std::string_view(pattern), escapeChar);
+    patternMetadata = determinePatternKind(patternView, escapeChar);
   } catch (...) {
     return std::make_shared<exec::AlwaysFailingVectorFunction>(
         std::current_exception());
@@ -2379,7 +2394,7 @@ std::shared_ptr<exec::VectorFunction> makeRe2ExtractAll(
             groupIdTypeKind == TypeKind::BIGINT,
         "{} requires third argument of type INTEGER or BIGINT, but got {}",
         name,
-        mapTypeKindToName(groupIdTypeKind));
+        TypeKindName::toName(groupIdTypeKind));
   }
 
   BaseVector* constantPattern = inputArgs[1].constantValue.get();
@@ -2448,5 +2463,36 @@ regexpReplaceWithLambdaSignatures() {
               .argumentType("varchar")
               .argumentType("function(array(varchar), varchar)")
               .build()};
+}
+
+std::string unescapeReplacement(const std::string& replacement) {
+  std::string result;
+  result.reserve(replacement.size());
+  for (size_t i = 0; i < replacement.size();) {
+    const char current = replacement[i];
+    const bool hasNext = i + 1 < replacement.size();
+    if (current == '\\' && hasNext) {
+      const char following = replacement[i + 1];
+      if (following == '\\' || (following >= '0' && following <= '9')) {
+        // '\\\\' and '\\<digit>' have the same meaning in RE2 and in
+        // java.util.regex; keep them as a two-byte unit.
+        result.push_back(current);
+        result.push_back(following);
+        i += 2;
+      } else {
+        // '\\<other>' in java.util.regex is just <other>; emit the trailing
+        // byte and skip the backslash.
+        result.push_back(following);
+        i += 2;
+      }
+    } else {
+      // Plain byte, or a trailing lone '\\'. The latter is invalid in both
+      // engines; we keep the byte so RE2 surfaces the error later instead of
+      // silently dropping input here.
+      result.push_back(current);
+      ++i;
+    }
+  }
+  return result;
 }
 } // namespace facebook::velox::functions

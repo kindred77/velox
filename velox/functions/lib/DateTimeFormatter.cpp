@@ -23,6 +23,7 @@
 #include "velox/external/date/iso_week.h"
 #include "velox/external/tzdb/tzdb_list.h"
 #include "velox/functions/lib/DateTimeFormatterBuilder.h"
+#include "velox/type/HugeInt.h"
 #include "velox/type/TimestampConversion.h"
 #include "velox/type/tz/TimeZoneMap.h"
 
@@ -210,7 +211,7 @@ int32_t padContent(
     const bool padFront = true) {
   const bool isNegative = content < 0;
   const auto digitLength =
-      isNegative ? countDigits(-(__int128_t)content) : countDigits(content);
+      isNegative ? countDigits(-(int128_t)content) : countDigits(content);
   const auto contentLength = isNegative ? digitLength + 1 : digitLength;
   if (contentLength == 0) {
     std::fill(result, result + totalDigits, padding);
@@ -310,10 +311,11 @@ parseFail(const std::string_view& input, const char* cur, const char* end) {
   if (threadSkipErrorDetails()) {
     return folly::makeUnexpected(Status::UserError());
   }
-  return folly::makeUnexpected(Status::UserError(
-      "Invalid date format: '{}' is malformed at '{}'",
-      input,
-      std::string_view(cur, end - cur)));
+  return folly::makeUnexpected(
+      Status::UserError(
+          "Invalid date format: '{}' is malformed at '{}'",
+          input,
+          std::string_view(cur, end - cur)));
 }
 
 // Joda only supports parsing a few three-letter prefixes. The list is available
@@ -1221,10 +1223,10 @@ uint32_t DateTimeFormatter::maxResultSize(const tz::TimeZone* timezone) const {
         break;
       case DateTimeFormatSpecifier::TIMEZONE:
         if (token.pattern.minRepresentDigits <= 3) {
-          // The longest timezone abbreviation is 6 in the case of negative or
-          // explicitly positive numeric representations (e.g., +01:00, -08:00)
-          // https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
-          size += 6;
+          // The longest timezone abbreviation is 9 in the case of timezones
+          // that do not have an abbreviation and use GMT offset (e.g.,
+          // GMT+01:00, GMT-08:00)
+          size += 9;
         } else {
           // The longest time zone long name is 40, Australian Central Western
           // Standard Time.
@@ -1618,13 +1620,14 @@ Expected<DateTimeResult> DateTimeFormatter::parse(
       if (threadSkipErrorDetails()) {
         return folly::makeUnexpected(Status::UserError());
       }
-      return folly::makeUnexpected(Status::UserError(
-          "Value {} for dayOfMonth must be in the range [1,{}] "
-          "for year {} and month {}.",
-          date.dayOfMonthValues[i],
-          util::getMaxDayOfMonth(date.year, date.month),
-          date.year,
-          date.month));
+      return folly::makeUnexpected(
+          Status::UserError(
+              "Value {} for dayOfMonth must be in the range [1,{}] "
+              "for year {} and month {}.",
+              date.dayOfMonthValues[i],
+              util::getMaxDayOfMonth(date.year, date.month),
+              date.year,
+              date.month));
     }
   }
 
@@ -1634,13 +1637,14 @@ Expected<DateTimeResult> DateTimeFormatter::parse(
       if (threadSkipErrorDetails()) {
         return folly::makeUnexpected(Status::UserError());
       }
-      return folly::makeUnexpected(Status::UserError(
-          "Value {} for dayOfMonth must be in the range [1,{}] "
-          "for year {} and month {}.",
-          date.dayOfYearValues[i],
-          util::isLeapYear(date.year) ? 366 : 365,
-          date.year,
-          date.month));
+      return folly::makeUnexpected(
+          Status::UserError(
+              "Value {} for dayOfMonth must be in the range [1,{}] "
+              "for year {} and month {}.",
+              date.dayOfYearValues[i],
+              util::isLeapYear(date.year) ? 366 : 365,
+              date.year,
+              date.month));
     }
   }
 
@@ -1797,8 +1801,9 @@ Expected<std::shared_ptr<DateTimeFormatter>> buildMysqlDateTimeFormatter(
           if (threadSkipErrorDetails()) {
             return folly::makeUnexpected(Status::UserError());
           }
-          return folly::makeUnexpected(Status::UserError(
-              "Date format specifier is not supported: %{}", *tokenEnd));
+          return folly::makeUnexpected(
+              Status::UserError(
+                  "Date format specifier is not supported: %{}", *tokenEnd));
         default:
           builder.appendLiteral(tokenEnd, 1);
           break;
@@ -1936,8 +1941,9 @@ Expected<std::shared_ptr<DateTimeFormatter>> buildJodaDateTimeFormatter(
             if (threadSkipErrorDetails()) {
               return folly::makeUnexpected(Status::UserError());
             }
-            return folly::makeUnexpected(Status::UserError(
-                "Specifier {} is not supported.", *startTokenPtr));
+            return folly::makeUnexpected(
+                Status::UserError(
+                    "Specifier {} is not supported.", *startTokenPtr));
           } else {
             builder.appendLiteral(startTokenPtr, cur - startTokenPtr);
           }
@@ -2015,9 +2021,6 @@ Expected<std::shared_ptr<DateTimeFormatter>> buildSimpleDateTimeFormatter(
         case 'D':
           builder.appendDayOfYear(count);
           break;
-        case 'e':
-          builder.appendDayOfWeek1Based(count);
-          break;
         case 'E':
           builder.appendDayOfWeekText(count);
           break;
@@ -2052,6 +2055,9 @@ Expected<std::shared_ptr<DateTimeFormatter>> buildSimpleDateTimeFormatter(
         case 'S':
           builder.appendFractionOfSecond(count);
           break;
+        case 'u':
+          builder.appendDayOfWeek1Based(count);
+          break;
         case 'w':
           builder.appendWeekOfWeekYear(count);
           break;
@@ -2078,8 +2084,9 @@ Expected<std::shared_ptr<DateTimeFormatter>> buildSimpleDateTimeFormatter(
             if (threadSkipErrorDetails()) {
               return folly::makeUnexpected(Status::UserError());
             }
-            return folly::makeUnexpected(Status::UserError(
-                "Specifier {} is not supported.", *startTokenPtr));
+            return folly::makeUnexpected(
+                Status::UserError(
+                    "Specifier {} is not supported.", *startTokenPtr));
           } else {
             builder.appendLiteral(startTokenPtr, cur - startTokenPtr);
           }

@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "velox/dwio/common/Options.h"
 #include "velox/dwio/common/SelectiveColumnReaderInternal.h"
 
 namespace facebook::velox::dwio::common {
@@ -110,9 +111,10 @@ class SelectiveStructColumnReaderBase : public SelectiveColumnReader {
 
   // The subscript of childSpecs will be set to this value if the column is
   // constant (either explicitly or because it's missing).
-  static constexpr int32_t kConstantChildSpecSubscript = -1;
+  static constexpr int32_t kConstantChildSpecSubscript{-1};
 
   SelectiveStructColumnReaderBase(
+      const dwio::common::ColumnReaderOptions& columnReaderOptions,
       const TypePtr& requestedType,
       const std::shared_ptr<const dwio::common::TypeWithId>& fileType,
       FormatParams& params,
@@ -120,11 +122,12 @@ class SelectiveStructColumnReaderBase : public SelectiveColumnReader {
       bool isRoot = false,
       bool generateLazyChildren = true)
       : SelectiveColumnReader(requestedType, fileType, params, scanSpec),
+        columnReaderOptions_(columnReaderOptions),
         debugString_(
             getExceptionContext().message(VeloxException::Type::kSystem)),
         isRoot_(isRoot),
         generateLazyChildren_(generateLazyChildren),
-        rows_(memoryPool_) {}
+        rows_(pool_) {}
 
   bool hasDeletion() const final {
     return hasDeletion_;
@@ -180,6 +183,8 @@ class SelectiveStructColumnReaderBase : public SelectiveColumnReader {
     }
   }
 
+  dwio::common::ColumnReaderOptions columnReaderOptions_;
+
   // Context information obtained from ExceptionContext. Stored here
   // so that LazyVector readers under this can add this to their
   // ExceptionContext. Allows contextualizing reader errors to split
@@ -199,7 +204,7 @@ class SelectiveStructColumnReaderBase : public SelectiveColumnReader {
 
   int64_t lazyVectorReadOffset_;
 
-  int64_t currentRowNumber_ = -1;
+  int64_t currentRowNumber_{-1};
 
   const Mutation* mutation_ = nullptr;
 
@@ -249,7 +254,7 @@ class SelectiveFlatMapColumnReaderHelper {
       reader_.children_[i]->setIsFlatMapValue(true);
     }
     if (auto type = reader_.requestedType_->childAt(1); type->isRow()) {
-      childValues_ = BaseVector::create(type, 0, reader_.memoryPool_);
+      childValues_ = BaseVector::create(type, 0, reader_.pool_);
     }
   }
 
@@ -265,8 +270,7 @@ class SelectiveFlatMapColumnReaderHelper {
       result->resize(size);
     } else {
       VLOG(1) << "Reallocating result MAP vector of size " << size;
-      result =
-          BaseVector::create(reader_.requestedType_, size, reader_.memoryPool_);
+      result = BaseVector::create(reader_.requestedType_, size, reader_.pool_);
     }
     return *result->asUnchecked<MapVector>();
   }
@@ -339,7 +343,7 @@ void SelectiveFlatMapColumnReaderHelper<T, KeyNode, FormatData>::read(
     reader_.advanceFieldReader(child, offset);
   }
   for (auto* child : reader_.children_) {
-    child->read(offset, activeRows, mapNulls);
+    child->readWithTiming(offset, activeRows, mapNulls);
     child->addParentNulls(offset, mapNulls, rows);
   }
   reader_.lazyVectorReadOffset_ = offset;
@@ -502,12 +506,12 @@ void SelectiveFlatMapColumnReaderHelper<T, KeyNode, FormatData>::copyValues(
       }
     }
     if (strKeySize > 0) {
-      auto buf = AlignedBuffer::allocate<char>(strKeySize, reader_.memoryPool_);
+      auto buf = AlignedBuffer::allocate<char>(strKeySize, reader_.pool_);
       rawStrKeyBuffer = buf->template asMutable<char>();
       flatKeys->addStringBuffer(buf);
       strKeySize = 0;
       for (int k = 0; k < reader_.children_.size(); ++k) {
-        auto& s = keyNodes_[k].key.get();
+        auto s = keyNodes_[k].key.get();
         if (!s.isInline()) {
           memcpy(&rawStrKeyBuffer[strKeySize], s.data(), s.size());
           strKeySize += s.size();

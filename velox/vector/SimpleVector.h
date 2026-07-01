@@ -27,7 +27,6 @@
 #include <folly/hash/Hash.h>
 #include <glog/logging.h>
 
-#include "velox/functions/lib/string/StringCore.h"
 #include "velox/type/DecimalUtil.h"
 #include "velox/type/FloatingPointUtil.h"
 #include "velox/type/Type.h"
@@ -144,10 +143,15 @@ class SimpleVector : public BaseVector {
     stats_ = std::move(stats);
   }
 
+  // Type of value returned depends on size of T. If T can fit in a machine
+  // word, return by value, otherwise return by const reference. This is an
+  // optimization to avoid copying large types.
+  using TValueAt = std::conditional_t<sizeof(T) <= sizeof(void*), T, const T&>;
+
   // Concrete Vector types need to implement this themselves.
   // This method does not do bounds checking. When the value is null the return
   // value is technically undefined (currently implemented as default of T)
-  virtual const T valueAt(vector_size_t idx) const = 0;
+  virtual TValueAt valueAt(vector_size_t idx) const = 0;
 
   std::optional<int32_t> compare(
       const BaseVector* other,
@@ -217,8 +221,30 @@ class SimpleVector : public BaseVector {
 
     if constexpr (std::is_floating_point_v<T>) {
       return util::floating_point::NaNAwareHash<T>{}(valueAt(index));
-    } else {
+    } else if constexpr (std::is_same_v<T, int128_t>) {
+#ifdef _MSC_VER
+      // MSVC has folly::hasher<int128_t> defined in Int128.h
+      return folly::hasher<int128_t>{}(valueAt(index));
+#else
+      // folly::hasher doesn't support __int128, use hash_combine of high/low parts
+      auto value = valueAt(index);
+      return folly::hash::hash_combine(
+          static_cast<uint64_t>(value),
+          static_cast<uint64_t>(value >> 64));
+#endif
+    } else if constexpr (
+        std::is_same_v<T, Timestamp> || std::is_arithmetic_v<T> ||
+        std::is_same_v<T, StringView>) {
       return folly::hasher<T>{}(valueAt(index));
+    } else if constexpr (std::is_same_v<T, std::shared_ptr<void>>) {
+      // OPAQUE type - hash the pointer value
+      return folly::hasher<uintptr_t>{}(
+          reinterpret_cast<uintptr_t>(valueAt(index).get()));
+    } else {
+      // Complex types (Array, Map, Row) don't have folly::hasher
+      VELOX_UNREACHABLE(
+          "hashValueAt not supported for complex type: {}",
+          type_->toString());
     }
   }
 
@@ -305,33 +331,7 @@ class SimpleVector : public BaseVector {
   /// present. Returns computed value.
   template <typename U = T>
   typename std::enable_if_t<std::is_same_v<U, StringView>, bool>
-  computeAndSetIsAscii(const SelectivityVector& rows) {
-    if (rows.isSubset(*asciiInfo.readLockedAsciiComputedRows())) {
-      return asciiInfo.isAllAscii();
-    }
-    ensureIsAsciiCapacity();
-    bool isAllAscii = true;
-    rows.applyToSelected([&](auto row) {
-      if (!isNullAt(row)) {
-        auto string = valueAt(row);
-        isAllAscii &=
-            functions::stringCore::isAscii(string.data(), string.size());
-      }
-    });
-
-    // Set isAllAscii flag, it will unset if we encounter any utf.
-    auto wlockedAsciiComputedRows = asciiInfo.writeLockedAsciiComputedRows();
-    if (!wlockedAsciiComputedRows->hasSelections()) {
-      asciiInfo.setIsAllAscii(isAllAscii);
-    } else {
-      asciiInfo.setIsAllAscii(asciiInfo.isAllAscii() & isAllAscii);
-    }
-
-    wlockedAsciiComputedRows->select(rows);
-    asciiInfo.setAsciiComputedRowsEmpty(
-        !wlockedAsciiComputedRows->hasSelections());
-    return asciiInfo.isAllAscii();
-  }
+  computeAndSetIsAscii(const SelectivityVector& rows);
 
   /// Clears asciiness state.
   template <typename U = T>
@@ -429,7 +429,19 @@ class SimpleVector : public BaseVector {
         return -1;
       }
     }
-    return left < right ? -1 : left == right ? 0 : 1;
+    // Only compile comparison for types that support it
+    if constexpr (std::is_arithmetic_v<T> || std::is_same_v<T, StringView> || 
+                  std::is_same_v<T, Timestamp> ||
+                  std::is_same_v<T, int128_t> || std::is_same_v<T, uint128_t>) {
+      return left < right ? -1 : left == right ? 0 : 1;
+    } else if constexpr (std::is_same_v<T, std::shared_ptr<void>>) {
+      // OPAQUE type - compare by pointer value for deterministic ordering
+      return left.get() < right.get() ? -1 : left.get() == right.get() ? 0 : 1;
+    } else {
+      // For complex types without comparison operators, this should never be called
+      VELOX_UNREACHABLE("comparePrimitiveAsc called for unsupported type");
+      return 0; // Unreachable, but required for MSVC
+    }
   }
 
  protected:

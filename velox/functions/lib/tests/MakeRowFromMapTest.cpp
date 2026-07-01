@@ -173,7 +173,8 @@ class MakeRowFroMapTest : public testing::Test, public test::VectorTestBase {
     // eg: cast(row_constructor(c0[1], c0[2]) as row(key1 bigint, key2 bigint))
     // Extract keys and wrap it in a struct
     auto typedExpr = core::Expressions::inferTypes(
-        parse::parseExpr("row_constructor(c0[1], c0[2])", {}),
+        parse::DuckSqlExpressionsParser().parseExpr(
+            "row_constructor(c0[1], c0[2])"),
         inputRow->type(),
         execCtx_->pool());
     // Wrap the struct in a cast to get the correct field names
@@ -593,6 +594,117 @@ TEST_F(MakeRowFroMapTest, duplicateKey) {
   options.throwOnDuplicateKeys = true;
   result = toRowVector<TypeKind::BIGINT>(*testCase, options, rows);
   test::assertEqualVectors(expected, result, rows);
+}
+
+class MakeRowFromMapDefaultsTest : public testing::Test,
+                                   public test::VectorTestBase {
+ protected:
+  static void SetUpTestCase() {
+    memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
+  }
+
+  template <typename T>
+  void verifyPrimitiveDefaults(const VectorPtr& vector, T expectedDefault) {
+    ASSERT_TRUE(vector->isFlatEncoding());
+    auto flatVector = vector->asFlatVector<T>();
+    for (auto i = 0; i < vector->size(); ++i) {
+      ASSERT_EQ(flatVector->valueAt(i), expectedDefault) << " at row " << i;
+    }
+  }
+
+  void verifyArrayVectorBaseDefaults(const VectorPtr& vector) {
+    ASSERT_TRUE(
+        vector->encoding() == VectorEncoding::Simple::ARRAY ||
+        vector->encoding() == VectorEncoding::Simple::MAP);
+    auto arrayVectorBase = vector->asUnchecked<ArrayVectorBase>();
+    for (auto i = 0; i < vector->size(); ++i) {
+      ASSERT_EQ(arrayVectorBase->sizeAt(i), 0) << " at row " << i;
+      ASSERT_EQ(arrayVectorBase->offsetAt(i), 0) << " at row " << i;
+    }
+  }
+};
+
+TEST_F(MakeRowFromMapDefaultsTest, createFlatPrimitiveTypes) {
+  vector_size_t size = 5;
+  // Test INTEGER
+  auto integerVector =
+      MakeRowFromMapDefaults::createFlat(INTEGER(), size, *pool(), nullptr);
+  verifyPrimitiveDefaults<int32_t>(integerVector, 0);
+
+  // Test VARCHAR
+  auto varcharVector =
+      MakeRowFromMapDefaults::createFlat(VARCHAR(), size, *pool(), nullptr);
+  verifyPrimitiveDefaults<StringView>(varcharVector, StringView());
+
+  // Test TIMESTAMP
+  auto timestampVector =
+      MakeRowFromMapDefaults::createFlat(TIMESTAMP(), size, *pool(), nullptr);
+  verifyPrimitiveDefaults<Timestamp>(timestampVector, Timestamp());
+}
+
+TEST_F(MakeRowFromMapDefaultsTest, createFlatComplexTypes) {
+  vector_size_t size = 5;
+
+  // Test ARRAY
+  auto arrayVector = MakeRowFromMapDefaults::createFlat(
+      ARRAY(INTEGER()), size, *pool(), nullptr);
+  verifyArrayVectorBaseDefaults(arrayVector);
+
+  // Test MAP
+  auto mapVector = MakeRowFromMapDefaults::createFlat(
+      MAP(INTEGER(), VARCHAR()), size, *pool(), nullptr);
+  verifyArrayVectorBaseDefaults(mapVector);
+}
+
+TEST_F(MakeRowFromMapDefaultsTest, createConstantPrimitiveTypes) {
+  vector_size_t size = 5;
+
+  // Test BIGINT constant
+  auto bigintConstant =
+      MakeRowFromMapDefaults::createConstant(BIGINT(), size, *pool());
+  ASSERT_TRUE(bigintConstant->isConstantEncoding());
+  ASSERT_EQ(bigintConstant->size(), size);
+  ASSERT_EQ(
+      bigintConstant->asUnchecked<ConstantVector<int64_t>>()->valueAt(0), 0);
+
+  // Test VARCHAR constant
+  auto varcharConstant =
+      MakeRowFromMapDefaults::createConstant(VARCHAR(), size, *pool());
+  ASSERT_TRUE(varcharConstant->isConstantEncoding());
+  ASSERT_EQ(varcharConstant->size(), size);
+  ASSERT_EQ(
+      varcharConstant->asUnchecked<ConstantVector<StringView>>()->valueAt(0),
+      StringView());
+}
+
+TEST_F(MakeRowFromMapDefaultsTest, createConstantComplexTypes) {
+  vector_size_t size = 5;
+
+  // Test ARRAY constant
+  auto arrayConstant =
+      MakeRowFromMapDefaults::createConstant(ARRAY(INTEGER()), size, *pool());
+  ASSERT_TRUE(arrayConstant->isConstantEncoding());
+  ASSERT_EQ(arrayConstant->size(), size);
+  verifyArrayVectorBaseDefaults(arrayConstant->valueVector());
+
+  // Test MAP constant
+  auto mapConstant = MakeRowFromMapDefaults::createConstant(
+      MAP(BIGINT(), VARCHAR()), size, *pool());
+  ASSERT_TRUE(mapConstant->isConstantEncoding());
+  ASSERT_EQ(mapConstant->size(), size);
+  verifyArrayVectorBaseDefaults(mapConstant->valueVector());
+}
+
+TEST_F(MakeRowFromMapDefaultsTest, unsupportedTypes) {
+  vector_size_t size = 5;
+
+  VELOX_ASSERT_THROW(
+      MakeRowFromMapDefaults::createConstant(ROW({BIGINT()}), size, *pool()),
+      "Unsupported type for replacing nulls: ROW<\"\":BIGINT>");
+
+  VELOX_ASSERT_THROW(
+      MakeRowFromMapDefaults::createConstant(UNKNOWN(), size, *pool()),
+      "Unsupported type for replacing nulls: UNKNOWN");
 }
 } // namespace
 } // namespace facebook::velox::functions

@@ -19,7 +19,8 @@
 
 #include <utility>
 
-#include "velox/common/Enums.h"
+#include "velox/common/EnumDeclare.h"
+#include "velox/common/rpc/RPCTypes.h"
 #include "velox/connectors/Connector.h"
 #include "velox/core/Expressions.h"
 #include "velox/core/QueryConfig.h"
@@ -206,6 +207,14 @@ class PlanNode : public ISerializable {
     return false;
   }
 
+  /// Returns true if this plan node requires single-threaded execution
+  /// (maxDrivers = 1). For example, ValuesNode, final OrderByNode, final
+  /// LimitNode, MergeExchangeNode, LocalMergeNode, and
+  /// LocalPartitionNode(Gather) all require single-threaded execution.
+  virtual bool requiresSingleThread() const {
+    return false;
+  }
+
   /// Returns true if this plan node operator supports task barrier processing.
   /// To support barrier processing, the operator must be able to drain its
   /// buffered output when it receives the drain signal at split boundary. Not
@@ -259,23 +268,28 @@ class PlanNode : public ISerializable {
   /// The name of the plan node, used in toString.
   virtual std::string_view name() const = 0;
 
+  template <typename T>
+  bool is() const {
+    return dynamic_cast<const T*>(this) != nullptr;
+  }
+
+  template <typename T>
+  const T* as() const {
+    return dynamic_cast<const T*>(this);
+  }
+
   /// Recursively checks the node tree for a first node that satisfy a given
   /// condition. Returns pointer to the node if found, nullptr if not.
   static const PlanNode* findFirstNode(
-      const PlanNode* node,
-      const std::function<bool(const PlanNode* node)>& predicate) {
-    if (predicate(node)) {
-      return node;
-    }
+      const PlanNode* root,
+      const std::function<bool(const PlanNode* node)>& predicate);
 
-    // Recursively go further through the sources.
-    for (const auto& source : node->sources()) {
-      const auto* ret = PlanNode::findFirstNode(source.get(), predicate);
-      if (ret != nullptr) {
-        return ret;
-      }
-    }
-    return nullptr;
+  /// @return PlanNode with matching ID or nullptr if not found.
+  static const PlanNode* findNodeById(
+      const PlanNode* root,
+      const PlanNodeId& id) {
+    return findFirstNode(
+        root, [&](const auto* node) { return node->id() == id; });
   }
 
  private:
@@ -386,6 +400,10 @@ class ValuesNode : public PlanNode {
   void accept(const PlanNodeVisitor& visitor, PlanNodeVisitorContext& context)
       const override;
 
+  bool requiresSingleThread() const override {
+    return !parallelizable_;
+  }
+
   const std::vector<RowVectorPtr>& values() const {
     return values_;
   }
@@ -488,6 +506,10 @@ class ArrowStreamNode : public PlanNode {
   void accept(const PlanNodeVisitor& visitor, PlanNodeVisitorContext& context)
       const override;
 
+  bool requiresSingleThread() const override {
+    return true;
+  }
+
   const std::shared_ptr<ArrowArrayStream>& arrowStream() const {
     return arrowStream_;
   }
@@ -498,6 +520,7 @@ class ArrowStreamNode : public PlanNode {
 
   folly::dynamic serialize() const override {
     VELOX_UNSUPPORTED("ArrowStream plan node is not serializable");
+    return folly::dynamic{};
   }
 
  private:
@@ -1129,6 +1152,7 @@ class AggregationNode : public PlanNode {
       const std::vector<std::string>& aggregateNames,
       const std::vector<Aggregate>& aggregates,
       bool ignoreNullKeys,
+      bool noGroupsSpanBatches,
       PlanNodePtr source);
 
   /// @param globalGroupingSets Group IDs of the global grouping sets produced
@@ -1150,6 +1174,7 @@ class AggregationNode : public PlanNode {
       const std::vector<vector_size_t>& globalGroupingSets,
       const std::optional<FieldAccessTypedExprPtr>& groupId,
       bool ignoreNullKeys,
+      bool noGroupsSpanBatches,
       PlanNodePtr source);
 
   class Builder {
@@ -1166,6 +1191,7 @@ class AggregationNode : public PlanNode {
       globalGroupingSets_ = other.globalGroupingSets();
       groupId_ = other.groupId();
       ignoreNullKeys_ = other.ignoreNullKeys();
+      noGroupsSpanBatches_ = other.noGroupsSpanBatches();
       VELOX_CHECK_EQ(other.sources().size(), 1);
       source_ = other.sources()[0];
     }
@@ -1216,6 +1242,11 @@ class AggregationNode : public PlanNode {
       return *this;
     }
 
+    Builder& noGroupsSpanBatches(bool noGroupsSpanBatches) {
+      noGroupsSpanBatches_ = noGroupsSpanBatches;
+      return *this;
+    }
+
     Builder& source(PlanNodePtr source) {
       source_ = std::move(source);
       return *this;
@@ -1250,6 +1281,7 @@ class AggregationNode : public PlanNode {
           globalGroupingSets_,
           groupId_,
           ignoreNullKeys_.value(),
+          noGroupsSpanBatches_,
           source_.value());
     }
 
@@ -1263,11 +1295,12 @@ class AggregationNode : public PlanNode {
     std::vector<vector_size_t> globalGroupingSets_ = kDefaultGlobalGroupingSets;
     std::optional<FieldAccessTypedExprPtr> groupId_ = kDefaultGroupId;
     std::optional<bool> ignoreNullKeys_;
+    bool noGroupsSpanBatches_{false};
     std::optional<PlanNodePtr> source_;
   };
 
   bool supportsBarrier() const override {
-    return isPreGrouped();
+    return true;
   }
 
   const std::vector<PlanNodePtr>& sources() const override {
@@ -1296,10 +1329,10 @@ class AggregationNode : public PlanNode {
   bool isPreGrouped() const {
     return !preGroupedKeys_.empty() &&
         std::equal(
-            preGroupedKeys_.begin(),
-            preGroupedKeys_.end(),
-            groupingKeys_.begin(),
-            groupingKeys_.end(),
+            preGroupedKeys_.cbegin(),
+            preGroupedKeys_.cend(),
+            groupingKeys_.cbegin(),
+            groupingKeys_.cend(),
             [](const FieldAccessTypedExprPtr& x,
                const FieldAccessTypedExprPtr& y) -> bool {
               return (*x == *y);
@@ -1322,8 +1355,17 @@ class AggregationNode : public PlanNode {
     return globalGroupingSets_;
   }
 
-  std::optional<FieldAccessTypedExprPtr> groupId() const {
+  const std::optional<FieldAccessTypedExprPtr>& groupId() const {
     return groupId_;
+  }
+
+  /// When true, indicates that for streaming aggregation, no sort group spans
+  /// across input batches. Each input batch contains complete data for its
+  /// groups - no group will appear in any subsequent input batch. This allows
+  /// the streaming aggregation operator to immediately produce the aggregation
+  /// result for all the groups in each input batch.
+  bool noGroupsSpanBatches() const {
+    return noGroupsSpanBatches_;
   }
 
   std::string_view name() const override {
@@ -1362,8 +1404,15 @@ class AggregationNode : public PlanNode {
   const std::vector<Aggregate> aggregates_;
   const bool ignoreNullKeys_;
 
-  std::optional<FieldAccessTypedExprPtr> groupId_;
-  std::vector<vector_size_t> globalGroupingSets_;
+  const std::optional<FieldAccessTypedExprPtr> groupId_;
+  const std::vector<vector_size_t> globalGroupingSets_;
+
+  // When true, indicates that for streaming aggregation, no sort group spans
+  // across input batches. Each input batch contains complete data for its
+  // groups - no group will appear in any subsequent input batch. This allows
+  // the streaming aggregation operator to immediately produce the aggregation
+  // result for all the groups in each input batch.
+  const bool noGroupsSpanBatches_;
 
   const std::vector<PlanNodePtr> sources_;
   const RowTypePtr outputType_;
@@ -1433,13 +1482,91 @@ struct ColumnStatsSpec : public ISerializable {
     VELOX_CHECK_EQ(aggregates.size(), aggregateNames.size());
   }
 
+  /// Returns the output row type that will be produced by this column stats
+  /// spec. The output type is determined by the grouping keys and aggregate
+  /// functions specified in the object.
+  RowTypePtr outputType() const;
+
   folly::dynamic serialize() const override;
 
   static ColumnStatsSpec create(const folly::dynamic& obj, void* context);
 };
 
+/// Writes input rows to a table via a connector-specific DataSink and
+/// optionally collects per-column statistics (count, min, max,
+/// approx_distinct) using an embedded ColumnStatsCollector.
+///
+/// Two output modes depending on outputType:
+///
+/// 1. Single-column BIGINT (Spark/Gluten): output is a single row count.
+///    No stats, no fragments, no commit context. Used when columnStatsSpec
+///    is not set.
+///
+/// 2. Multiplexed format (Prestissimo, see TableWriteTraits):
+///   Channel 0 (rows):      row count or NULL
+///   Channel 1 (fragments): file fragment data or NULL
+///   Channel 2 (context):   commit context JSON (always present)
+///   Channel 3+ (stats):    aggregated statistics columns (if configured)
+///
+///   Each operator instance (one per driver) produces three kinds of rows:
+///     - Statistics rows: rows=NULL, fragments=NULL, stats populated.
+///       One row per partition (or one row for unpartitioned tables).
+///     - Fragment rows:   rows=NULL, fragments=non-NULL, stats=NULL.
+///       One row per output file.
+///     - Summary row:     rows=totalCount, fragments=NULL, stats=NULL.
+///       One per driver, emitted last.
+///
+///   The context column (channel 2) is a JSON object. See
+///   TableWriteTraits for field names (taskId, lifespan,
+///   pageSinkCommitStrategy, lastPage). All rows carry context; the
+///   summary row has lastPage=true.
+///
+///   When columnStatsSpec is set, the aggregation step controls output types:
+///     - kSingle:  produces final statistics values (single-driver, no merge).
+///     - kPartial: produces intermediate aggregation state (requires a
+///                 downstream TableWriteMergeNode to finalize).
+///
+/// Typical plan topologies (data flows left to right):
+///
+///   Single-node, single-driver:
+///     Input → TableWrite(kSingle)
+///
+///   Single-node, multi-driver:
+///     Input → TableWrite(kPartial) → LocalGather → TableWriteMerge(kFinal)
+///
+///   Multi-node, multi-driver:
+///     Worker:      Input → TableWrite(kPartial) → LocalGather
+///                    → TableWriteMerge(kIntermediate) → PartitionedOutput
+///     Coordinator: Exchange → TableWriteMerge(kFinal)
+///     In Prestissimo, the coordinator uses Presto's Java
+///     TableFinishOperator instead of TableWriteMerge.
 class TableWriteNode : public PlanNode {
  public:
+  /// @param id Plan node ID.
+  /// @param columns Subset of source output columns to write, potentially
+  /// reordered. The names in this type must match columns in the source
+  /// output (used to build the input-to-output column mapping).
+  /// @param columnNames Target table column names for the written data.
+  /// Aligned 1:1 with 'columns'. May differ from 'columns' names when the
+  /// query renames columns (e.g. source has "expr_0" but table column is
+  /// "key"). The DataSink receives data using these names.
+  /// @param columnStatsSpec Optional specification for column statistics
+  /// collection. When set, the operator collects per-column aggregates
+  /// (count, min, max, approx_distinct) alongside the write. Restrictions:
+  ///   - aggregation step must be kSingle or kPartial.
+  ///   - grouping keys must be a subset of 'columns' (partition columns).
+  ///   - grouping keys must not contain duplicates.
+  /// @param insertTableHandle Connector-specific handle identifying the
+  /// target table and write operation.
+  /// @param hasPartitioningScheme Whether a partitioning scheme is configured
+  /// for shuffles. Controls which query config determines the number of
+  /// writer operator instances: 'task_partitioned_writer_count' if true,
+  /// 'task_writer_count' if false.
+  /// @param outputType Output row type. For Prestissimo, must match
+  /// TableWriteTraits::outputType(columnStatsSpec). For Spark/Gluten, a
+  /// single-column BIGINT type with no columnStatsSpec.
+  /// @param commitStrategy Commit strategy for the write operation.
+  /// @param source Input plan node providing rows to write.
   TableWriteNode(
       const PlanNodeId& id,
       const RowTypePtr& columns,
@@ -1449,25 +1576,7 @@ class TableWriteNode : public PlanNode {
       bool hasPartitioningScheme,
       RowTypePtr outputType,
       connector::CommitStrategy commitStrategy,
-      const PlanNodePtr& source)
-      : PlanNode(id),
-        sources_{source},
-        columns_{columns},
-        columnNames_{columnNames},
-        columnStatsSpec_(std::move(columnStatsSpec)),
-        insertTableHandle_(std::move(insertTableHandle)),
-        hasPartitioningScheme_(hasPartitioningScheme),
-        outputType_(std::move(outputType)),
-        commitStrategy_(commitStrategy) {
-    VELOX_USER_CHECK_EQ(columns_->size(), columnNames_.size());
-    for (const auto& column : columns_->names()) {
-      VELOX_USER_CHECK(
-          source->outputType()->containsChild(column),
-          "Column {} not found in TableWriter input: {}",
-          column,
-          source->outputType()->toString());
-    }
-  }
+      const PlanNodePtr& source);
 
   class Builder {
    public:
@@ -1605,8 +1714,7 @@ class TableWriteNode : public PlanNode {
   /// Indicates if this table write plan node has specified partitioning
   /// scheme for remote and local shuffles. If true, the task creates a
   /// number of table write operators based on the query config
-  /// 'task_partitioned_writer_count', otherwise based on
-  /// x'task_writer_count'.
+  /// 'task_partitioned_writer_count', otherwise based on 'task_writer_count'.
   bool hasPartitioningScheme() const {
     return hasPartitioningScheme_;
   }
@@ -1615,15 +1723,17 @@ class TableWriteNode : public PlanNode {
     return commitStrategy_;
   }
 
-  /// Returns true of this table write plan node has configured column
-  /// statistics collection.
   bool hasColumnStatsSpec() const {
     return columnStatsSpec_.has_value();
   }
 
-  /// Optional spec for column statistics collection.
   const std::optional<ColumnStatsSpec>& columnStatsSpec() const {
     return columnStatsSpec_;
+  }
+
+  bool requiresSingleThread() const override {
+    return !insertTableHandle_->connectorInsertTableHandle()
+                ->supportsMultiThreading();
   }
 
   bool canSpill(const QueryConfig& queryConfig) const override {
@@ -1653,29 +1763,50 @@ class TableWriteNode : public PlanNode {
 
 using TableWriteNodePtr = std::shared_ptr<const TableWriteNode>;
 
+/// Merges output from multiple TableWrite operators. Collects fragments,
+/// accumulates row counts, and aggregates column statistics using an
+/// embedded ColumnStatsCollector.
+///
+/// Input rows are classified per-row using TableWriteTraits::isStatisticsRow
+/// (see TableWriteTraits). Input batches may contain a mix of statistics and
+/// data rows (e.g. when receiving batched output from an exchange):
+///   - Statistics rows (rows=NULL, fragments=NULL): routed to the stats
+///     collector for aggregation.
+///   - Data rows (rows or fragments non-NULL): row counts are accumulated,
+///     fragments are buffered, and commit context is validated for
+///     consistency (all inputs must share the same commit strategy;
+///     taskId may differ in cross-worker merge).
+///
+/// Output follows the same three-phase protocol as TableWriteNode:
+///   1. Fragment rows (emitted first, to free memory).
+///   2. Aggregated statistics rows from the stats collector.
+///   3. Summary row with total row count and lastPage=true.
+///
+/// The aggregation step in ColumnStatsSpec must be kIntermediate or kFinal:
+///   - kIntermediate: reads partial state, produces partial state (for
+///     further merging downstream).
+///   - kFinal: reads partial state, produces final scalar values.
+///
+/// Supports both single-task multi-driver merge (via LocalGather) and
+/// cross-task merge (via Exchange from multiple workers).
 class TableWriteMergeNode : public PlanNode {
  public:
-  /// 'outputType' specifies the type to store the metadata of table write
-  /// output which contains the following columns: 'numWrittenRows',
-  /// 'fragment' and 'tableCommitContext'.
+  /// @param id Plan node ID.
+  /// @param columnStatsSpec Optional specification for column statistics
+  /// aggregation. Restrictions:
+  ///   - aggregation step must be kIntermediate or kFinal.
+  ///   - grouping keys must be present in source output type.
+  ///   - grouping keys must not contain duplicates.
+  /// @param outputType Output row type. Column names may differ from
+  /// TableWriteTraits defaults (e.g. Prestissimo appends node ID suffixes).
+  /// Types must match TableWriteTraits::outputType(columnStatsSpec).
+  /// @param source Input plan node, typically a LocalGather over
+  /// TableWriteNode(s).
   TableWriteMergeNode(
       const PlanNodeId& id,
       RowTypePtr outputType,
       std::optional<ColumnStatsSpec> columnStatsSpec,
-      PlanNodePtr source)
-      : PlanNode(id),
-        columnStatsSpec_(std::move(columnStatsSpec)),
-        sources_{std::move(source)},
-        outputType_(std::move(outputType)) {
-    if (hasColumnStatsSpec()) {
-      VELOX_USER_CHECK(
-          columnStatsSpec_->aggregationStep ==
-                  core::AggregationNode::Step::kFinal ||
-              columnStatsSpec_->aggregationStep ==
-                  core::AggregationNode::Step::kIntermediate,
-          "TableWriteMergeNode requires aggregation step to be intermediate or final");
-    }
-  }
+      PlanNodePtr source);
 
   class Builder {
    public:
@@ -1736,6 +1867,10 @@ class TableWriteMergeNode : public PlanNode {
   /// Optional spec for column statistics collection.
   const std::optional<ColumnStatsSpec>& columnStatsSpec() const {
     return columnStatsSpec_;
+  }
+
+  bool requiresSingleThread() const override {
+    return true;
   }
 
   const std::vector<PlanNodePtr>& sources() const override {
@@ -2044,11 +2179,8 @@ using GroupIdNodePtr = std::shared_ptr<const GroupIdNode>;
 
 class ExchangeNode : public PlanNode {
  public:
-  ExchangeNode(
-      const PlanNodeId& id,
-      RowTypePtr type,
-      VectorSerde::Kind serdeKind)
-      : PlanNode(id), outputType_(type), serdeKind_(serdeKind) {}
+  ExchangeNode(const PlanNodeId& id, RowTypePtr type, std::string serdeKind)
+      : PlanNode(id), outputType_(type), serdeKind_(std::move(serdeKind)) {}
 
   class Builder {
    public:
@@ -2070,8 +2202,8 @@ class ExchangeNode : public PlanNode {
       return *this;
     }
 
-    Builder& serdeKind(VectorSerde::Kind serdeKind) {
-      serdeKind_ = serdeKind;
+    Builder& serdeKind(std::string serdeKind) {
+      serdeKind_ = std::move(serdeKind);
       return *this;
     }
 
@@ -2089,7 +2221,7 @@ class ExchangeNode : public PlanNode {
    private:
     std::optional<PlanNodeId> id_;
     std::optional<RowTypePtr> outputType_;
-    std::optional<VectorSerde::Kind> serdeKind_;
+    std::optional<std::string> serdeKind_;
   };
 
   const RowTypePtr& outputType() const override {
@@ -2113,7 +2245,7 @@ class ExchangeNode : public PlanNode {
     return "Exchange";
   }
 
-  VectorSerde::Kind serdeKind() const {
+  const std::string& serdeKind() const {
     return serdeKind_;
   }
 
@@ -2125,7 +2257,7 @@ class ExchangeNode : public PlanNode {
   void addDetails(std::stringstream& stream) const override;
 
   const RowTypePtr outputType_;
-  const VectorSerde::Kind serdeKind_;
+  const std::string serdeKind_;
 };
 
 using ExchangeNodePtr = std::shared_ptr<const ExchangeNode>;
@@ -2137,7 +2269,7 @@ class MergeExchangeNode : public ExchangeNode {
       const RowTypePtr& type,
       const std::vector<FieldAccessTypedExprPtr>& sortingKeys,
       const std::vector<SortOrder>& sortingOrders,
-      VectorSerde::Kind serdeKind);
+      std::string serdeKind);
 
   class Builder {
    public:
@@ -2171,8 +2303,8 @@ class MergeExchangeNode : public ExchangeNode {
       return *this;
     }
 
-    Builder& serdeKind(VectorSerde::Kind serdeKind) {
-      serdeKind_ = serdeKind;
+    Builder& serdeKind(std::string serdeKind) {
+      serdeKind_ = std::move(serdeKind);
       return *this;
     }
 
@@ -2201,7 +2333,7 @@ class MergeExchangeNode : public ExchangeNode {
     std::optional<RowTypePtr> outputType_;
     std::optional<std::vector<FieldAccessTypedExprPtr>> sortingKeys_;
     std::optional<std::vector<SortOrder>> sortingOrders_;
-    std::optional<VectorSerde::Kind> serdeKind_;
+    std::optional<std::string> serdeKind_;
   };
 
   const std::vector<FieldAccessTypedExprPtr>& sortingKeys() const {
@@ -2210,6 +2342,10 @@ class MergeExchangeNode : public ExchangeNode {
 
   const std::vector<SortOrder>& sortingOrders() const {
     return sortingOrders_;
+  }
+
+  bool requiresSingleThread() const override {
+    return true;
   }
 
   void accept(const PlanNodeVisitor& visitor, PlanNodeVisitorContext& context)
@@ -2310,6 +2446,10 @@ class LocalMergeNode : public PlanNode {
   void accept(const PlanNodeVisitor& visitor, PlanNodeVisitorContext& context)
       const override;
 
+  bool requiresSingleThread() const override {
+    return true;
+  }
+
   const std::vector<FieldAccessTypedExprPtr>& sortingKeys() const {
     return sortingKeys_;
   }
@@ -2378,6 +2518,7 @@ class GatherPartitionFunctionSpec : public PartitionFunctionSpec {
       int /*numPartitions*/,
       bool /*localExchange*/) const override {
     VELOX_UNREACHABLE();
+    return nullptr;
   }
 
   std::string toString() const override {
@@ -2521,6 +2662,10 @@ class LocalPartitionNode : public PlanNode {
     return scaleWriter_;
   }
 
+  bool requiresSingleThread() const override {
+    return type_ == Type::kGather;
+  }
+
   bool supportsBarrier() const override {
     return !scaleWriter_;
   }
@@ -2581,26 +2726,26 @@ class PartitionedOutputNode : public PlanNode {
       bool replicateNullsAndAny,
       PartitionFunctionSpecPtr partitionFunctionSpec,
       RowTypePtr outputType,
-      VectorSerde::Kind serdeKind,
+      std::string serdeKind,
       PlanNodePtr source);
 
   static std::shared_ptr<PartitionedOutputNode> broadcast(
       const PlanNodeId& id,
       int numPartitions,
       RowTypePtr outputType,
-      VectorSerde::Kind serdeKind,
+      std::string serdeKind,
       PlanNodePtr source);
 
   static std::shared_ptr<PartitionedOutputNode> arbitrary(
       const PlanNodeId& id,
       RowTypePtr outputType,
-      VectorSerde::Kind serdeKind,
+      std::string serdeKind,
       PlanNodePtr source);
 
   static std::shared_ptr<PartitionedOutputNode> single(
       const PlanNodeId& id,
       RowTypePtr outputType,
-      VectorSerde::Kind VectorSerde,
+      std::string serdeKind,
       PlanNodePtr source);
 
   class Builder {
@@ -2655,8 +2800,8 @@ class PartitionedOutputNode : public PlanNode {
       return *this;
     }
 
-    Builder& serdeKind(VectorSerde::Kind serdeKind) {
-      serdeKind_ = serdeKind;
+    Builder& serdeKind(std::string serdeKind) {
+      serdeKind_ = std::move(serdeKind);
       return *this;
     }
 
@@ -2708,7 +2853,7 @@ class PartitionedOutputNode : public PlanNode {
     std::optional<bool> replicateNullsAndAny_;
     std::optional<PartitionFunctionSpecPtr> partitionFunctionSpec_;
     std::optional<RowTypePtr> outputType_;
-    std::optional<VectorSerde::Kind> serdeKind_;
+    std::optional<std::string> serdeKind_;
     std::optional<PlanNodePtr> source_;
   };
 
@@ -2751,7 +2896,7 @@ class PartitionedOutputNode : public PlanNode {
     return kind_;
   }
 
-  VectorSerde::Kind serdeKind() const {
+  const std::string& serdeKind() const {
     return serdeKind_;
   }
 
@@ -2789,7 +2934,7 @@ class PartitionedOutputNode : public PlanNode {
   const int numPartitions_;
   const bool replicateNullsAndAny_;
   const PartitionFunctionSpecPtr partitionFunctionSpec_;
-  const VectorSerde::Kind serdeKind_;
+  const std::string serdeKind_;
   const RowTypePtr outputType_;
 };
 
@@ -2830,6 +2975,12 @@ enum class JoinType {
   // equal to the cardinality of the left side.
   kLeftSemiFilter = 4,
 
+  // Multiset version of kLeftSemiFilter. The build side deduplicates keys and
+  // stores a per-key count. On probe, each match decrements the count; the
+  // probe row is emitted only while the count is greater than zero. Implements
+  // INTERSECT ALL semantics.
+  kCountingLeftSemiFilter = 5,
+
   // Return each row from the left side with a boolean flag indicating whether
   // there exists a match on the right side. For this join type, cardinality
   // of the output equals the cardinality of the left side.
@@ -2838,12 +2989,12 @@ enum class JoinType {
   // 'nullAware' boolean specified separately.
   //
   // Null-aware join follows IN semantic. Regular join follows EXISTS semantic.
-  kLeftSemiProject = 5,
+  kLeftSemiProject = 6,
 
   // Opposite of kLeftSemiFilter. Return a subset of rows from the right side
   // which have a match on the left side. For this join type, cardinality of
   // the output is less than or equal to the cardinality of the right side.
-  kRightSemiFilter = 6,
+  kRightSemiFilter = 7,
 
   // Opposite of kLeftSemiProject. Return each row from the right side with a
   // boolean flag indicating whether there exists a match on the left side.
@@ -2854,7 +3005,7 @@ enum class JoinType {
   // 'nullAware' boolean specified separately.
   //
   // Null-aware join follows IN semantic. Regular join follows EXISTS semantic.
-  kRightSemiProject = 7,
+  kRightSemiProject = 8,
 
   // Return each row from the left side which has no match on the right side.
   // The handling of the rows with nulls in the join key depends on the
@@ -2869,9 +3020,15 @@ enum class JoinType {
   // Regular anti join follows NOT EXISTS semantic:
   // (1) ignore right-side rows with nulls in the join keys;
   // (2) unconditionally return left side rows with nulls in the join keys.
-  kAnti = 8,
+  kAnti = 9,
 
-  kNumJoinTypes = 9,
+  // Multiset version of kAnti. The build side deduplicates keys and stores a
+  // per-key count. On probe, each match decrements the count; the probe row is
+  // emitted only when the count reaches zero or no match is found. Implements
+  // EXCEPT ALL semantics.
+  kCountingAnti = 10,
+
+  kNumJoinTypes = 11,
 };
 
 VELOX_DECLARE_ENUM_NAME(JoinType);
@@ -2910,6 +3067,26 @@ inline bool isRightSemiProjectJoin(JoinType joinType) {
 
 inline bool isAntiJoin(JoinType joinType) {
   return joinType == JoinType::kAnti;
+}
+
+inline bool isCountingAntiJoin(JoinType joinType) {
+  return joinType == JoinType::kCountingAnti;
+}
+
+inline bool isCountingLeftSemiFilterJoin(JoinType joinType) {
+  return joinType == JoinType::kCountingLeftSemiFilter;
+}
+
+inline bool isCountingJoin(JoinType joinType) {
+  return isCountingAntiJoin(joinType) || isCountingLeftSemiFilterJoin(joinType);
+}
+
+/// Returns true if the join type is "probe-only", meaning the output includes
+/// only columns from the probe side (plus possibly a mark column).
+inline bool isProbeOnlyJoin(JoinType joinType) {
+  return joinType == JoinType::kLeftSemiFilter ||
+      joinType == JoinType::kLeftSemiProject || joinType == JoinType::kAnti ||
+      isCountingJoin(joinType);
 }
 
 inline bool isNullAwareSupported(JoinType joinType) {
@@ -3050,8 +3227,32 @@ class AbstractJoinNode : public PlanNode {
     return joinType_ == JoinType::kAnti;
   }
 
+  bool isCountingAntiJoin() const {
+    return joinType_ == JoinType::kCountingAnti;
+  }
+
+  bool isCountingLeftSemiFilterJoin() const {
+    return joinType_ == JoinType::kCountingLeftSemiFilter;
+  }
+
+  bool isCountingJoin() const {
+    return core::isCountingJoin(joinType_);
+  }
+
   bool isPreservingProbeOrder() const {
     return isInnerJoin() || isLeftJoin() || isAntiJoin();
+  }
+
+  /// Indicates if this joinNode can drop duplicate rows with same join key.
+  /// For left semi and anti join, it is not necessary to store duplicate rows.
+  /// For counting joins, duplicates are folded into a per-key count.
+  bool canDropDuplicates() const {
+    // Left semi and anti join with no extra filter only needs to know whether
+    // there is a match. Hence, no need to store entries with duplicate keys.
+    // Counting joins always deduplicate and track counts.
+    return isCountingJoin() ||
+        (!filter() &&
+         (isLeftSemiFilterJoin() || isLeftSemiProjectJoin() || isAntiJoin()));
   }
 
   const std::vector<FieldAccessTypedExprPtr>& leftKeys() const {
@@ -3093,6 +3294,12 @@ class AbstractJoinNode : public PlanNode {
 /// EXISTS.
 class HashJoinNode : public AbstractJoinNode {
  public:
+  /// @param nullAware Applies to semi and anti joins only. When true, the
+  /// join semantic is IN / NOT IN (three-valued NULL logic). When false, the
+  /// join semantic is EXISTS / NOT EXISTS.
+  /// @param nullAsValue When true, join keys use IS NOT DISTINCT FROM
+  /// semantics where NULL equals NULL. Used to implement SQL set operations
+  /// (EXCEPT, INTERSECT). Mutually exclusive with nullAware.
   HashJoinNode(
       const PlanNodeId& id,
       JoinType joinType,
@@ -3102,7 +3309,10 @@ class HashJoinNode : public AbstractJoinNode {
       TypedExprPtr filter,
       PlanNodePtr left,
       PlanNodePtr right,
-      RowTypePtr outputType)
+      RowTypePtr outputType,
+      bool useHashTableCache = false,
+      bool nullAsValue = false,
+      std::optional<std::string> cacheKey = std::nullopt)
       : AbstractJoinNode(
             id,
             joinType,
@@ -3112,8 +3322,27 @@ class HashJoinNode : public AbstractJoinNode {
             std::move(left),
             std::move(right),
             std::move(outputType)),
-        nullAware_{nullAware} {
+        nullAware_{nullAware},
+        nullAsValue_{nullAsValue},
+        useHashTableCache_{useHashTableCache},
+        cacheKey_{std::move(cacheKey)} {
     validate();
+
+    VELOX_USER_CHECK(
+        !nullAware || !nullAsValue,
+        "nullAware and nullAsValue are mutually exclusive");
+    VELOX_USER_CHECK(
+        !cacheKey_.has_value() || useHashTableCache_,
+        "cacheKey can only be set when useHashTableCache is enabled");
+    VELOX_USER_CHECK(
+        !cacheKey_.has_value() || !cacheKey_->empty(),
+        "cacheKey must be non-empty if set");
+
+    if (isCountingJoin()) {
+      VELOX_USER_CHECK(
+          !nullAware, "Counting joins do not support null-aware flag");
+      VELOX_USER_CHECK(!filter_, "Counting joins do not support extra filter");
+    }
 
     if (nullAware) {
       VELOX_USER_CHECK(
@@ -3137,10 +3366,28 @@ class HashJoinNode : public AbstractJoinNode {
     explicit Builder(const HashJoinNode& other)
         : AbstractJoinNode::Builder<HashJoinNode, Builder>(other) {
       nullAware_ = other.isNullAware();
+      nullAsValue_ = other.isNullAsValue();
+      useHashTableCache_ = other.useHashTableCache();
+      cacheKey_ = other.cacheKey();
     }
 
     Builder& nullAware(bool value) {
       nullAware_ = value;
+      return *this;
+    }
+
+    Builder& nullAsValue(bool value) {
+      nullAsValue_ = value;
+      return *this;
+    }
+
+    Builder& useHashTableCache(bool value) {
+      useHashTableCache_ = value;
+      return *this;
+    }
+
+    Builder& cacheKey(std::optional<std::string> value) {
+      cacheKey_ = std::move(value);
       return *this;
     }
 
@@ -3170,11 +3417,17 @@ class HashJoinNode : public AbstractJoinNode {
           filter_.value_or(nullptr),
           left_.value(),
           right_.value(),
-          outputType_.value());
+          outputType_.value(),
+          useHashTableCache_.value_or(false),
+          nullAsValue_.value_or(false),
+          cacheKey_);
     }
 
    private:
     std::optional<bool> nullAware_;
+    std::optional<bool> nullAsValue_;
+    std::optional<bool> useHashTableCache_;
+    std::optional<std::string> cacheKey_;
   };
 
   std::string_view name() const override {
@@ -3193,8 +3446,29 @@ class HashJoinNode : public AbstractJoinNode {
         queryConfig.joinSpillEnabled();
   }
 
+  bool requiresSingleThread() const override {
+    return isRightSemiProjectJoin() && nullAware_;
+  }
+
   bool isNullAware() const {
     return nullAware_;
+  }
+
+  /// Returns true when join keys use IS NOT DISTINCT FROM semantics where
+  /// NULL equals NULL. Used to implement SQL set operations (EXCEPT,
+  /// INTERSECT).
+  bool isNullAsValue() const {
+    return nullAsValue_;
+  }
+
+  /// Returns whether hash table caching is enabled for broadcast joins.
+  /// Only used by Presto-on-Spark.
+  bool useHashTableCache() const {
+    return useHashTableCache_;
+  }
+
+  const std::optional<std::string>& cacheKey() const {
+    return cacheKey_;
   }
 
   folly::dynamic serialize() const override;
@@ -3205,6 +3479,9 @@ class HashJoinNode : public AbstractJoinNode {
   void addDetails(std::stringstream& stream) const override;
 
   const bool nullAware_;
+  const bool nullAsValue_;
+  const bool useHashTableCache_;
+  const std::optional<std::string> cacheKey_;
 };
 
 using HashJoinNodePtr = std::shared_ptr<const HashJoinNode>;
@@ -3259,6 +3536,10 @@ class MergeJoinNode : public AbstractJoinNode {
           outputType_.value());
     }
   };
+
+  bool requiresSingleThread() const override {
+    return true;
+  }
 
   std::string_view name() const override {
     return "MergeJoin";
@@ -3368,8 +3649,9 @@ struct BetweenIndexLookupCondition : public IndexLookupCondition {
 using BetweenIndexLookupConditionPtr =
     std::shared_ptr<BetweenIndexLookupCondition>;
 
-/// Represents EQUAL index lookup condition: 'key' = 'value'. 'value' must be a
-/// constant value with the same type as 'key'.
+/// Represents EQUAL index lookup condition: 'key' = 'value'. 'value' can be
+/// either a constant value or a field access expression (probe side column)
+/// with the same type as 'key'.
 struct EqualIndexLookupCondition : public IndexLookupCondition {
   /// The value to compare against.
   TypedExprPtr value;
@@ -3442,6 +3724,14 @@ class IndexLookupJoinNode : public AbstractJoinNode {
   /// @param hasMarker if true, the output type includes a boolean
   /// column at the end to indicate if a join output row has a match or not.
   /// This only applies for left join.
+  /// @param forwardedProbeColumns Probe-side columns that the operator must
+  /// include in the connector's lookup input vector even when no join key or
+  /// join condition references them. Connectors that need per-row probe
+  /// values (e.g. cumulative-weight caps fetched per probe) use this to
+  /// declare which columns they expect to find in the request input. Defaults
+  /// to empty, in which case behavior is unchanged. A forwarded column may
+  /// not overlap with any column already referenced by leftKeys or by a join
+  /// condition.
   IndexLookupJoinNode(
       const PlanNodeId& id,
       JoinType joinType,
@@ -3452,31 +3742,29 @@ class IndexLookupJoinNode : public AbstractJoinNode {
       bool hasMarker,
       PlanNodePtr left,
       TableScanNodePtr right,
-      RowTypePtr outputType);
+      RowTypePtr outputType,
+      std::optional<bool> splitOutput = std::nullopt,
+      std::vector<FieldAccessTypedExprPtr> forwardedProbeColumns = {});
 
-#ifdef VELOX_ENABLE_BACKWARD_COMPATIBILITY
+  /// @param splitOutput Optional flag to control whether the operator should
+  /// split output batches if they are too large. If true, output is split into
+  /// batches according to Operator's outputBatchRows logic. If false, output is
+  /// not split and output batches match input batches 1:1. If not set, defaults
+  /// to the value of the index_lookup_join_split_output config in the
+  /// QueryConfig.
   IndexLookupJoinNode(
       const PlanNodeId& id,
       JoinType joinType,
       const std::vector<FieldAccessTypedExprPtr>& leftKeys,
       const std::vector<FieldAccessTypedExprPtr>& rightKeys,
       const std::vector<IndexLookupConditionPtr>& joinConditions,
+      TypedExprPtr filter,
       bool hasMarker,
+      std::optional<bool> splitOutput,
       PlanNodePtr left,
       TableScanNodePtr right,
-      RowTypePtr outputType)
-      : IndexLookupJoinNode(
-            id,
-            joinType,
-            leftKeys,
-            rightKeys,
-            joinConditions,
-            /*filter=*/nullptr,
-            hasMarker,
-            std::move(left),
-            std::move(right),
-            std::move(outputType)) {}
-#endif
+      RowTypePtr outputType,
+      std::vector<FieldAccessTypedExprPtr> forwardedProbeColumns = {});
 
   class Builder
       : public AbstractJoinNode::Builder<IndexLookupJoinNode, Builder> {
@@ -3488,6 +3776,8 @@ class IndexLookupJoinNode : public AbstractJoinNode {
       joinConditions_ = other.joinConditions();
       filter_ = other.filter();
       hasMarker_ = other.hasMarker();
+      splitOutput_ = other.splitOutput();
+      forwardedProbeColumns_ = other.forwardedProbeColumns();
     }
 
     /// Set lookup conditions for index lookup that can't be converted into
@@ -3507,6 +3797,22 @@ class IndexLookupJoinNode : public AbstractJoinNode {
     /// Set whether to include a marker column for left joins.
     Builder& hasMarker(bool hasMarker) {
       hasMarker_ = hasMarker;
+      return *this;
+    }
+
+    /// Set whether to split large output into multiple batches, std::nullopt
+    /// means respect index_lookup_join_split_output in the QueryConfig.
+    Builder& splitOutput(std::optional<bool> splitOutput) {
+      splitOutput_ = splitOutput;
+      return *this;
+    }
+
+    /// Set probe-side columns that should be forwarded to the connector's
+    /// lookup input even though no join key or join condition references
+    /// them. See the IndexLookupJoinNode constructor for the contract.
+    Builder& forwardedProbeColumns(
+        std::vector<FieldAccessTypedExprPtr> forwardedProbeColumns) {
+      forwardedProbeColumns_ = std::move(forwardedProbeColumns);
       return *this;
     }
 
@@ -3533,14 +3839,18 @@ class IndexLookupJoinNode : public AbstractJoinNode {
           joinConditions_,
           filter_.value_or(nullptr),
           hasMarker_,
+          splitOutput_,
           left_.value(),
           std::dynamic_pointer_cast<const TableScanNode>(right_.value()),
-          outputType_.value());
+          outputType_.value(),
+          forwardedProbeColumns_);
     }
 
    private:
     std::vector<IndexLookupConditionPtr> joinConditions_;
-    bool hasMarker_;
+    bool hasMarker_{false};
+    std::optional<bool> splitOutput_;
+    std::vector<FieldAccessTypedExprPtr> forwardedProbeColumns_;
   };
 
   bool supportsBarrier() const override {
@@ -3551,10 +3861,22 @@ class IndexLookupJoinNode : public AbstractJoinNode {
     return lookupSourceNode_;
   }
 
+  /// Returns true if the lookup source requires splits for index lookup.
+  /// This delegates to the table handle's needsIndexSplit() method.
+  bool needsIndexSplit() const;
+
   /// Returns the join conditions for index lookup that can't be converted into
   /// simple equality join conditions.
   const std::vector<IndexLookupConditionPtr>& joinConditions() const {
     return joinConditions_;
+  }
+
+  /// Probe-side columns the operator forwards into the connector's lookup
+  /// input vector beyond what leftKeys and joinConditions reference. Connectors
+  /// that need per-row probe values (e.g. cumulative-weight caps) declare
+  /// them here. Empty by default.
+  const std::vector<FieldAccessTypedExprPtr>& forwardedProbeColumns() const {
+    return forwardedProbeColumns_;
   }
 
   std::string_view name() const override {
@@ -3564,6 +3886,10 @@ class IndexLookupJoinNode : public AbstractJoinNode {
   /// Returns whether this node includes a marker column for left joins.
   bool hasMarker() const {
     return hasMarker_;
+  }
+
+  const std::optional<bool>& splitOutput() const {
+    return splitOutput_;
   }
 
   void accept(const PlanNodeVisitor& visitor, PlanNodeVisitorContext& context)
@@ -3589,6 +3915,16 @@ class IndexLookupJoinNode : public AbstractJoinNode {
 
   /// Whether to include a marker column for left joins to indicate matches.
   const bool hasMarker_;
+
+  /// Optional flag to control whether to split output batches. When set,
+  /// overrides the index_lookup_join_split_output QueryConfig.
+  const std::optional<bool> splitOutput_;
+
+  /// Probe-side columns to forward to the connector's lookup input even if
+  /// they are not referenced by leftKeys or joinConditions. Validated in the
+  /// constructor to be present in the probe input type and to not overlap
+  /// with leftKeys or joinCondition-referenced columns.
+  const std::vector<FieldAccessTypedExprPtr> forwardedProbeColumns_;
 };
 
 using IndexLookupJoinNodePtr = std::shared_ptr<const IndexLookupJoinNode>;
@@ -3856,6 +4192,10 @@ class OrderByNode : public PlanNode {
   void accept(const PlanNodeVisitor& visitor, PlanNodeVisitorContext& context)
       const override;
 
+  bool requiresSingleThread() const override {
+    return !isPartial_;
+  }
+
   // True if this node only sorts a portion of the final result. If it is
   // true, a local merge or merge exchange is required to merge the sorted
   // runs.
@@ -3902,9 +4242,28 @@ class SpatialJoinNode : public PlanNode {
       const PlanNodeId& id,
       JoinType joinType,
       TypedExprPtr joinCondition,
+      FieldAccessTypedExprPtr probeGeometry,
+      FieldAccessTypedExprPtr buildGeometry,
+      std::optional<FieldAccessTypedExprPtr> radius,
       PlanNodePtr left,
       PlanNodePtr right,
       RowTypePtr outputType);
+
+  SpatialJoinNode(
+      const PlanNodeId& id,
+      JoinType joinType,
+      TypedExprPtr joinCondition,
+      PlanNodePtr left,
+      PlanNodePtr right,
+      RowTypePtr outputType);
+
+  PlanNodePtr leftNode() const {
+    return sources()[0];
+  }
+
+  PlanNodePtr rightNode() const {
+    return sources()[1];
+  }
 
   class Builder {
    public:
@@ -3914,6 +4273,9 @@ class SpatialJoinNode : public PlanNode {
       id_ = other.id();
       joinType_ = other.joinType();
       joinCondition_ = other.joinCondition();
+      probeGeometry_ = other.probeGeometry();
+      buildGeometry_ = other.buildGeometry();
+      radius_ = other.radius();
       VELOX_CHECK_EQ(other.sources().size(), 2);
       left_ = other.sources()[0];
       right_ = other.sources()[1];
@@ -3932,6 +4294,21 @@ class SpatialJoinNode : public PlanNode {
 
     Builder& joinCondition(TypedExprPtr joinCondition) {
       joinCondition_ = std::move(joinCondition);
+      return *this;
+    }
+
+    Builder& probeGeometry(FieldAccessTypedExprPtr probeGeometry) {
+      probeGeometry_ = std::move(probeGeometry);
+      return *this;
+    }
+
+    Builder& buildGeometry(FieldAccessTypedExprPtr buildGeometry) {
+      buildGeometry_ = std::move(buildGeometry);
+      return *this;
+    }
+
+    Builder& radius(FieldAccessTypedExprPtr radius) {
+      radius_ = std::move(radius);
       return *this;
     }
 
@@ -3958,11 +4335,38 @@ class SpatialJoinNode : public PlanNode {
           right_.has_value(), "SpatialJoinNode right source is not set");
       VELOX_USER_CHECK(
           outputType_.has_value(), "SpatialJoinNode outputType is not set");
+      VELOX_USER_CHECK(
+          probeGeometry_.has_value(),
+          "SpatialJoinNode probe geometry is not set");
+      VELOX_USER_CHECK(
+          buildGeometry_.has_value(),
+          "SpatialJoinNode build geometry is not set");
+
+      VELOX_USER_CHECK(
+          (probeGeometry_.has_value() && buildGeometry_.has_value()) ||
+              (!probeGeometry_.has_value() && !buildGeometry_.has_value()),
+          "Either probe and build geometry must both be set, or neither");
+
+      if (probeGeometry_.has_value() && buildGeometry_.has_value()) {
+        return std::make_shared<SpatialJoinNode>(
+            id_.value(),
+            joinType_,
+            joinCondition_,
+            probeGeometry_.value(),
+            buildGeometry_.value(),
+            radius_,
+            left_.value(),
+            right_.value(),
+            outputType_.value());
+      }
 
       return std::make_shared<SpatialJoinNode>(
           id_.value(),
           joinType_,
           joinCondition_,
+          probeGeometry_.value(),
+          buildGeometry_.value(),
+          radius_,
           left_.value(),
           right_.value(),
           outputType_.value());
@@ -3972,6 +4376,9 @@ class SpatialJoinNode : public PlanNode {
     std::optional<PlanNodeId> id_;
     JoinType joinType_ = kDefaultJoinType;
     TypedExprPtr joinCondition_;
+    std::optional<FieldAccessTypedExprPtr> probeGeometry_;
+    std::optional<FieldAccessTypedExprPtr> buildGeometry_;
+    std::optional<FieldAccessTypedExprPtr> radius_;
     std::optional<PlanNodePtr> left_;
     std::optional<PlanNodePtr> right_;
     std::optional<RowTypePtr> outputType_;
@@ -3996,6 +4403,18 @@ class SpatialJoinNode : public PlanNode {
     return joinCondition_;
   }
 
+  const FieldAccessTypedExprPtr& probeGeometry() const {
+    return probeGeometry_;
+  }
+
+  const FieldAccessTypedExprPtr& buildGeometry() const {
+    return buildGeometry_;
+  }
+
+  const std::optional<FieldAccessTypedExprPtr>& radius() const {
+    return radius_;
+  }
+
   JoinType joinType() const {
     return joinType_;
   }
@@ -4014,6 +4433,9 @@ class SpatialJoinNode : public PlanNode {
 
   const JoinType joinType_;
   const TypedExprPtr joinCondition_;
+  const FieldAccessTypedExprPtr probeGeometry_;
+  const FieldAccessTypedExprPtr buildGeometry_;
+  const std::optional<FieldAccessTypedExprPtr> radius_;
   const std::vector<PlanNodePtr> sources_;
   const RowTypePtr outputType_;
 };
@@ -4120,6 +4542,10 @@ class TopNNode : public PlanNode {
 
   void accept(const PlanNodeVisitor& visitor, PlanNodeVisitorContext& context)
       const override;
+
+  bool requiresSingleThread() const override {
+    return !isPartial_;
+  }
 
   int32_t count() const {
     return count_;
@@ -4256,6 +4682,10 @@ class LimitNode : public PlanNode {
     return count_;
   }
 
+  bool requiresSingleThread() const override {
+    return !isPartial_;
+  }
+
   bool isPartial() const {
     return isPartial_;
   }
@@ -4299,6 +4729,12 @@ class UnnestNode : public PlanNode {
   /// output row has non-empty unnested value. If not present, marker column is
   /// not provided and the unnest operator also skips producing output rows
   /// with empty unnest value.
+  /// @param splitOutput Optional flag to control whether it should output 1
+  /// batch for each input batch, or split output batches if they are too large.
+  /// If true, output is split into batches according to Operator's
+  /// outputBatchRows logic. If false, output is not split and output batches
+  /// match input batches 1:1. If not set, defaults to the value of the
+  /// unnest_split_output config in the QueryConfig.
   UnnestNode(
       const PlanNodeId& id,
       std::vector<FieldAccessTypedExprPtr> replicateVariables,
@@ -4306,6 +4742,16 @@ class UnnestNode : public PlanNode {
       std::vector<std::string> unnestNames,
       std::optional<std::string> ordinalityName,
       std::optional<std::string> markerName,
+      const PlanNodePtr& source);
+
+  UnnestNode(
+      const PlanNodeId& id,
+      std::vector<FieldAccessTypedExprPtr> replicateVariables,
+      std::vector<FieldAccessTypedExprPtr> unnestVariables,
+      std::vector<std::string> unnestNames,
+      std::optional<std::string> ordinalityName,
+      std::optional<std::string> markerName,
+      std::optional<bool> splitOutput,
       const PlanNodePtr& source);
 
   class Builder {
@@ -4318,6 +4764,7 @@ class UnnestNode : public PlanNode {
       unnestVariables_ = other.unnestVariables();
       unnestNames_ = other.unnestNames_;
       ordinalityName_ = other.ordinalityName_;
+      splitOutput_ = other.splitOutput_;
       VELOX_CHECK_EQ(other.sources().size(), 1);
       source_ = other.sources()[0];
     }
@@ -4359,6 +4806,11 @@ class UnnestNode : public PlanNode {
       return *this;
     }
 
+    Builder& splitOutput(std::optional<bool> splitOutput) {
+      splitOutput_ = splitOutput;
+      return *this;
+    }
+
     std::shared_ptr<UnnestNode> build() const {
       VELOX_USER_CHECK(id_.has_value(), "UnnestNode id is not set");
       VELOX_USER_CHECK(
@@ -4378,6 +4830,7 @@ class UnnestNode : public PlanNode {
           unnestNames_.value(),
           ordinalityName_,
           markerName_,
+          splitOutput_,
           source_.value());
     }
 
@@ -4389,6 +4842,7 @@ class UnnestNode : public PlanNode {
     std::optional<std::string> ordinalityName_;
     std::optional<std::string> markerName_;
     std::optional<PlanNodePtr> source_;
+    std::optional<bool> splitOutput_;
   };
 
   bool supportsBarrier() const override {
@@ -4437,6 +4891,10 @@ class UnnestNode : public PlanNode {
     return markerName_.has_value();
   }
 
+  const std::optional<bool>& splitOutput() const {
+    return splitOutput_;
+  }
+
   std::string_view name() const override {
     return "Unnest";
   }
@@ -4453,6 +4911,7 @@ class UnnestNode : public PlanNode {
   const std::vector<std::string> unnestNames_;
   const std::optional<std::string> ordinalityName_;
   const std::optional<std::string> markerName_;
+  const std::optional<bool> splitOutput_;
   const std::vector<PlanNodePtr> sources_;
   RowTypePtr outputType_;
 };
@@ -4511,6 +4970,14 @@ class EnforceSingleRowNode : public PlanNode {
     return sources_;
   }
 
+  /// Validates that input produces exactly one row, so the pipeline must
+  /// observe all rows sequentially on a single driver. Multiple drivers
+  /// would each independently produce a row (or NULL on empty input),
+  /// breaking the single-row contract.
+  bool requiresSingleThread() const override {
+    return true;
+  }
+
   void accept(const PlanNodeVisitor& visitor, PlanNodeVisitorContext& context)
       const override;
 
@@ -4534,19 +5001,33 @@ using EnforceSingleRowNodePtr = std::shared_ptr<const EnforceSingleRowNode>;
 /// with unique int64_t value per input row.
 ///
 /// 64-bit unique id is built in following way:
-///  - first 24 bits - task unique id
-///  - next 40 bits - operator counter value
+///  - high 24 bits - task unique id
+///  - low 40 bits - operator counter value
 ///
-/// The task unique id is added to ensure the generated id is unique
-/// across all the nodes executing the same query stage in a distributed
-/// query execution.
+/// The task unique id ensures the generated id is unique across all the tasks
+/// executing the same query stage in a distributed query. It is supplied by the
+/// executing Task via PlanFragment::taskUniqueId.
 class AssignUniqueIdNode : public PlanNode {
  public:
   AssignUniqueIdNode(
       const PlanNodeId& id,
       const std::string& idName,
-      const int32_t taskUniqueId,
       PlanNodePtr source);
+
+#ifdef VELOX_ENABLE_BACKWARD_COMPATIBILITY
+  // Legacy constructor for read-only synced consumers that still pass
+  // taskUniqueId on the node. The value is not serialized; it is consumed at
+  // execution as the fallback for an unset PlanFragment::taskUniqueId.
+  AssignUniqueIdNode(
+      const PlanNodeId& id,
+      const std::string& idName,
+      int32_t taskUniqueId,
+      PlanNodePtr source)
+      : PlanNode(id),
+        taskUniqueId_(taskUniqueId),
+        sources_{std::move(source)},
+        outputType_(makeOutputType(sources_[0], idName)) {}
+#endif
 
   bool supportsBarrier() const override {
     return true;
@@ -4559,7 +5040,6 @@ class AssignUniqueIdNode : public PlanNode {
     explicit Builder(const AssignUniqueIdNode& other) {
       id_ = other.id();
       idName_ = other.outputType()->names().back();
-      taskUniqueId_ = other.taskUniqueId();
       VELOX_CHECK_EQ(other.sources().size(), 1);
       source_ = other.sources()[0];
     }
@@ -4574,11 +5054,6 @@ class AssignUniqueIdNode : public PlanNode {
       return *this;
     }
 
-    Builder& taskUniqueId(int32_t taskUniqueId) {
-      taskUniqueId_ = taskUniqueId;
-      return *this;
-    }
-
     Builder& source(PlanNodePtr source) {
       source_ = std::move(source);
       return *this;
@@ -4589,18 +5064,15 @@ class AssignUniqueIdNode : public PlanNode {
       VELOX_USER_CHECK(
           idName_.has_value(), "AssignUniqueIdNode idName not set");
       VELOX_USER_CHECK(
-          taskUniqueId_.has_value(), "AssignUniqueIdNode taskUniqueId not set");
-      VELOX_USER_CHECK(
           source_.has_value(), "AssignUniqueIdNode source is not set");
 
       return std::make_shared<AssignUniqueIdNode>(
-          id_.value(), idName_.value(), taskUniqueId_.value(), source_.value());
+          id_.value(), idName_.value(), source_.value());
     }
 
    private:
     std::optional<PlanNodeId> id_;
     std::optional<std::string> idName_;
-    std::optional<int32_t> taskUniqueId_;
     std::optional<PlanNodePtr> source_;
   };
 
@@ -4623,21 +5095,22 @@ class AssignUniqueIdNode : public PlanNode {
     return taskUniqueId_;
   }
 
-  const std::shared_ptr<std::atomic_int64_t>& uniqueIdCounter() const {
-    return uniqueIdCounter_;
-  }
-
   folly::dynamic serialize() const override;
 
   static PlanNodePtr create(const folly::dynamic& obj, void* context);
 
  private:
+  // Builds the output row type: the source columns followed by the BIGINT id
+  // column named 'idName'.
+  static RowTypePtr makeOutputType(
+      const PlanNodePtr& source,
+      const std::string& idName);
+
   void addDetails(std::stringstream& stream) const override;
 
   const int32_t taskUniqueId_;
   const std::vector<PlanNodePtr> sources_;
   RowTypePtr outputType_;
-  std::shared_ptr<std::atomic_int64_t> uniqueIdCounter_;
 };
 
 using AssignUniqueIdNodePtr = std::shared_ptr<const AssignUniqueIdNode>;
@@ -5023,17 +5496,39 @@ class RowNumberNode : public PlanNode {
 
 using RowNumberNodePtr = std::shared_ptr<const RowNumberNode>;
 
-/// The MarkDistinct operator marks unique rows based on distinctKeys.
-/// The result is put in a new markerName column alongside the original input.
-/// @param markerName Name of the output mask channel.
-/// @param distinctKeys Names of grouping keys.
-/// column.
+/// Marks unique rows based on a set of distinct keys. Always produces
+/// masks.size() + 1 boolean marker columns:
+///
+/// markers[0]: no-mask marker — true for the first occurrence of each distinct
+/// key combination, regardless of any mask.
+///
+/// markers[i+1]: per-mask marker — true for the first occurrence of each
+/// distinct key combination where masks[i] is true.
+///
+/// When masks is empty (single-marker mode), only the no-mask marker is
+/// produced.
 class MarkDistinctNode : public PlanNode {
  public:
+  /// Constructs a single-marker MarkDistinct node.
+  /// @param markerName Name of the output boolean marker column.
+  /// @param distinctKeys Columns to check for distinct values.
   MarkDistinctNode(
       PlanNodeId id,
       std::string markerName,
       std::vector<FieldAccessTypedExprPtr> distinctKeys,
+      PlanNodePtr source);
+
+  /// Constructs a MarkDistinct node that produces one no-mask marker followed
+  /// by one marker per mask column.
+  /// @param markerNames Names of output boolean marker columns. Must have
+  ///   exactly masks.size() + 1 entries.
+  /// @param distinctKeys Columns to check for distinct values.
+  /// @param masks Boolean input columns used as masks. Can be empty.
+  MarkDistinctNode(
+      PlanNodeId id,
+      std::vector<std::string> markerNames,
+      std::vector<FieldAccessTypedExprPtr> distinctKeys,
+      std::vector<FieldAccessTypedExprPtr> masks,
       PlanNodePtr source);
 
   class Builder {
@@ -5042,7 +5537,8 @@ class MarkDistinctNode : public PlanNode {
 
     explicit Builder(const MarkDistinctNode& other) {
       id_ = other.id();
-      markerName_ = other.markerName();
+      markerNames_ = other.markerNames();
+      masks_ = other.masks();
       distinctKeys_ = other.distinctKeys();
       VELOX_CHECK_EQ(other.sources().size(), 1);
       source_ = other.sources()[0];
@@ -5053,8 +5549,13 @@ class MarkDistinctNode : public PlanNode {
       return *this;
     }
 
-    Builder& markerName(std::string markerName) {
-      markerName_ = std::move(markerName);
+    Builder& markerNames(std::vector<std::string> markerNames) {
+      markerNames_ = std::move(markerNames);
+      return *this;
+    }
+
+    Builder& masks(std::vector<FieldAccessTypedExprPtr> masks) {
+      masks_ = std::move(masks);
       return *this;
     }
 
@@ -5071,7 +5572,7 @@ class MarkDistinctNode : public PlanNode {
     std::shared_ptr<MarkDistinctNode> build() const {
       VELOX_USER_CHECK(id_.has_value(), "MarkDistinctNode id is not set");
       VELOX_USER_CHECK(
-          markerName_.has_value(), "MarkDistinctNode markerName is not set");
+          markerNames_.has_value(), "MarkDistinctNode markerNames is not set");
       VELOX_USER_CHECK(
           distinctKeys_.has_value(),
           "MarkDistinctNode distinctKeys is not set");
@@ -5080,14 +5581,16 @@ class MarkDistinctNode : public PlanNode {
 
       return std::make_shared<MarkDistinctNode>(
           id_.value(),
-          markerName_.value(),
+          markerNames_.value(),
           distinctKeys_.value(),
+          masks_.value_or(std::vector<FieldAccessTypedExprPtr>{}),
           source_.value());
     }
 
    private:
     std::optional<PlanNodeId> id_;
-    std::optional<std::string> markerName_;
+    std::optional<std::vector<std::string>> markerNames_;
+    std::optional<std::vector<FieldAccessTypedExprPtr>> masks_;
     std::optional<std::vector<FieldAccessTypedExprPtr>> distinctKeys_;
     std::optional<PlanNodePtr> source_;
   };
@@ -5109,8 +5612,26 @@ class MarkDistinctNode : public PlanNode {
     return "MarkDistinct";
   }
 
-  const std::string& markerName() const {
-    return markerName_;
+  bool canSpill(const QueryConfig& queryConfig) const override {
+    return queryConfig.markDistinctSpillEnabled();
+  }
+
+  /// Returns the no-mask marker name (markerNames[0]). Retained for callers
+  /// not yet migrated to markerNames(); to be removed in a follow-up.
+  [[deprecated("Use markerNames()[0]")]] const std::string& markerName() const {
+    return markerNames_[0];
+  }
+
+  /// Returns all marker names: [0] is the no-mask marker, [1..N] correspond
+  /// to masks[0..N-1]. The constructor invariant markerNames_.size() ==
+  /// masks_.size() + 1 guarantees this is always non-empty.
+  const std::vector<std::string>& markerNames() const {
+    return markerNames_;
+  }
+
+  /// Returns mask column references. Empty for single-marker mode.
+  const std::vector<FieldAccessTypedExprPtr>& masks() const {
+    return masks_;
   }
 
   const std::vector<FieldAccessTypedExprPtr>& distinctKeys() const {
@@ -5124,7 +5645,12 @@ class MarkDistinctNode : public PlanNode {
  private:
   void addDetails(std::stringstream& stream) const override;
 
-  const std::string markerName_;
+  // markerNames_[0] is the no-mask marker; markerNames_[i+1] corresponds to
+  // masks_[i]. Always has masks_.size() + 1 entries.
+  const std::vector<std::string> markerNames_;
+
+  // Mask channel references. Empty in single-marker mode.
+  const std::vector<FieldAccessTypedExprPtr> masks_;
 
   const std::vector<FieldAccessTypedExprPtr> distinctKeys_;
 
@@ -5134,6 +5660,208 @@ class MarkDistinctNode : public PlanNode {
 };
 
 using MarkDistinctNodePtr = std::shared_ptr<const MarkDistinctNode>;
+
+/// Checks that input rows have unique values in the specified key columns.
+/// Passes through all input rows unchanged. Raises an exception if duplicate
+/// key values are detected.
+///
+/// Used to validate uniqueness constraints, such as ensuring a scalar subquery
+/// returns at most one row per group.
+///
+class EnforceDistinctNode : public PlanNode {
+ public:
+  /// @param distinctKeys Columns that must have unique values.
+  /// @param preGroupedKeys Subset of distinctKeys that input is already
+  /// clustered on. When preGroupedKeys equals distinctKeys, a streaming
+  /// implementation is used that compares consecutive rows instead of using a
+  /// hash table.
+  /// @param errorMessage Custom error message to show when duplicates are
+  /// found.
+  EnforceDistinctNode(
+      PlanNodeId id,
+      std::vector<FieldAccessTypedExprPtr> distinctKeys,
+      std::vector<FieldAccessTypedExprPtr> preGroupedKeys,
+      std::string errorMessage,
+      PlanNodePtr source);
+
+  const std::vector<PlanNodePtr>& sources() const override {
+    return sources_;
+  }
+
+  void accept(const PlanNodeVisitor& visitor, PlanNodeVisitorContext& context)
+      const override;
+
+  const RowTypePtr& outputType() const override {
+    return sources_[0]->outputType();
+  }
+
+  std::string_view name() const override {
+    return "EnforceDistinct";
+  }
+
+  const std::vector<FieldAccessTypedExprPtr>& distinctKeys() const {
+    return distinctKeys_;
+  }
+
+  const std::vector<FieldAccessTypedExprPtr>& preGroupedKeys() const {
+    return preGroupedKeys_;
+  }
+
+  /// Returns true if all distinct keys are pre-grouped, meaning input is
+  /// clustered on distinct keys and streaming enforcement can be used.
+  bool isPreGrouped() const {
+    return preGroupedKeys_.size() == distinctKeys_.size();
+  }
+
+  const std::string& errorMessage() const {
+    return errorMessage_;
+  }
+
+  folly::dynamic serialize() const override;
+
+  static PlanNodePtr create(const folly::dynamic& obj, void* context);
+
+ private:
+  void addDetails(std::stringstream& stream) const override;
+
+  const std::vector<FieldAccessTypedExprPtr> distinctKeys_;
+  const std::vector<FieldAccessTypedExprPtr> preGroupedKeys_;
+  const std::string errorMessage_;
+  const std::vector<PlanNodePtr> sources_;
+};
+
+using EnforceDistinctNodePtr = std::shared_ptr<const EnforceDistinctNode>;
+
+/// The MarkSorted operator marks rows where the sort key changes.
+/// The result is put in a new markerName column alongside the original input.
+/// The first row is always marked true. Subsequent rows are marked true if
+/// they compare as sorted relative to the previous row based on sortingKeys
+/// and sortingOrders.
+/// @param markerName Name of the output marker channel.
+/// @param sortingKeys Keys to check for sorted order.
+/// @param sortingOrders Sort orders (ascending/descending, nulls first/last).
+class MarkSortedNode : public PlanNode {
+ public:
+  MarkSortedNode(
+      PlanNodeId id,
+      std::string markerName,
+      std::vector<FieldAccessTypedExprPtr> sortingKeys,
+      std::vector<SortOrder> sortingOrders,
+      PlanNodePtr source);
+
+  class Builder {
+   public:
+    Builder() = default;
+
+    explicit Builder(const MarkSortedNode& other) {
+      id_ = other.id();
+      markerName_ = other.markerName();
+      sortingKeys_ = other.sortingKeys();
+      sortingOrders_ = other.sortingOrders();
+      VELOX_CHECK_EQ(other.sources().size(), 1);
+      source_ = other.sources()[0];
+    }
+
+    Builder& id(PlanNodeId id) {
+      id_ = std::move(id);
+      return *this;
+    }
+
+    Builder& markerName(std::string markerName) {
+      markerName_ = std::move(markerName);
+      return *this;
+    }
+
+    Builder& sortingKeys(std::vector<FieldAccessTypedExprPtr> sortingKeys) {
+      sortingKeys_ = std::move(sortingKeys);
+      return *this;
+    }
+
+    Builder& sortingOrders(std::vector<SortOrder> sortingOrders) {
+      sortingOrders_ = std::move(sortingOrders);
+      return *this;
+    }
+
+    Builder& source(PlanNodePtr source) {
+      source_ = std::move(source);
+      return *this;
+    }
+
+    std::shared_ptr<MarkSortedNode> build() const {
+      VELOX_USER_CHECK(id_.has_value(), "MarkSortedNode id is not set");
+      VELOX_USER_CHECK(
+          markerName_.has_value(), "MarkSortedNode markerName is not set");
+      VELOX_USER_CHECK(
+          sortingKeys_.has_value(), "MarkSortedNode sortingKeys is not set");
+      VELOX_USER_CHECK(
+          sortingOrders_.has_value(),
+          "MarkSortedNode sortingOrders is not set");
+      VELOX_USER_CHECK(source_.has_value(), "MarkSortedNode source is not set");
+
+      return std::make_shared<MarkSortedNode>(
+          id_.value(),
+          markerName_.value(),
+          sortingKeys_.value(),
+          sortingOrders_.value(),
+          source_.value());
+    }
+
+   private:
+    std::optional<PlanNodeId> id_;
+    std::optional<std::string> markerName_;
+    std::optional<std::vector<FieldAccessTypedExprPtr>> sortingKeys_;
+    std::optional<std::vector<SortOrder>> sortingOrders_;
+    std::optional<PlanNodePtr> source_;
+  };
+
+  const std::vector<PlanNodePtr>& sources() const override {
+    return sources_;
+  }
+
+  void accept(const PlanNodeVisitor& visitor, PlanNodeVisitorContext& context)
+      const override;
+
+  /// The outputType is the concatenation of the input columns and marker
+  /// column.
+  const RowTypePtr& outputType() const override {
+    return outputType_;
+  }
+
+  std::string_view name() const override {
+    return "MarkSorted";
+  }
+
+  const std::string& markerName() const {
+    return markerName_;
+  }
+
+  const std::vector<FieldAccessTypedExprPtr>& sortingKeys() const {
+    return sortingKeys_;
+  }
+
+  const std::vector<SortOrder>& sortingOrders() const {
+    return sortingOrders_;
+  }
+
+  folly::dynamic serialize() const override;
+
+  static PlanNodePtr create(const folly::dynamic& obj, void* context);
+
+ private:
+  void addDetails(std::stringstream& stream) const override;
+
+  const std::string markerName_;
+
+  const std::vector<FieldAccessTypedExprPtr> sortingKeys_;
+
+  const std::vector<SortOrder> sortingOrders_;
+
+  const std::vector<PlanNodePtr> sources_;
+
+  const RowTypePtr outputType_;
+};
+
+using MarkSortedNodePtr = std::shared_ptr<const MarkSortedNode>;
 
 /// Optimized version of a WindowNode for a single row_number, rank or
 /// dense_rank function with a limit over sorted partitions. The output of this
@@ -5343,6 +6071,149 @@ class TopNRowNumberNode : public PlanNode {
 
 using TopNRowNumberNodePtr = std::shared_ptr<const TopNRowNumberNode>;
 
+/// Union operator that combines data from multiple inputs.
+/// Supports both serial mode (process inputs one at a time) and
+/// mixed mode (process inputs simultaneously and combine results).
+class MixedUnionNode : public PlanNode {
+ public:
+  MixedUnionNode(const PlanNodeId& id, std::vector<PlanNodePtr> sources)
+      : MixedUnionNode(id, std::move(sources), {}) {}
+
+  MixedUnionNode(
+      const PlanNodeId& id,
+      std::vector<PlanNodePtr> sources,
+      std::vector<int64_t> batchSizesPerSource)
+      : PlanNode(id),
+        sources_(std::move(sources)),
+        batchSizesPerSource_(std::move(batchSizesPerSource)) {
+    VELOX_USER_CHECK(
+        !sources_.empty(), "Union node must have at least one source");
+
+    // All sources must have the same output type
+    outputType_ = sources_[0]->outputType();
+    for (size_t i = 1; i < sources_.size(); ++i) {
+      VELOX_USER_CHECK(
+          outputType_->equivalent(*sources_[i]->outputType()),
+          "All Union sources must have the same output type. "
+          "Source 0 type: {}, Source {} type: {}",
+          outputType_->toString(),
+          i,
+          sources_[i]->outputType()->toString());
+    }
+  }
+
+  class Builder {
+   public:
+    Builder() = default;
+
+    explicit Builder(const MixedUnionNode& other) {
+      id_ = other.id();
+      sources_ = other.sources();
+      batchSizesPerSource_ = other.batchSizesPerSource();
+    }
+
+    Builder& id(PlanNodeId id) {
+      id_ = std::move(id);
+      return *this;
+    }
+
+    Builder& sources(std::vector<PlanNodePtr> sources) {
+      sources_ = std::move(sources);
+      return *this;
+    }
+
+    Builder& source(PlanNodePtr source) {
+      if (!sources_.has_value()) {
+        sources_ = std::vector<PlanNodePtr>{};
+      }
+      sources_->push_back(std::move(source));
+      return *this;
+    }
+
+    Builder& batchSizesPerSource(std::vector<int64_t> batchSizes) {
+      batchSizesPerSource_ = std::move(batchSizes);
+      return *this;
+    }
+
+    Builder& batchSizeForSource(int32_t sourceIndex, int64_t batchSize) {
+      if (!batchSizesPerSource_.has_value()) {
+        batchSizesPerSource_ = std::vector<int64_t>{};
+      }
+      if (sourceIndex >= batchSizesPerSource_->size()) {
+        batchSizesPerSource_->resize(sourceIndex + 1, 0);
+      }
+      (*batchSizesPerSource_)[sourceIndex] = batchSize;
+      return *this;
+    }
+
+    std::shared_ptr<MixedUnionNode> build() const {
+      VELOX_USER_CHECK(id_.has_value(), "MixedUnionNode id is not set");
+      VELOX_USER_CHECK(
+          sources_.has_value() && !sources_->empty(),
+          "MixedUnionNode sources is not set or empty");
+
+      return std::make_shared<MixedUnionNode>(
+          id_.value(),
+          sources_.value(),
+          batchSizesPerSource_.value_or(std::vector<int64_t>{}));
+    }
+
+   private:
+    std::optional<PlanNodeId> id_;
+    std::optional<std::vector<PlanNodePtr>> sources_;
+    std::optional<std::vector<int64_t>> batchSizesPerSource_;
+  };
+
+  const std::vector<PlanNodePtr>& sources() const override {
+    return sources_;
+  }
+
+  const RowTypePtr& outputType() const override {
+    return outputType_;
+  }
+
+  /// Returns the batch sizes per source index.
+  /// This controls how many rows are taken from each source when mixing.
+  const std::vector<int64_t>& batchSizesPerSource() const {
+    return batchSizesPerSource_;
+  }
+
+  /// Get batch size for a specific source index (returns 0 if not set).
+  int64_t getBatchSizeForSource(int32_t sourceIndex) const {
+    if (sourceIndex < 0 || sourceIndex >= batchSizesPerSource_.size()) {
+      return 0;
+    }
+    return batchSizesPerSource_[sourceIndex];
+  }
+
+  bool requiresSingleThread() const override {
+    return true;
+  }
+
+  void accept(const PlanNodeVisitor& visitor, PlanNodeVisitorContext& context)
+      const override;
+
+  std::string_view name() const override {
+    return "MixedUnion";
+  }
+
+  folly::dynamic serialize() const override;
+
+  static PlanNodePtr create(const folly::dynamic& obj, void* context);
+
+  bool supportsBarrier() const override {
+    return true;
+  }
+
+ private:
+  void addDetails(std::stringstream& /* stream */) const override {}
+  const std::vector<PlanNodePtr> sources_;
+  RowTypePtr outputType_;
+  std::vector<int64_t> batchSizesPerSource_;
+};
+
+using MixedUnionNodePtr = std::shared_ptr<const MixedUnionNode>;
+
 class PlanNodeVisitorContext {
  public:
   virtual ~PlanNodeVisitorContext() = default;
@@ -5396,6 +6267,13 @@ class PlanNodeVisitor {
       PlanNodeVisitorContext& ctx) const = 0;
 
   virtual void visit(const MarkDistinctNode& node, PlanNodeVisitorContext& ctx)
+      const = 0;
+
+  virtual void visit(
+      const EnforceDistinctNode& node,
+      PlanNodeVisitorContext& ctx) const = 0;
+
+  virtual void visit(const MarkSortedNode& node, PlanNodeVisitorContext& ctx)
       const = 0;
 
   virtual void visit(const MergeExchangeNode& node, PlanNodeVisitorContext& ctx)
@@ -5456,6 +6334,9 @@ class PlanNodeVisitor {
   virtual void visit(const WindowNode& node, PlanNodeVisitorContext& ctx)
       const = 0;
 
+  virtual void visit(const MixedUnionNode& node, PlanNodeVisitorContext& ctx)
+      const = 0;
+
   /// Used to visit custom PlanNodes that extend the set provided by Velox.
   virtual void visit(const PlanNode& node, PlanNodeVisitorContext& ctx)
       const = 0;
@@ -5467,6 +6348,126 @@ class PlanNodeVisitor {
     }
   }
 };
+
+/// Plan node for async RPC execution (e.g., LLM inference, embeddings).
+///
+/// Stores the function name, result type, argument columns, and streaming
+/// mode. The RPCNode does NOT evaluate argument expressions — a ProjectNode
+/// inserted before this node by the plan rewriter computes argument columns.
+///
+/// Architecture:
+///   SQL: SELECT rpc_function(col1, 'model_name') FROM table
+///            |
+///            v (Plan Rewriter)
+///     ProjectNode (__rpc_arg_0 = col1, __rpc_arg_1 = 'model_name')
+///           |
+///        RPCNode (argumentColumns = [__rpc_arg_0, __rpc_arg_1])
+///           |
+///       source[0]
+///           |
+///       TableScan
+class RPCNode : public PlanNode {
+ public:
+  /// @param id Unique identifier for this plan node.
+  /// @param source Data source (the only source).
+  /// @param functionName Name of the registered AsyncRPCFunction.
+  /// @param functionResultType Velox type of the RPC result column.
+  /// @param outputColumn Name of the output column for RPC responses.
+  /// @param outputType Explicit output type. Must contain outputColumn
+  ///        and any passthrough source columns needed by downstream.
+  ///        Specified explicitly (like AbstractJoinNode) to support column
+  ///        pruning.
+  /// @param argumentColumns Names of input columns containing pre-evaluated
+  ///        argument values. RPCOperator reads these columns in addInput().
+  /// @param argumentTypes Types of each argument (aligned with
+  ///        argumentColumns). Passed to AsyncRPCFunction::initialize().
+  /// @param constantInputs Constant argument values (aligned with
+  ///        argumentColumns). nullptr for non-constant args, single-element
+  ///        ConstantVectors for constant args. Passed to initialize().
+  /// @param streamingMode The streaming mode for RPC execution.
+  /// @param dispatchBatchSize For BATCH mode pipelining: fire callBatch()
+  ///        every N rows during addInput() instead of collecting all rows.
+  RPCNode(
+      const PlanNodeId& id,
+      PlanNodePtr source,
+      std::string functionName,
+      TypePtr functionResultType,
+      std::string outputColumn,
+      RowTypePtr outputType,
+      std::vector<std::string> argumentColumns,
+      std::vector<TypePtr> argumentTypes,
+      std::vector<VectorPtr> constantInputs,
+      rpc::RPCStreamingMode streamingMode = rpc::RPCStreamingMode::kPerRow,
+      int32_t dispatchBatchSize = 0);
+
+  const PlanNodePtr& source() const {
+    return sources_[0];
+  }
+
+  const std::string& functionName() const {
+    return functionName_;
+  }
+
+  const TypePtr& rpcResultType() const {
+    return resultType_;
+  }
+
+  const std::string& outputColumn() const {
+    return outputColumn_;
+  }
+
+  const std::vector<std::string>& argumentColumns() const {
+    return argumentColumns_;
+  }
+
+  const std::vector<TypePtr>& argumentTypes() const {
+    return argumentTypes_;
+  }
+
+  const std::vector<VectorPtr>& constantInputs() const {
+    return constantInputs_;
+  }
+
+  rpc::RPCStreamingMode streamingMode() const {
+    return streamingMode_;
+  }
+
+  int32_t dispatchBatchSize() const {
+    return dispatchBatchSize_;
+  }
+
+  std::string_view name() const override {
+    return "RPC";
+  }
+
+  const RowTypePtr& outputType() const override {
+    return outputType_;
+  }
+
+  const std::vector<PlanNodePtr>& sources() const override {
+    return sources_;
+  }
+
+  folly::dynamic serialize() const override;
+
+  static PlanNodePtr create(const folly::dynamic& obj, void* context);
+
+ private:
+  void addDetails(std::stringstream& stream) const override;
+
+  std::vector<PlanNodePtr> sources_;
+  std::string functionName_;
+  TypePtr resultType_;
+  std::string outputColumn_;
+  RowTypePtr outputType_;
+  std::vector<std::string> argumentColumns_;
+  std::vector<TypePtr> argumentTypes_;
+  std::vector<VectorPtr> constantInputs_;
+  rpc::RPCStreamingMode streamingMode_;
+  int32_t dispatchBatchSize_{0};
+};
+
+using RPCNodePtr = std::shared_ptr<RPCNode>;
 
 } // namespace facebook::velox::core
 

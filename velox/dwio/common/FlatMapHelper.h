@@ -24,7 +24,11 @@ namespace facebook::velox::dwio::common::flatmap {
 namespace detail {
 
 // Reset vector with the desired size/hasNulls properties
-void reset(VectorPtr& vector, vector_size_t size, bool hasNulls);
+void reset(
+    VectorPtr& vector,
+    VectorEncoding::Simple desiredEncoding,
+    vector_size_t size,
+    bool hasNulls);
 
 // Reset vector smart pointer if any of the buffers is not single referenced.
 template <typename... T>
@@ -63,7 +67,7 @@ void initializeFlatVector(
     vector_size_t size,
     bool hasNulls,
     std::vector<BufferPtr>&& stringBuffers = {}) {
-  detail::reset(vector, size, hasNulls);
+  detail::reset(vector, VectorEncoding::Simple::FLAT, size, hasNulls);
   if (vector) {
     auto& flatVector = dynamic_cast<FlatVector<T>&>(*vector);
     detail::resetIfNotWritable(vector, flatVector.nulls(), flatVector.values());
@@ -140,6 +144,33 @@ class KeyValue {
   }
 };
 
+// Specialization for StringView that owns the string data. The generic
+// KeyValue<StringView> would store a non-owning StringView, which leads to
+// use-after-free when the source string is destroyed (e.g., when a
+// folly::dynamic from JSON parsing goes out of scope).
+template <>
+class KeyValue<StringView> {
+ private:
+  std::string owned_;
+  size_t h_;
+
+ public:
+  explicit KeyValue(StringView value)
+      : owned_(value), h_{std::hash<StringView>()(value)} {}
+
+  StringView get() const {
+    return StringView(owned_);
+  }
+
+  std::size_t hash() const {
+    return h_;
+  }
+
+  bool operator==(const KeyValue<StringView>& other) const {
+    return owned_ == other.owned_;
+  }
+};
+
 template <typename T>
 struct KeyValueHash {
   std::size_t operator()(const KeyValue<T>& kv) const {
@@ -168,7 +199,7 @@ struct KeyProjection {
 template <typename T>
 KeyProjection<T> convertDynamic(const folly::dynamic& v) {
   constexpr char reject_prefix = '!';
-  const auto str = v.asString();
+  const auto& str = v.asString();
   const std::string_view view(str);
   if (!view.empty() && view.front() == reject_prefix) {
     return {
@@ -232,14 +263,14 @@ KeyPredicate<T> prepareKeyPredicate(std::string_view expression) {
   // You cannot mix allow key and reject key.
   VELOX_CHECK(
       modes.empty() ||
-      std::all_of(modes.begin(), modes.end(), [&modes](const auto& v) {
+      std::all_of(modes.cbegin(), modes.cend(), [&modes](const auto& v) {
         return v == modes.front();
       }));
 
   auto mode = modes.empty() ? KeyProjectionMode::ALLOW : modes.front();
 
   return KeyPredicate<T>(
-      mode, typename KeyPredicate<T>::Lookup(keys.begin(), keys.end()));
+      mode, typename KeyPredicate<T>::Lookup(keys.cbegin(), keys.cend()));
 }
 
 } // namespace facebook::velox::dwio::common::flatmap

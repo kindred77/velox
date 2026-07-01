@@ -16,12 +16,22 @@
 
 #pragma once
 
+#include <fmt/format.h>
 #include <folly/Hash.h>
+#include <folly/Synchronized.h>
 #include <folly/container/F14Map.h>
+#include <type_traits>
+#include <utility>
+#include "velox/common/time/CpuWallTimer.h"
+#include "velox/common/time/Timer.h"
+#include "velox/dwio/common/Options.h"
+#include "velox/dwio/common/TypeWithId.h"
+#include "velox/dwio/common/UnitLoader.h"
 
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/base/RuntimeMetrics.h"
-#include "velox/dwio/common/exception/Exception.h"
+#include "velox/common/io/IoStatistics.h"
+#include "velox/type/Type.h"
 
 namespace facebook::velox::dwio::common {
 
@@ -133,6 +143,12 @@ class ColumnStatistics {
     VELOX_CHECK(
         !numDistinct_.has_value(), "numDistinct_ can be set only once.");
     numDistinct_ = count;
+  }
+
+  /// Returns true if there are no non-null values (value count is known to be
+  /// zero).
+  bool isAllNull() const {
+    return valueCount_.has_value() && valueCount_.value() == 0;
   }
 
   /**
@@ -493,10 +509,11 @@ class MapColumnStatistics : public virtual ColumnStatistics {
     values.reserve(entryStatistics_.size());
     for (const auto& entry : entryStatistics_) {
       auto& stats = *entry.second;
-      values.push_back(fmt::format(
-          "{{ Key: {}, Stats: {},}}",
-          entry.first.toString(),
-          stats.toString()));
+      values.push_back(
+          fmt::format(
+              "{{ Key: {}, Stats: {},}}",
+              entry.first.toString(),
+              stats.toString()));
     }
     std::string repr;
     folly::join(",", values, repr);
@@ -532,10 +549,199 @@ class Statistics {
   virtual uint32_t getNumberOfColumns() const = 0;
 };
 
+/// Runs 'func' and records decompression CPU time if 'counter' is non-null.
+template <typename F>
+auto withDecompressStats(io::IoCounter* counter, F&& func)
+    -> std::enable_if_t<!std::is_void_v<decltype(func())>, decltype(func())> {
+  if (counter) {
+    uint64_t cpuNanos = 0;
+    auto result = [&] {
+      NanosecondCPUTimer timer{&cpuNanos};
+      return func();
+    }();
+    counter->increment(cpuNanos);
+    return result;
+  }
+  return func();
+}
+
+template <typename F>
+auto withDecompressStats(io::IoCounter* counter, F&& func)
+    -> std::enable_if_t<std::is_void_v<decltype(func())>> {
+  if (counter) {
+    uint64_t cpuNanos = 0;
+    {
+      NanosecondCPUTimer timer{&cpuNanos};
+      func();
+    }
+    counter->increment(cpuNanos);
+    return;
+  }
+  func();
+}
+
+/// Per-column statistics counters. Wraps multiple IoCounter instances for
+/// different types of measurements (decompression, encoding, etc.).
+/// Can be used by any file format reader (DWRF, Nimble, Parquet, etc.).
+struct DecodingStats {
+  explicit DecodingStats(TypeKind type = TypeKind::INVALID) : typeKind(type) {}
+
+  TypeKind typeKind;
+  io::IoCounter decompressCPUTimeNanos;
+  io::IoCounter decodeCPUTimeNanos;
+
+  /// Merges stats from another DecodingStats instance.
+  void merge(const DecodingStats& other) {
+    decompressCPUTimeNanos.merge(other.decompressCPUTimeNanos);
+    decodeCPUTimeNanos.merge(other.decodeCPUTimeNanos);
+  }
+};
+
+/// Thread-safe collection of per-column decoding statistics keyed by nodeId.
+/// Can be used by any file format reader (DWRF, Nimble, Parquet, etc.).
+struct DecodingStatsSet {
+  /// Gets or creates a DecodingStats for a column. Sets typeKind when
+  /// creating.
+  DecodingStats* getOrCreate(
+      uint32_t nodeId,
+      TypeKind typeKind = TypeKind::INVALID) {
+    auto locked = map_.wlock();
+    auto it = locked->find(nodeId);
+    if (it == locked->end()) {
+      it = locked->emplace(nodeId, std::make_unique<DecodingStats>(typeKind))
+               .first;
+    }
+    return it->second.get();
+  }
+
+  /// Merges all column decoding statistics from another DecodingStatsSet
+  /// instance.
+  void mergeFrom(const DecodingStatsSet& other) {
+    auto srcLocked = other.map_.rlock();
+    auto dstLocked = map_.wlock();
+    for (const auto& [nodeId, srcStats] : *srcLocked) {
+      auto it = dstLocked->find(nodeId);
+      if (it == dstLocked->end()) {
+        it =
+            dstLocked->emplace(nodeId, std::make_unique<DecodingStats>()).first;
+        it->second->typeKind = srcStats->typeKind;
+      }
+      it->second->merge(*srcStats);
+    }
+  }
+
+  /// Exports per-column metrics into the runtime metrics result map.
+  void toRuntimeMetrics(
+      std::unordered_map<std::string, RuntimeMetric>& result) const {
+    auto statsLocked = map_.rlock();
+    for (const auto& [nodeId, stats] : *statsLocked) {
+      // Export decompression timing.
+      const auto& decompressCounter = stats->decompressCPUTimeNanos;
+      if (decompressCounter.count() > 0) {
+        result.emplace(
+            fmt::format(
+                "column_{}.{}.decompressCPUTimeNanos",
+                nodeId,
+                TypeKindName::toName(stats->typeKind)),
+            RuntimeMetric{
+                saturateCast(decompressCounter.sum()),
+                decompressCounter.count(),
+                saturateCast(decompressCounter.min()),
+                saturateCast(decompressCounter.max()),
+                RuntimeCounter::Unit::kNanos});
+      }
+      // Export decode timing.
+      const auto& decodeCounter = stats->decodeCPUTimeNanos;
+      if (decodeCounter.count() > 0) {
+        result.emplace(
+            fmt::format(
+                "column_{}.{}.decodeCPUTimeNanos",
+                nodeId,
+                TypeKindName::toName(stats->typeKind)),
+            RuntimeMetric{
+                saturateCast(decodeCounter.sum()),
+                decodeCounter.count(),
+                saturateCast(decodeCounter.min()),
+                saturateCast(decodeCounter.max()),
+                RuntimeCounter::Unit::kNanos});
+      }
+    }
+  }
+
+ private:
+  folly::Synchronized<
+      folly::F14FastMap<uint32_t, std::unique_ptr<DecodingStats>>>
+      map_;
+};
+
 struct ColumnReaderStatistics {
   // Number of rows returned by string dictionary reader that is flattened
   // instead of keeping dictionary encoding.
   int64_t flattenStringDictionaryValues{0};
+
+  // Total time spent in loading pages, in nanoseconds.
+  io::IoCounter pageLoadTimeNs;
+
+  // Per-column decoding statistics. Only populated when decoding stats
+  // collection is enabled.
+  std::optional<DecodingStatsSet> decodingStatsSet;
+
+  /// Initializes column stats collection for the given schema if enabled in
+  /// options. Recursively registers metrics for all columns in the type tree.
+  void initColumnStatsCollection(
+      const TypeWithId& schema,
+      const RowReaderOptions& options) {
+    if (!options.collectColumnCpuMetrics()) {
+      return;
+    }
+    decodingStatsSet.emplace();
+    registerDecodingStatsImpl(schema);
+  }
+
+  /// Merges all stats from another ColumnReaderStatistics instance.
+  void mergeFrom(const ColumnReaderStatistics& other) {
+    flattenStringDictionaryValues += other.flattenStringDictionaryValues;
+    pageLoadTimeNs.merge(other.pageLoadTimeNs);
+    if (other.decodingStatsSet) {
+      if (!decodingStatsSet) {
+        decodingStatsSet.emplace();
+      }
+      decodingStatsSet->mergeFrom(*other.decodingStatsSet);
+    }
+  }
+
+  /// Exports all metrics into the runtime metrics result map.
+  void toRuntimeMetrics(
+      std::unordered_map<std::string, RuntimeMetric>& result) const {
+    if (flattenStringDictionaryValues > 0) {
+      result.emplace(
+          "flattenStringDictionaryValues",
+          RuntimeMetric(flattenStringDictionaryValues));
+    }
+    if (pageLoadTimeNs.sum() > 0) {
+      result.emplace(
+          "pageLoadTimeNs",
+          RuntimeMetric(
+              pageLoadTimeNs.sum(),
+              pageLoadTimeNs.count(),
+              pageLoadTimeNs.min(),
+              pageLoadTimeNs.max(),
+              RuntimeCounter::Unit::kNanos));
+    }
+    if (decodingStatsSet) {
+      decodingStatsSet->toRuntimeMetrics(result);
+    }
+  }
+
+ private:
+  void registerDecodingStatsImpl(const TypeWithId& node) {
+    decodingStatsSet->getOrCreate(node.id(), node.type()->kind());
+    for (uint32_t i = 0; i < node.size(); ++i) {
+      if (const auto* child = node.childAt(i).get()) {
+        registerDecodingStatsImpl(*child);
+      }
+    }
+  }
 };
 
 struct RuntimeStatistics {
@@ -556,42 +762,67 @@ struct RuntimeStatistics {
 
   int64_t footerBufferOverread{0};
 
+  int64_t footerBufferUnderread{0};
+
+  int64_t footerCacheHit{0};
+
   int64_t numStripes{0};
 
-  ColumnReaderStatistics columnReaderStatistics;
+  // Estimated bytes reported to the memory pool for the deserialized
+  // Parquet file footer, when the parquet reader's footer-memory
+  // tracking path is engaged. Lets operators compare the estimate
+  // against actual pool usage. 0 when the reader did not engage
+  // tracking (e.g. footer below threshold or non-parquet format).
+  int64_t parquetFooterEstimatedBytes{0};
 
-  std::unordered_map<std::string, RuntimeCounter> toMap() {
-    std::unordered_map<std::string, RuntimeCounter> result;
+  UnitLoaderStats unitLoaderStats;
+  ColumnReaderStatistics columnReaderStats;
+
+  std::unordered_map<std::string, RuntimeMetric> toRuntimeMetricMap() {
+    std::unordered_map<std::string, RuntimeMetric> result;
+    for (const auto& [name, metric] : unitLoaderStats.stats()) {
+      result.emplace(name, RuntimeMetric(metric.sum, metric.unit));
+    }
     if (skippedSplits > 0) {
-      result.emplace("skippedSplits", RuntimeCounter(skippedSplits));
+      result.emplace("skippedSplits", RuntimeMetric(skippedSplits));
     }
     if (processedSplits > 0) {
-      result.emplace("processedSplits", RuntimeCounter(processedSplits));
+      result.emplace("processedSplits", RuntimeMetric(processedSplits));
     }
     if (skippedSplitBytes > 0) {
       result.emplace(
           "skippedSplitBytes",
-          RuntimeCounter(skippedSplitBytes, RuntimeCounter::Unit::kBytes));
+          RuntimeMetric(skippedSplitBytes, RuntimeCounter::Unit::kBytes));
     }
     if (skippedStrides > 0) {
-      result.emplace("skippedStrides", RuntimeCounter(skippedStrides));
+      result.emplace("skippedStrides", RuntimeMetric(skippedStrides));
     }
     if (processedStrides > 0) {
-      result.emplace("processedStrides", RuntimeCounter(processedStrides));
+      result.emplace("processedStrides", RuntimeMetric(processedStrides));
     }
     if (footerBufferOverread > 0) {
       result.emplace(
           "footerBufferOverread",
-          RuntimeCounter(footerBufferOverread, RuntimeCounter::Unit::kBytes));
+          RuntimeMetric(footerBufferOverread, RuntimeCounter::Unit::kBytes));
+    }
+    if (footerBufferUnderread > 0) {
+      result.emplace(
+          "footerBufferUnderread",
+          RuntimeMetric(footerBufferUnderread, RuntimeCounter::Unit::kBytes));
+    }
+    if (footerCacheHit > 0) {
+      result.emplace("footerCacheHit", RuntimeMetric(footerCacheHit));
     }
     if (numStripes > 0) {
-      result.emplace("numStripes", RuntimeCounter(numStripes));
+      result.emplace("numStripes", RuntimeMetric(numStripes));
     }
-    if (columnReaderStatistics.flattenStringDictionaryValues > 0) {
+    if (parquetFooterEstimatedBytes > 0) {
       result.emplace(
-          "flattenStringDictionaryValues",
-          RuntimeCounter(columnReaderStatistics.flattenStringDictionaryValues));
+          "parquetFooterEstimatedBytes",
+          RuntimeMetric(
+              parquetFooterEstimatedBytes, RuntimeCounter::Unit::kBytes));
     }
+    columnReaderStats.toRuntimeMetrics(result);
     return result;
   }
 };

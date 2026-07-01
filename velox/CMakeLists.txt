@@ -33,7 +33,9 @@ if(${VELOX_ENABLE_EXAMPLES} AND ${VELOX_ENABLE_EXPRESSION})
   add_subdirectory(examples)
 endif()
 
-add_subdirectory(benchmarks)
+if(NOT WIN32)
+  add_subdirectory(benchmarks)
+endif()
 
 if(${VELOX_ENABLE_EXPRESSION})
   add_subdirectory(expression)
@@ -76,6 +78,10 @@ if(VELOX_ENABLE_WAVE OR VELOX_ENABLE_CUDF)
     add_subdirectory(experimental/wave)
     add_subdirectory(external/jitify)
   endif()
+endif()
+
+if(VELOX_ENABLE_TORCHWAVE)
+  add_subdirectory(experimental/torchwave)
 endif()
 
 if(${VELOX_BUILD_TESTING})

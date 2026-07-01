@@ -22,12 +22,30 @@ velox_add_library(
   MakeDecimal.cpp
   SparkCastExpr.cpp
   SparkCastHooks.cpp
+  HEADERS
+  AtLeastNNonNulls.h
+  DecimalRound.h
+  FromJson.h
+  GetArrayStructFields.h
+  GetStructField.h
+  MakeDecimal.h
+  SparkCastExpr.h
+  SparkCastHooks.h
 )
 
 velox_link_libraries(
   velox_functions_spark_specialforms
   fmt::fmt
+  velox_spark_query_config
   velox_functions_lib
   velox_functions_json
   velox_expression
 )
+
+if(MSVC)
+  # Only set properties if target is not an ALIAS (e.g., in mono library mode)
+  get_target_property(_aliased velox_functions_spark_specialforms ALIASED_TARGET)
+  if(NOT _aliased)
+    set_target_properties(velox_functions_spark_specialforms PROPERTIES CXX_STANDARD 20)
+  endif()
+endif()

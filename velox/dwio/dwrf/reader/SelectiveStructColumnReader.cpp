@@ -31,6 +31,7 @@ SelectiveStructColumnReader::SelectiveStructColumnReader(
     common::ScanSpec& scanSpec,
     bool isRoot)
     : SelectiveStructColumnReaderBase(
+          columnReaderOptions,
           requestedType,
           fileType,
           params,
@@ -86,12 +87,13 @@ SelectiveStructColumnReader::SelectiveStructColumnReader(
             .sequence = encodingKey.sequence(),
             .inMapDecoder = nullptr,
             .keySelectionCallback = nullptr});
-    addChild(SelectiveDwrfReader::build(
-        columnReaderOptions,
-        childRequestedType,
-        childFileType,
-        childParams,
-        *childSpec));
+    addChild(
+        SelectiveDwrfReader::build(
+            columnReaderOptions,
+            childRequestedType,
+            childFileType,
+            childParams,
+            *childSpec));
     childSpec->setSubscript(children_.size() - 1);
   }
 }

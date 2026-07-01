@@ -17,6 +17,7 @@
 #include "velox/common/memory/MemoryArbitrator.h"
 
 #include <utility>
+#include <tuple>
 
 #include "velox/common/base/Counters.h"
 #include "velox/common/base/RuntimeMetrics.h"
@@ -99,7 +100,11 @@ class NoopArbitrator : public MemoryArbitrator {
   }
 
   void removePool(MemoryPool* pool) override {
-    VELOX_CHECK_EQ(pool->reservedBytes(), 0);
+    VELOX_CHECK_EQ(
+        pool->reservedBytes(),
+        0,
+        "Memory pool has unexpected reserved bytes on removal: {}",
+        pool->name());
   }
 
   // Noop arbitrator has no memory capacity limit so no operation needed for
@@ -187,7 +192,7 @@ uint64_t MemoryReclaimer::run(
   uint64_t execTimeUs{0};
   int64_t reclaimedBytes{0};
   {
-    MicrosecondTimer timer{&execTimeUs};
+    MicrosecondWallTimer timer{&execTimeUs};
     reclaimedBytes = func();
   }
   VELOX_CHECK_GE(reclaimedBytes, 0);
@@ -263,9 +268,10 @@ uint64_t MemoryReclaimer::reclaim(
           nonReclaimableCandidates.push_back(Candidate{std::move(child), 0});
           continue;
         }
-        candidates.push_back(Candidate{
-            std::move(child),
-            static_cast<int64_t>(reclaimableBytesOpt.value())});
+        candidates.push_back(
+            Candidate{
+                std::move(child),
+                static_cast<int64_t>(reclaimableBytesOpt.value())});
       }
     }
   }
@@ -329,6 +335,21 @@ MemoryReclaimer::Stats& MemoryReclaimer::Stats::operator+=(
   reclaimWaitTimeUs += other.reclaimWaitTimeUs;
   return *this;
 }
+
+#ifdef _MSC_VER
+bool MemoryReclaimer::Stats::operator==(const Stats& other) const {
+  return std::tie(
+             numNonReclaimableAttempts,
+             reclaimExecTimeUs,
+             reclaimedBytes,
+             reclaimWaitTimeUs) ==
+      std::tie(
+             other.numNonReclaimableAttempts,
+             other.reclaimExecTimeUs,
+             other.reclaimedBytes,
+             other.reclaimWaitTimeUs);
+}
+#endif
 
 MemoryArbitrator::Stats::Stats(
     uint64_t _numRequests,
@@ -412,6 +433,7 @@ bool MemoryArbitrator::Stats::operator==(const Stats& other) const {
              other.numNonReclaimableAttempts);
 }
 
+#ifndef _MSC_VER
 std::strong_ordering MemoryArbitrator::Stats::operator<=>(
     const Stats& other) const {
   uint32_t gtCount{0};
@@ -442,6 +464,47 @@ std::strong_ordering MemoryArbitrator::Stats::operator<=>(
       : gtCount > 0  ? std::strong_ordering::greater
                      : std::strong_ordering::equal;
 }
+#else
+bool MemoryArbitrator::Stats::operator<(const Stats& other) const {
+  uint32_t gtCount{0};
+  uint32_t ltCount{0};
+#define UPDATE_COUNTER(counter)           \
+  do {                                    \
+    if (counter < other.counter) {        \
+      ++ltCount;                          \
+    } else if (counter > other.counter) { \
+      ++gtCount;                          \
+    }                                     \
+  } while (0);
+
+  UPDATE_COUNTER(numRequests);
+  UPDATE_COUNTER(numSucceeded);
+  UPDATE_COUNTER(numAborted);
+  UPDATE_COUNTER(numFailures);
+  UPDATE_COUNTER(reclaimedFreeBytes);
+  UPDATE_COUNTER(reclaimedUsedBytes);
+  UPDATE_COUNTER(numNonReclaimableAttempts);
+#undef UPDATE_COUNTER
+  VELOX_CHECK(
+      !((gtCount > 0) && (ltCount > 0)),
+      "gtCount {} ltCount {}",
+      gtCount,
+      ltCount);
+  return ltCount > 0;
+}
+
+bool MemoryArbitrator::Stats::operator>(const Stats& other) const {
+  return other < *this;
+}
+
+bool MemoryArbitrator::Stats::operator<=(const Stats& other) const {
+  return !(other < *this);
+}
+
+bool MemoryArbitrator::Stats::operator>=(const Stats& other) const {
+  return !(*this < other);
+}
+#endif
 
 MemoryArbitrationContext::MemoryArbitrationContext(const MemoryPool* requestor)
     : type(Type::kLocal), requestorName(requestor->name()) {}
@@ -539,10 +602,14 @@ ScopedReclaimedBytesRecorder::~ScopedReclaimedBytesRecorder() {
   const int64_t reservedBytesAfterReclaim = pool_->reservedBytes();
   if (reservedBytesAfterReclaim > reservedBytesBeforeReclaim_) {
     LOG(ERROR) << "Unexpected reserved bytes growth from " << pool_->name()
+               << ", root pool: " << pool_->root()->name()
                << " after memory reclaim from "
                << succinctBytes(reservedBytesBeforeReclaim_) << " to "
-               << succinctBytes(reservedBytesAfterReclaim) << ", current usage "
-               << succinctBytes(pool_->usedBytes());
+               << succinctBytes(reservedBytesAfterReclaim)
+               << ", used: " << succinctBytes(pool_->usedBytes())
+               << ", reservation: " << succinctBytes(pool_->reservedBytes())
+               << ", root pool reservation: "
+               << succinctBytes(pool_->root()->reservedBytes());
   }
   *reclaimedBytes_ = reservedBytesBeforeReclaim_ - reservedBytesAfterReclaim;
 }

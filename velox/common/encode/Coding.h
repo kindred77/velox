@@ -27,6 +27,9 @@
 
 #include "velox/common/encode/ByteStream.h"
 #include "velox/common/encode/UInt128.h"
+#ifdef _MSC_VER
+#include "velox/type/HugeInt.h"
+#endif
 
 namespace facebook::velox {
 
@@ -109,20 +112,20 @@ class Varint {
     char buf[kMaxSize64];
     char* p = buf;
     encode(val, &p);
-    sink->append(folly::StringPiece(buf, p - buf));
+    sink->append(std::string_view(buf, p - buf));
   }
 
   static void encode128ToByteSink(UInt128 val, strings::ByteSink* sink) {
     char buf[kMaxSize128];
     char* p = buf;
     encode128(val, &p);
-    sink->append(folly::StringPiece(buf, p - buf));
+    sink->append(std::string_view(buf, p - buf));
   }
 
   // Returns true if decode can be called without causing a CHECK failure.
   // The pointers are not adjusted at all
-  static bool canDecode(folly::StringPiece src) {
-    src = src.subpiece(0, kMaxSize64);
+  static bool canDecode(std::string_view src) {
+    src = src.substr(0, kMaxSize64);
     return std::any_of(
         src.begin(), src.end(), [](char v) { return ~v & 0x80; });
   }
@@ -187,18 +190,18 @@ class Varint {
     return val;
   }
 
-  // Decode a value from a StringPiece, and advance the StringPiece.
-  static uint64_t decode(folly::StringPiece* data) {
-    const char* p = data->start();
+  // Decode a value from a string_view, and advance it.
+  static uint64_t decode(std::string_view* data) {
+    const char* p = data->data();
     uint64_t val = decode(&p, data->size());
-    data->advance(p - data->start());
+    data->remove_prefix(p - data->data());
     return val;
   }
 
-  static UInt128 decode128(folly::StringPiece* data) {
-    const char* p = data->start();
+  static UInt128 decode128(std::string_view* data) {
+    const char* p = data->data();
     UInt128 val = decode128(&p, data->size());
-    data->advance(p - data->start());
+    data->remove_prefix(p - data->data());
     return val;
   }
 
@@ -207,13 +210,13 @@ class Varint {
     uint64_t val = 0;
     int32_t shift = 0;
     int32_t max_size = kMaxSize64;
-    folly::StringPiece chunk;
+    std::string_view chunk;
     int32_t remaining = 0;
     const char* p = nullptr;
     for (;;) {
       if (remaining == 0) {
         CHECK(src->next(&chunk));
-        p = chunk.start();
+        p = chunk.data();
         remaining = chunk.size();
         DCHECK_GT(remaining, 0);
       }
@@ -238,13 +241,13 @@ class Varint {
     UInt128 val = 0;
     int32_t shift = 0;
     int32_t max_size = kMaxSize128;
-    folly::StringPiece chunk;
+    std::string_view chunk;
     int32_t remaining = 0;
     const char* p = nullptr;
     for (;;) {
       if (remaining == 0) {
         CHECK(src->next(&chunk));
-        p = chunk.start();
+        p = chunk.data();
         remaining = chunk.size();
         DCHECK_GT(remaining, 0);
       }
@@ -271,6 +274,19 @@ class Varint {
 // if x >= 0, ZigZag::encode(x) == 2*x
 // if x < 0, ZigZag::encode(x) == -2*x + 1
 class ZigZag {
+ private:
+  // Helper to get signed type - default version
+  template <typename U, typename = void>
+  struct make_signed_helper {
+    using type = typename std::make_signed<U>::type;
+  };
+  
+  // Specialization for uint128_t
+  template <typename Dummy>
+  struct make_signed_helper<velox::uint128_t, Dummy> {
+    using type = velox::int128_t;
+  };
+
  public:
   static uint64_t encode(int64_t val) {
     // Bit-twiddling magic stolen from the Google protocol buffer document;
@@ -278,13 +294,42 @@ class ZigZag {
     return (static_cast<uint64_t>(val) << 1) ^ (val >> 63);
   }
 
+#ifndef _MSC_VER
   static __uint128_t encodeInt128(__int128_t val) {
     return (static_cast<__uint128_t>(val) << 1) ^ (val >> 127);
   }
+#else
+  static uint128_t encodeInt128(int128_t val) {
+    // ZigZag encode: (val << 1) ^ (val >> 127)
+    uint128_t uval(val);
+    uint128_t shifted = uval << 1;
+    // Arithmetic right shift by 127: all 1s if negative, all 0s if positive
+    uint128_t sign_mask = val < 0 ? uint128_t(~0ULL, ~0ULL) : uint128_t(0);
+    return shifted ^ sign_mask;
+  }
+#endif
 
-  template <typename U, typename T = typename std::make_signed<U>::type>
-  static T decode(U val) {
+  // Decode for standard types (not uint128_t)
+  template <typename U, typename T = typename make_signed_helper<U>::type>
+  static typename std::enable_if<!std::is_same<U, velox::uint128_t>::value, T>::type
+  decode(U val) {
     return static_cast<T>((val >> 1) ^ -(val & 1));
+  }
+  
+  // Decode for uint128_t (can't use unary minus)
+  template <typename U, typename T = typename make_signed_helper<U>::type>
+  static typename std::enable_if<std::is_same<U, velox::uint128_t>::value, T>::type
+  decode(U val) {
+#ifdef _MSC_VER
+    velox::uint128_t one(1);
+    velox::uint128_t bitVal = val & one;
+    velox::uint128_t decodeMask = (bitVal != velox::uint128_t(0)) ? velox::uint128_t(~0ULL, ~0ULL) : velox::uint128_t(0);
+    return static_cast<T>((val >> 1) ^ decodeMask);
+#else
+    velox::uint128_t one = 1;
+    velox::uint128_t mask = (val & one) ? static_cast<velox::uint128_t>(-1) : static_cast<velox::uint128_t>(0);
+    return static_cast<T>((val >> 1) ^ mask);
+#endif
   }
 };
 
@@ -292,7 +337,7 @@ namespace detail {
 class ByteSinkAppender {
  public:
   /* implicit */ ByteSinkAppender(strings::ByteSink* out) : out_(out) {}
-  void operator()(folly::StringPiece sp) {
+  void operator()(std::string_view sp) {
     out_->append(sp.data(), sp.size());
   }
 
@@ -303,6 +348,7 @@ class ByteSinkAppender {
 
 // Import GroupVarint encoding / decoding code from folly
 
+#if FOLLY_HAVE_GROUP_VARINT
 typedef folly::GroupVarint32 GroupVarint32;
 typedef folly::GroupVarint64 GroupVarint64;
 
@@ -313,5 +359,6 @@ typedef folly::GroupVarintEncoder<uint64_t, detail::ByteSinkAppender>
 
 typedef folly::GroupVarintDecoder<uint32_t> GroupVarint32Decoder;
 typedef folly::GroupVarintDecoder<uint64_t> GroupVarint64Decoder;
+#endif
 
 } // namespace facebook::velox

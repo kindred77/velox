@@ -216,5 +216,37 @@ TEST_F(UnsafeRowTest, nestedMaps) {
   testRoundTrip(data);
 }
 
+TEST_F(UnsafeRowTest, constantVector) {
+  auto data =
+      makeRowVector({BaseVector::createNullConstant(ROW({}), 1, pool_.get())});
+  testRoundTrip(data);
+}
+
+TEST_F(UnsafeRowTest, timestampUtc) {
+  auto data = makeRowVector({
+      makeFlatVector<Timestamp>(
+          {Timestamp::fromMicros(0), Timestamp::fromMicros(1)},
+          TIMESTAMP_UTC()),
+  });
+
+  testRoundTrip(data);
+
+  data = makeRowVector({
+      makeFlatVector<Timestamp>(
+          {
+              Timestamp::fromMicros(0),
+              Timestamp::max(),
+              Timestamp::fromMicros(1'000),
+              Timestamp::min(),
+          },
+          TIMESTAMP_UTC()),
+  });
+
+  data->childAt(0)->setNull(1, true);
+  data->childAt(0)->setNull(3, true);
+
+  testRoundTrip(data);
+}
+
 } // namespace
 } // namespace facebook::velox::row

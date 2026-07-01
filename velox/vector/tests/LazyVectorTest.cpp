@@ -19,7 +19,9 @@
 #include "velox/common/memory/RawVector.h"
 #include "velox/vector/tests/utils/VectorTestBase.h"
 
-using namespace facebook::velox;
+namespace facebook::velox {
+namespace {
+
 using namespace facebook::velox::test;
 
 class LazyVectorTest : public testing::Test, public VectorTestBase {
@@ -696,3 +698,55 @@ TEST_F(LazyVectorTest, runtimeStats) {
   ASSERT_EQ(stats[2].first, LazyVector::kWallNanos);
   ASSERT_GE(stats[2].second.value, 0);
 }
+
+TEST_F(LazyVectorTest, chain) {
+  auto lazy = std::make_shared<LazyVector>(
+      pool_.get(),
+      INTEGER(),
+      10,
+      std::make_unique<test::SimpleVectorLoader>([&](auto rows) {
+        return makeFlatVector<int32_t>(rows.back() + 1, folly::identity);
+      }));
+  lazy->chain([](auto& vector) {
+    auto* values =
+        vector->template asChecked<FlatVector<int32_t>>()->mutableRawValues();
+    for (vector_size_t i = 0; i < vector->size(); ++i) {
+      values[i] *= 2;
+    }
+  });
+  auto expected = makeFlatVector<int32_t>(10, [](auto i) { return i * 2; });
+  assertEqualVectors(expected, lazy);
+}
+
+// Verify containsLazyNotLoaded is lazily evaluated and correctly recomputed
+// after invalidation for RowVectors.
+TEST_F(LazyVectorTest, containsLazyNotLoadedLazyEvaluation) {
+  constexpr vector_size_t size = 100;
+
+  // RowVector with no lazy children.
+  auto flat = makeFlatVector<int32_t>(size, folly::identity);
+  auto rowVector = makeRowVector({flat});
+  EXPECT_FALSE(rowVector->containsLazyNotLoaded());
+
+  // RowVector with a lazy child.
+  auto lazy = vectorMaker_.lazyFlatVector<int32_t>(
+      size, [](vector_size_t row) { return row; });
+  auto rowWithLazy = makeRowVector({flat, lazy});
+  EXPECT_TRUE(rowWithLazy->containsLazyNotLoaded());
+
+  // After loading the lazy child, invalidate and verify recomputation.
+  lazy->loadedVector();
+  rowWithLazy->invalidateContainsLazyNotLoaded();
+  EXPECT_FALSE(rowWithLazy->containsLazyNotLoaded());
+
+  // Replace a child with a new lazy vector after invalidation, verify
+  // recomputation picks it up.
+  auto lazy2 = vectorMaker_.lazyFlatVector<int32_t>(
+      size, [](vector_size_t row) { return row * 2; });
+  rowWithLazy->childAt(1) = lazy2;
+  rowWithLazy->invalidateContainsLazyNotLoaded();
+  EXPECT_TRUE(rowWithLazy->containsLazyNotLoaded());
+}
+
+} // namespace
+} // namespace facebook::velox

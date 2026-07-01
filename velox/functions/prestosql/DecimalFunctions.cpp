@@ -53,9 +53,9 @@ struct DecimalPlusFunction {
     int128_t aRescaled;
     int128_t bRescaled;
     if (__builtin_mul_overflow(
-            a, DecimalUtil::kPowersOfTen[aRescale_], &aRescaled) ||
+            static_cast<int128_t>(a), DecimalUtil::kPowersOfTen[aRescale_], &aRescaled) ||
         __builtin_mul_overflow(
-            b, DecimalUtil::kPowersOfTen[bRescale_], &bRescaled)) {
+            static_cast<int128_t>(b), DecimalUtil::kPowersOfTen[bRescale_], &bRescaled)) {
       VELOX_ARITHMETIC_ERROR("Decimal overflow: {} + {}", a, b);
     }
     out = checkedPlus<R>(R(aRescaled), R(bRescaled));
@@ -102,9 +102,9 @@ struct DecimalMinusFunction {
     int128_t aRescaled;
     int128_t bRescaled;
     if (__builtin_mul_overflow(
-            a, DecimalUtil::kPowersOfTen[aRescale_], &aRescaled) ||
+            static_cast<int128_t>(a), DecimalUtil::kPowersOfTen[aRescale_], &aRescaled) ||
         __builtin_mul_overflow(
-            b, DecimalUtil::kPowersOfTen[bRescale_], &bRescaled)) {
+            static_cast<int128_t>(b), DecimalUtil::kPowersOfTen[bRescale_], &bRescaled)) {
       VELOX_ARITHMETIC_ERROR("Decimal overflow: {} - {}", a, b);
     }
     out = checkedMinus<R>(R(aRescaled), R(bRescaled));
@@ -195,17 +195,30 @@ struct DecimalModulusFunction {
         R(DecimalUtil::kPowersOfTen[aRescale_]),
         "Decimal");
 
-    R unsignedDivisorRescaled(b);
+    B unsignedDivisorRescaled(b);
     if (b < 0) {
       unsignedDivisorRescaled *= -1;
     }
     unsignedDivisorRescaled = checkedMultiply<B>(
         unsignedDivisorRescaled,
-        R(DecimalUtil::kPowersOfTen[bRescale_]),
+        B(DecimalUtil::kPowersOfTen[bRescale_]),
         "Decimal");
 
+#ifdef _MSC_VER
+    // On Windows, R % B doesn't work if they're different types
+    if constexpr (std::is_same_v<R, B>) {
+      R remainder = unsignedDividendRescaled % unsignedDivisorRescaled;
+      out = remainder * remainderSign;
+    } else {
+      // Cast to larger type for modulo
+      using Larger = std::conditional_t<sizeof(R) >= sizeof(B), R, B>;
+      Larger remainder = static_cast<Larger>(unsignedDividendRescaled) % static_cast<Larger>(unsignedDivisorRescaled);
+      out = static_cast<R>(remainder) * remainderSign;
+    }
+#else
     R remainder = unsignedDividendRescaled % unsignedDivisorRescaled;
     out = remainder * remainderSign;
+#endif
   }
 
  private:
@@ -255,7 +268,15 @@ struct DecimalRoundFunction {
     auto reScaleFactor = DecimalUtil::kPowersOfTen[scale_ - n];
     DecimalUtil::divideWithRoundUp<R, A, int128_t>(
         out, a, reScaleFactor, false, 0, 0);
+#ifdef _MSC_VER
+    if constexpr (std::is_same_v<R, int128_t>) {
+      out *= reScaleFactor;
+    } else {
+      out = static_cast<R>(static_cast<int128_t>(out) * reScaleFactor);
+    }
+#else
     out *= reScaleFactor;
+#endif
   }
 
  private:
@@ -278,10 +299,59 @@ struct DecimalFloorFunction {
   template <typename R, typename A>
   void call(R& out, const A& a) {
     const auto rescaleFactor = DecimalUtil::kPowersOfTen[scale_];
-    // Function interpretation is the same as ceil for negative numbers, and as
-    // floor for positive numbers.
+#ifdef _MSC_VER
+    // rescaleFactor is int128_t; cast operands to match the Windows int128 shim
+    // which lacks mixed-type operators.
+    if constexpr (std::is_same_v<std::remove_cv_t<A>, int128_t>) {
+      const auto increment = (a % rescaleFactor) < 0 ? -1 : 0;
+      out = static_cast<R>(a / rescaleFactor + increment);
+    } else {
+      const auto increment =
+          (static_cast<int128_t>(a) % rescaleFactor) < 0 ? -1 : 0;
+      out = static_cast<R>(static_cast<int128_t>(a) / rescaleFactor + increment);
+    }
+#else
+    // Round rowards -INF.
     const auto increment = (a % rescaleFactor) < 0 ? -1 : 0;
     out = a / rescaleFactor + increment;
+#endif
+  }
+
+ private:
+  uint8_t scale_;
+};
+
+template <typename TExec>
+struct DecimalCeilFunction {
+  VELOX_DEFINE_FUNCTION_TYPES(TExec);
+
+  template <typename A>
+  void initialize(
+      const std::vector<TypePtr>& inputTypes,
+      const core::QueryConfig& /*config*/,
+      A* /*a*/) {
+    scale_ = getDecimalPrecisionScale(*inputTypes[0]).second;
+  }
+
+  template <typename R, typename A>
+  void call(R& out, const A& a) {
+    const auto rescaleFactor = DecimalUtil::kPowersOfTen[scale_];
+    // Round towards +INF.
+#ifdef _MSC_VER
+    // rescaleFactor is int128_t; cast operands to match the Windows int128 shim
+    // which lacks mixed-type operators.
+    if constexpr (std::is_same_v<std::remove_cv_t<A>, int128_t>) {
+      const auto increment = (a % rescaleFactor) > 0 ? 1 : 0;
+      out = static_cast<R>(a / rescaleFactor + increment);
+    } else {
+      const auto increment =
+          (static_cast<int128_t>(a) % rescaleFactor) > 0 ? 1 : 0;
+      out = static_cast<R>(static_cast<int128_t>(a) / rescaleFactor + increment);
+    }
+#else
+    const auto increment = (a % rescaleFactor) > 0 ? 1 : 0;
+    out = a / rescaleFactor + increment;
+#endif
   }
 
  private:
@@ -314,9 +384,19 @@ struct DecimalTruncateFunction {
   template <typename R, typename A>
   void call(R& out, const A& a) {
     if UNLIKELY (scale_ == 0 || a == 0) {
-      out = a;
+      if constexpr (std::is_same_v<std::remove_cv_t<A>, int128_t> && !std::is_same_v<std::remove_cv_t<R>, int128_t>) {
+        out = static_cast<R>(a);
+      } else {
+        out = a;
+      }
     } else {
-      out = a / DecimalUtil::kPowersOfTen[scale_];
+      const auto rescaleFactor = DecimalUtil::kPowersOfTen[scale_];
+      if constexpr (std::is_same_v<std::remove_cv_t<A>, int128_t>) {
+        out = static_cast<R>(a / rescaleFactor);
+      } else {
+        // rescaleFactor is int128_t but A is not, need cast
+        out = static_cast<R>(static_cast<int128_t>(a) / rescaleFactor);
+      }
     }
   }
 
@@ -327,7 +407,16 @@ struct DecimalTruncateFunction {
     } else if UNLIKELY (scale_ <= n) {
       out = a;
     } else {
-      out = a - (a % DecimalUtil::kPowersOfTen[scale_ - n]);
+      auto modFactor = DecimalUtil::kPowersOfTen[scale_ - n];
+#ifdef _MSC_VER
+      if constexpr (std::is_same_v<A, int128_t>) {
+        out = a - (a % modFactor);
+      } else {
+        out = a - static_cast<A>(static_cast<int128_t>(a) % modFactor);
+      }
+#else
+      out = a - (a % modFactor);
+#endif
     }
   }
 
@@ -532,7 +621,10 @@ void registerDecimalModulus(const std::string& prefix) {
       LongDecimal<P2, S2>>({prefix + "mod"}, constraints);
 }
 
-void registerDecimalFloor(const std::string& prefix) {
+template <template <class> typename TFunc>
+void registerDecimalFloorOrCeil(
+    const std::string& prefix,
+    const std::string& functionName) {
   std::vector<exec::SignatureVariable> constraints = {
       exec::SignatureVariable(
           P2::name(),
@@ -545,20 +637,22 @@ void registerDecimalFloor(const std::string& prefix) {
           S2::name(), "0", exec::ParameterType::kIntegerParameter),
   };
 
-  registerFunction<
-      DecimalFloorFunction,
-      LongDecimal<P2, S2>,
-      LongDecimal<P1, S1>>({prefix + "floor"}, constraints);
+  registerFunction<TFunc, LongDecimal<P2, S2>, LongDecimal<P1, S1>>(
+      {prefix + functionName}, constraints);
 
-  registerFunction<
-      DecimalFloorFunction,
-      ShortDecimal<P2, S2>,
-      LongDecimal<P1, S1>>({prefix + "floor"}, constraints);
+  registerFunction<TFunc, ShortDecimal<P2, S2>, LongDecimal<P1, S1>>(
+      {prefix + functionName}, constraints);
 
-  registerFunction<
-      DecimalFloorFunction,
-      ShortDecimal<P2, S2>,
-      ShortDecimal<P1, S1>>({prefix + "floor"}, constraints);
+  registerFunction<TFunc, ShortDecimal<P2, S2>, ShortDecimal<P1, S1>>(
+      {prefix + functionName}, constraints);
+}
+
+void registerDecimalFloor(const std::string& prefix) {
+  registerDecimalFloorOrCeil<DecimalFloorFunction>(prefix, "floor");
+}
+
+void registerDecimalCeil(const std::string& prefix) {
+  registerDecimalFloorOrCeil<DecimalCeilFunction>(prefix, "ceil");
 }
 
 void registerDecimalRound(const std::string& prefix) {

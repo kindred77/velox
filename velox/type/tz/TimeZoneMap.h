@@ -17,7 +17,10 @@
 #pragma once
 
 #include <chrono>
+#include <memory>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace facebook::velox::tzdb {
@@ -167,6 +170,15 @@ class TimeZone {
     return tz_;
   }
 
+  /// Returns the fixed offset for offset-based time zones (e.g., "+05:30").
+  /// Returns std::nullopt for time zones with a tzdb::time_zone pointer.
+  std::optional<std::chrono::minutes> offset() const {
+    if (tz_ == nullptr) {
+      return offset_;
+    }
+    return std::nullopt;
+  }
+
   /// Returns the short name (abbreviation) of the time zone for the given
   /// timestamp. Note that the timestamp is needed for time zones that support
   /// daylight savings time as the short name will change depending on the date
@@ -189,5 +201,11 @@ class TimeZone {
   const std::string timeZoneName_;
   const int16_t timeZoneID_;
 };
+
+/// Builds a TimeZone database vector from the input list of (id, name) pairs.
+/// Exposed only for testing the missing-tzdb fallback path; production code
+/// uses the cached database returned by locateZone().
+std::vector<std::unique_ptr<TimeZone>> testingBuildTimeZoneDatabase(
+    const std::vector<std::pair<int16_t, std::string>>& dbInput);
 
 } // namespace facebook::velox::tz

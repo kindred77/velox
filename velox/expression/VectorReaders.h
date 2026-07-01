@@ -115,7 +115,7 @@ struct ConstantVectorReader {
 
   std::optional<exec_in_t> value;
 
-  explicit ConstantVectorReader<T>(ConstantVector<exec_in_t>& vector) {
+  explicit ConstantVectorReader(ConstantVector<exec_in_t>& vector) {
     if (!vector.isNullAt(0)) {
       value = *vector.rawValues();
     }
@@ -160,7 +160,7 @@ struct FlatVectorReader {
   const exec_in_t* values;
   FlatVector<exec_in_t>* vector;
 
-  explicit FlatVectorReader<T>(FlatVector<exec_in_t>& baseVector)
+  explicit FlatVectorReader(FlatVector<exec_in_t>& baseVector)
       : values(baseVector.rawValues()), vector(&baseVector) {}
 
   exec_in_t operator[](vector_size_t offset) const {
@@ -560,6 +560,11 @@ struct VectorReader<Variadic<T>> {
       int32_t startPosition)
       : childReaders_{prepareChildReaders(decodedArgs, startPosition)} {}
 
+  explicit VectorReader(
+      const std::vector<DecodedVector>& decodedVecs,
+      int32_t startPosition)
+      : childReaders_{prepareChildReaders(decodedVecs, startPosition)} {}
+
   exec_in_t operator[](vector_size_t offset) const {
     return {&childReaders_, offset};
   }
@@ -572,6 +577,18 @@ struct VectorReader<Variadic<T>> {
     // The Variadic itself can never be null, only the values of the underlying
     // Types
     return true;
+  }
+
+  // Returns true if any immediate variadic element is null at the given row.
+  // Unlike containsNull(), this checks only the top-level nullity of each
+  // element, not recursive nulls within complex types.
+  bool hasTopLevelNull(vector_size_t index) const {
+    for (const auto& childReader : childReaders_) {
+      if (!childReader->isSet(index)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   bool containsNull(vector_size_t index) const {
@@ -634,6 +651,18 @@ struct VectorReader<Variadic<T>> {
     return childReaders;
   }
 
+  auto prepareChildReaders(
+      const std::vector<DecodedVector>& decodedArgs,
+      int32_t startPosition) {
+    std::vector<std::unique_ptr<VectorReader<T>>> childReaders;
+    childReaders.reserve(decodedArgs.size());
+    for (int i = startPosition; i < decodedArgs.size(); ++i) {
+      childReaders.emplace_back(
+          std::make_unique<VectorReader<T>>(&decodedArgs[i]));
+    }
+    return childReaders;
+  }
+
   std::vector<std::unique_ptr<VectorReader<T>>> childReaders_;
 };
 
@@ -681,6 +710,7 @@ struct VectorReader<Generic<T, comparable, orderable>> {
     // TODO (kevinwilfong): Add support for Generics in callNullFree.
     VELOX_UNSUPPORTED(
         "Calling callNullFree with Generic arguments is not yet supported.");
+    return false; // unreachable; MSVC does not honor VELOX_UNSUPPORTED noreturn
   }
 
   bool containsNull(
@@ -690,6 +720,7 @@ struct VectorReader<Generic<T, comparable, orderable>> {
     // TODO (kevinwilfong): Add support for Generics in callNullFree.
     VELOX_UNSUPPORTED(
         "Calling callNullFree with Generic arguments is not yet supported.");
+    return false; // unreachable; MSVC does not honor VELOX_UNSUPPORTED noreturn
   }
 
   inline bool mayHaveNullsRecursive() const {
@@ -697,6 +728,7 @@ struct VectorReader<Generic<T, comparable, orderable>> {
     // TODO (kevinwilfong): Add support for Generics in callNullFree.
     VELOX_UNSUPPORTED(
         "Calling callNullFree with Generic arguments is not yet supported.");
+    return false; // unreachable; MSVC does not honor VELOX_UNSUPPORTED noreturn
   }
 
   bool mayHaveNulls() const {
@@ -733,8 +765,9 @@ struct VectorReader<DynamicRow> {
         vector_(detail::getDecoded<in_vector_t>(decoded_)),
         childrenDecoders_{vector_.childrenSize()} {
     for (int i = 0; i < vector_.childrenSize(); i++) {
-      childReaders_.push_back(std::make_unique<VectorReader<Any>>(
-          detail::decode(childrenDecoders_[i], *vector_.childAt(i))));
+      childReaders_.push_back(
+          std::make_unique<VectorReader<Any>>(
+              detail::decode(childrenDecoders_[i], *vector_.childAt(i))));
     }
   }
 

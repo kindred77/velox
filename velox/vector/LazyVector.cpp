@@ -182,7 +182,7 @@ void LazyVector::ensureLoadedRowsImpl(
         decodedChild.decode(*child, baseRows, false);
         ensureLoadedRowsImpl(child, decodedChild, baseRows, childRows);
       }
-      rowVector->updateContainsLazyNotLoaded();
+      rowVector->invalidateContainsLazyNotLoaded();
       vector->loadedVector();
     }
     return;
@@ -203,15 +203,17 @@ void LazyVector::ensureLoadedRowsImpl(
         rowSet = RowSet(iota, rows.end());
       } else {
         rowNumbers.resize(rows.end());
-        rowNumbers.resize(simd::indicesOfSetBits(
-            rows.asRange().bits(), 0, rows.end(), rowNumbers.data()));
+        rowNumbers.resize(
+            simd::indicesOfSetBits(
+                rows.asRange().bits(), 0, rows.end(), rowNumbers.data()));
         rowSet = RowSet(rowNumbers);
       }
     } else {
       selectBaseRowsToLoad(decoded, baseRows, rows);
       rowNumbers.resize(baseRows.end());
-      rowNumbers.resize(simd::indicesOfSetBits(
-          baseRows.asRange().bits(), 0, baseRows.end(), rowNumbers.data()));
+      rowNumbers.resize(
+          simd::indicesOfSetBits(
+              baseRows.asRange().bits(), 0, baseRows.end(), rowNumbers.data()));
 
       rowSet = RowSet(rowNumbers);
     }

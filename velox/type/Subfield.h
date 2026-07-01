@@ -16,9 +16,11 @@
 #pragma once
 
 #include <fmt/format.h>
+#include <folly/hash/Hash.h>
+#include <cstdint>
 #include <ostream>
 
-#include "velox/common/Enums.h"
+#include "velox/common/EnumDeclare.h"
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/base/Macros.h"
 
@@ -87,6 +89,14 @@ class Subfield {
       return dynamic_cast<const T*>(this);
     }
 
+    template <typename T>
+    const T* asChecked() const {
+      auto* ptr = dynamic_cast<const T*>(this);
+      VELOX_CHECK_NOT_NULL(
+          ptr, "PathElement is not of expected type. Actual kind: {}", kind_);
+      return ptr;
+    }
+
    private:
     const SubfieldKind kind_;
   };
@@ -133,7 +143,7 @@ class Subfield {
     }
 
     size_t hash() const override {
-      return std::hash<std::string>()(name_);
+      return folly::hasher<std::string_view>()(name_);
     }
 
     std::string toString() const override {
@@ -150,10 +160,10 @@ class Subfield {
 
   class LongSubscript final : public PathElement {
    public:
-    explicit LongSubscript(long index)
+    explicit LongSubscript(int64_t index)
         : PathElement(SubfieldKind::kLongSubscript), index_(index) {}
 
-    long index() const {
+    int64_t index() const {
       return index_;
     }
 
@@ -166,7 +176,7 @@ class Subfield {
     }
 
     size_t hash() const override {
-      return std::hash<long>()(index_);
+      return std::hash<int64_t>()(index_);
     }
 
     std::string toString() const override {
@@ -178,7 +188,7 @@ class Subfield {
     }
 
    private:
-    const long index_;
+    const int64_t index_;
   };
 
   class StringSubscript final : public PathElement {
@@ -199,7 +209,7 @@ class Subfield {
     }
 
     size_t hash() const override {
-      return std::hash<std::string>()(index_);
+      return folly::hasher<std::string_view>()(index_);
     }
 
     std::string toString() const override;

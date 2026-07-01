@@ -1,6 +1,10 @@
 %{
 #include <FlexLexer.h>
+#include <fmt/format.h>
+#include <boost/algorithm/string/predicate.hpp>
 #include "velox/common/base/Exceptions.h"
+#include "velox/functions/prestosql/types/BigintEnumType.h"
+#include "velox/functions/prestosql/types/VarcharEnumType.h"
 #include "velox/type/Type.h"
 #include "velox/functions/prestosql/types/parser/ParserUtil.h"
 %}
@@ -34,7 +38,7 @@
 }
 
 %token               LPAREN RPAREN COMMA PERIOD COLON ARRAY MAP ROW FUNCTION DECIMAL LBRACE RBRACE
-%token <std::string> WORD VARIABLE QUOTED_ID WORD_WITH_PERIODS
+%token <std::string> WORD VARIABLE QUOTED_ID WORD_WITH_SPECIAL_CHAR
 %token <long long>   NUMBER SIGNED_INT
 %token YYEOF         0
 
@@ -173,16 +177,20 @@ enum_map_entry : QUOTED_ID COLON SIGNED_INT {  $$ = "[" + $1 + "," + std::to_str
                | QUOTED_ID COLON QUOTED_ID  {  $$ = "[" + $1 + "," + $3 + "]"; }
                ;
 
-enum_kind : WORD { if ($1 != "BigintEnum" && $1 != "VarcharEnum" )
+enum_kind : WORD { if (!boost::iequals($1, BigintEnumType::kKind) &&
+                       !boost::iequals($1, VarcharEnumType::kKind))
                     {
-                        std::string msg = "Invalid type " + $1 + ", expected BigintEnum or VarcharEnum";
+                        std::string msg = fmt::format(
+                            "Invalid type {}, expected {} or {}",
+                            $1,
+                            BigintEnumType::kKind,
+                            VarcharEnumType::kKind);
                         error(msg.c_str());
                     }
                 $$ = $1; }
                 ;
 
-enum_name : WORD_WITH_PERIODS { $$ = $1; }
-          | WORD { $$ = $1; }
+enum_name : WORD_WITH_SPECIAL_CHAR { $$ = $1; }
           ;
 
 enum_type : enum_name COLON enum_kind LPAREN enum_name enum_map_entries_json RPAREN

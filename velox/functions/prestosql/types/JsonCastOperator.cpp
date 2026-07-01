@@ -31,6 +31,8 @@ void generateJsonTyped(
     int row,
     std::string& result,
     const TypePtr& type,
+    bool isDate,
+    bool isDecimal,
     const std::shared_ptr<exec::CastHooks>& hooks) {
   auto value = input.valueAt(row);
 
@@ -50,9 +52,10 @@ void generateJsonTyped(
         std::is_same_v<T, double> || std::is_same_v<T, float>) {
       if constexpr (!legacyCast) {
         if (FOLLY_UNLIKELY(std::isinf(value) || std::isnan(value))) {
-          result.append(fmt::format(
-              "\"{}\"",
-              util::Converter<TypeKind::VARCHAR>::tryCast(value).value()));
+          result.append(
+              fmt::format(
+                  "\"{}\"",
+                  util::Converter<TypeKind::VARCHAR>::tryCast(value).value()));
         } else {
           result.append(
               util::Converter<TypeKind::VARCHAR>::tryCast(value).value());
@@ -79,16 +82,18 @@ void generateJsonTyped(
       result.append("\"");
       result.append(buffer);
       result.append("\"");
-    } else if (type->isDate()) {
-      std::string stringValue = DATE()->toString(value);
+    } else if (isDate) {
+      std::string stringValue = DATE()->toString(static_cast<int32_t>(value));
       result.reserve(stringValue.size() + 2);
       result.append("\"");
       result.append(stringValue);
       result.append("\"");
-    } else if (type->isDecimal()) {
+    } else if (isDecimal) {
       result.append(DecimalUtil::toString(value, type));
+    } else if constexpr (std::is_same_v<T, int128_t>) {
+      result.append(std::to_string(static_cast<int64_t>(value)));
     } else {
-      folly::toAppend<std::string, T>(value, &result);
+      folly::toAppend(value, &result);
     }
   }
 }
@@ -101,13 +106,20 @@ void generateJsonNonKeyTyped(
     FlatVector<StringView>& flatResult,
     const std::shared_ptr<exec::CastHooks>& hooks) {
   std::string result;
+  const auto& type = inputVector.type();
+  // Resolve type checks once before the loop to avoid per-element
+  // dynamic_cast calls in isDecimal() (which does two dynamic_casts
+  // to ShortDecimalType*/LongDecimalType* that always fail for plain
+  // integer types).
+  const bool isDate = type->isDate();
+  const bool isDecimal = type->isDecimal();
   context.applyToSelectedNoThrow(rows, [&](auto row) {
     if (inputVector.isNullAt(row)) {
       flatResult.set(row, "null");
     } else {
       result.clear();
       generateJsonTyped<T, legacyCast>(
-          inputVector, row, result, inputVector.type(), hooks);
+          inputVector, row, result, type, isDate, isDecimal, hooks);
 
       flatResult.set(row, StringView{result});
     }
@@ -122,6 +134,9 @@ void generateJsonKeyTyped(
     FlatVector<StringView>& flatResult,
     const std::shared_ptr<exec::CastHooks>& hooks) {
   std::string result;
+  const auto& type = inputVector.type();
+  const bool isDate = type->isDate();
+  const bool isDecimal = type->isDecimal();
   context.applyToSelectedNoThrow(rows, [&](auto row) {
     if (inputVector.isNullAt(row)) {
       VELOX_USER_FAIL("Map keys cannot be null.");
@@ -133,7 +148,7 @@ void generateJsonKeyTyped(
       }
 
       generateJsonTyped<T, legacyCast>(
-          inputVector, row, result, inputVector.type(), hooks);
+          inputVector, row, result, type, isDate, isDecimal, hooks);
 
       if constexpr (!std::is_same_v<T, StringView>) {
         result.append("\"");
@@ -648,21 +663,30 @@ void castToJsonFromRow(
 
 template <typename T>
 simdjson::simdjson_result<T> fromString(const std::string_view& s) {
-  auto result = folly::tryTo<T>(s);
-  if (result.hasError()) {
-    return simdjson::INCORRECT_TYPE;
-  }
+  if constexpr (std::is_same_v<T, int128_t>) {
+    // int128_t is not supported by folly::tryTo, so we parse as int64_t
+    auto result = folly::tryTo<int64_t>(s);
+    if (result.hasError()) {
+      return simdjson::INCORRECT_TYPE;
+    }
+    return static_cast<int128_t>(*result);
+  } else {
+    auto result = folly::tryTo<T>(s);
+    if (result.hasError()) {
+      return simdjson::INCORRECT_TYPE;
+    }
 
-  if constexpr (std::is_floating_point_v<T>) {
-    // Only "NaN" is allowed to be converted to NaN.  "nan" is not allowed.
-    if (FOLLY_UNLIKELY(std::isnan(*result))) {
-      if (s != "NaN" && s != "-NaN") {
-        return simdjson::INCORRECT_TYPE;
+    if constexpr (std::is_floating_point_v<T>) {
+      // Only "NaN" is allowed to be converted to NaN.  "nan" is not allowed.
+      if (FOLLY_UNLIKELY(std::isnan(*result))) {
+        if (s != "NaN" && s != "-NaN") {
+          return simdjson::INCORRECT_TYPE;
+        }
       }
     }
-  }
 
-  return std::move(*result);
+    return std::move(*result);
+  }
 }
 
 // Write x to writer if x is in the range of writer type `To'.  Only the
@@ -1156,57 +1180,7 @@ simdjson::error_code castFromJsonOneRow(
   return simdjson::SUCCESS;
 }
 
-bool isSupportedBasicType(const TypePtr& type) {
-  switch (type->kind()) {
-    case TypeKind::BOOLEAN:
-    case TypeKind::BIGINT:
-    case TypeKind::INTEGER:
-    case TypeKind::SMALLINT:
-    case TypeKind::TINYINT:
-    case TypeKind::DOUBLE:
-    case TypeKind::REAL:
-    case TypeKind::VARCHAR:
-      return true;
-    default:
-      return false;
-  }
-}
 } // namespace
-
-bool JsonCastOperator::isSupportedFromType(const TypePtr& other) const {
-  if (isSupportedBasicType(other)) {
-    return true;
-  }
-
-  switch (other->kind()) {
-    case TypeKind::UNKNOWN:
-    case TypeKind::TIMESTAMP:
-      return true;
-    case TypeKind::ARRAY:
-      return isSupportedFromType(other->childAt(0));
-    case TypeKind::ROW:
-      for (const auto& child : other->as<TypeKind::ROW>().children()) {
-        if (!isSupportedFromType(child)) {
-          return false;
-        }
-      }
-      return true;
-    case TypeKind::MAP:
-      if (other->childAt(1)->isUnKnown()) {
-        if (other->childAt(0)->isUnKnown()) {
-          return true;
-        }
-        return isSupportedBasicType(other->childAt(0)) &&
-            !isJsonType(other->childAt(0));
-      }
-
-      return (
-          isSupportedBasicType(other->childAt(0)) &&
-          isSupportedFromType(other->childAt(1)));
-    default:
-      return false;
-  }
-}
 
 template <TypeKind kind>
 void JsonCastOperator::castFromJson(
@@ -1229,6 +1203,10 @@ void JsonCastOperator::castFromJson(
     maxSize = std::max(maxSize, input.size());
   });
   paddedInput_.resize(maxSize + simdjson::SIMDJSON_PADDING);
+  memset(
+      paddedInput_.data() + maxSize,
+      0,
+      simdjson::SIMDJSON_PADDING);
   context.applyToSelectedNoThrow(
       rows,
       [&](auto row) INLINE_LAMBDA {
@@ -1239,9 +1217,23 @@ void JsonCastOperator::castFromJson(
         }
         auto& input = inputVector->valueAt(row);
         memcpy(paddedInput_.data(), input.data(), input.size());
+        if (input.size() < maxSize) {
+          memset(
+              paddedInput_.data() + input.size(),
+              0,
+              maxSize - input.size());
+        }
         simdjson::padded_string_view paddedInput(
             paddedInput_.data(), input.size(), paddedInput_.size());
         if (auto error = castFromJsonOneRow<kind>(paddedInput, writer)) {
+#ifdef _WIN32
+          // On MSVC, pre-initializing all error codes crashes due to stack
+          // trace capture exhaustion. Create errors lazily instead.
+          if (!errors_[error]) {
+            simdjson::simdjson_error e(error);
+            errors_[error] = toVeloxException(std::make_exception_ptr(e));
+          }
+#endif
           context.setVeloxExceptionError(row, errors_[error]);
           writer.commitNull();
         }
@@ -1249,35 +1241,6 @@ void JsonCastOperator::castFromJson(
       [&](vector_size_t row) INLINE_LAMBDA { writer.commitNull(); });
 
   writer.finish();
-}
-
-bool JsonCastOperator::isSupportedToType(const TypePtr& other) const {
-  if (other->isDate()) {
-    return false;
-  }
-
-  if (isSupportedBasicType(other)) {
-    return true;
-  }
-
-  switch (other->kind()) {
-    case TypeKind::ARRAY:
-      return isSupportedToType(other->childAt(0));
-    case TypeKind::ROW:
-      for (const auto& child : other->as<TypeKind::ROW>().children()) {
-        if (!isSupportedToType(child)) {
-          return false;
-        }
-      }
-      return true;
-    case TypeKind::MAP:
-      return (
-          isSupportedBasicType(other->childAt(0)) &&
-          isSupportedToType(other->childAt(1)) &&
-          !isJsonType(other->childAt(0)));
-    default:
-      return false;
-  }
 }
 
 /// Converts an input vector of a supported type to Json type. The
@@ -1323,8 +1286,14 @@ void JsonCastOperator::castFrom(
     const TypePtr& resultType,
     VectorPtr& result) const {
   // Initialize errors here so that we get the proper exception context.
+#ifdef _WIN32
+  // On MSVC, pre-initializing all 33 simdjson error codes at once crashes
+  // during VeloxException stack trace capture. Errors are created lazily
+  // in castFromJson instead.
+#else
   folly::call_once(
       initializeErrors_, [this] { simdjsonErrorsToExceptions(errors_); });
+#endif
   context.ensureWritable(rows, resultType, result);
   // Casting to unsupported types should have been rejected by isSupportedType()
   // in the caller.

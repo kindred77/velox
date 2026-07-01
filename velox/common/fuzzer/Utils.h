@@ -31,6 +31,17 @@ namespace facebook::velox::fuzzer {
 
 using FuzzerGenerator = folly::detail::DefaultGenerator;
 
+// Frequently used timezone offsets in minutes (US timezones including DST)
+// -240 = UTC-4:00 (EDT)
+// -300 = UTC-5:00 (EST/CDT)
+// -360 = UTC-6:00 (CST/MDT)
+// -420 = UTC-7:00 (MST/PDT)
+// -480 = UTC-8:00 (PST)
+// -540 = UTC-9:00 (AKST)
+// -600 = UTC-10:00 (HST)
+constexpr std::array<int16_t, 7> kFrequentlyUsedTimezoneOffsets =
+    {-240, -300, -360, -420, -480, -540, -600};
+
 enum UTF8CharList {
   ASCII = 0, // Ascii character set.
   UNICODE_CASE_SENSITIVE = 1, // Unicode scripts that support case.
@@ -87,6 +98,7 @@ inline T rand(
     FuzzerGenerator& /*rng*/,
     DataSpec /*dataSpec*/ = {false, false}) {
   VELOX_NYI();
+  return T{}; // Unreachable, but needed for Windows MSVC.
 }
 
 template <>
@@ -167,11 +179,55 @@ inline Timestamp rand(FuzzerGenerator& rng, DataSpec /*dataSpec*/) {
 
 int32_t randDate(FuzzerGenerator& rng);
 
+int32_t randTime(FuzzerGenerator& rng);
+
+/// Generate random timezone offset using biased distribution
+/// 25% probability: picks from frequently used offsets
+/// 75% probability: generates random offset from [-840, 840]
+///
+/// @param rng Random number generator
+/// @param frequentlyUsedProbability Probability of selecting from frequently
+///        used offsets (default 0.25 for 25%)
+/// @return Timezone offset in minutes [-840, 840]
+int16_t generateRandomTimezoneOffset(
+    FuzzerGenerator& rng,
+    double frequentlyUsedProbability = 0.25);
+
+/// Convert timezone offset in minutes to "+HH:mm" or "-HH:mm" format
+/// Always uses Presto-compatible +HH:mm format (never +HH or +HHmm)
+///
+/// Examples:
+/// - 0 → "+00:00"
+/// - 330 → "+05:30"
+/// - -300 → "-05:00"
+/// - 840 → "+14:00"
+/// - -840 → "-14:00"
+///
+/// @param offsetMinutes Timezone offset in minutes [-840, 840]
+/// @return Timezone offset string in "+HH:mm" or "-HH:mm" format
+/// @throws VeloxException if offsetMinutes is out of range [-840, 840]
+std::string timezoneOffsetToString(int16_t offsetMinutes);
+
 template <
     typename T,
-    typename std::enable_if_t<std::is_arithmetic_v<T>, int> = 0>
+    typename std::enable_if_t<
+        std::is_arithmetic_v<T> || std::is_same_v<T, int128_t>,
+        int> = 0>
 inline T rand(FuzzerGenerator& rng, T min, T max) {
-  if constexpr (std::is_integral_v<T>) {
+  if constexpr (std::is_same_v<T, int128_t>) {
+    // int128_t is not supported by boost's distributions. Compose a random
+    // 128-bit value from two random 64-bit halves. This stays portable across
+    // the native __int128 and the MSVC int128_t shim.
+    const uint64_t lo = boost::random::uniform_int_distribution<uint64_t>()(rng);
+    const uint64_t hi = boost::random::uniform_int_distribution<uint64_t>()(rng);
+    const uint128_t uval =
+        (static_cast<uint128_t>(hi) << 64) | static_cast<uint128_t>(lo);
+    if (max > min) {
+      const uint128_t range = static_cast<uint128_t>(max - min) + 1;
+      return min + static_cast<int128_t>(uval % range);
+    }
+    return min;
+  } else if constexpr (std::is_integral_v<T>) {
     return boost::random::uniform_int_distribution<T>(min, max)(rng);
   } else {
     return boost::random::uniform_real_distribution<T>(min, max)(rng);

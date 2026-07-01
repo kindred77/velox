@@ -114,11 +114,16 @@ RowVectorPtr reduceToSelectedRows(
   if (rows.isAllSelected()) {
     return rowVector;
   }
+  // The fuzzer can generate a test case whose active rows select nothing.
+  // Return an empty RowVector so callers compare zero rows.
+  if (!rows.hasSelections()) {
+    return std::dynamic_pointer_cast<RowVector>(
+        BaseVector::create(rowVector->type(), 0, rowVector->pool()));
+  }
   BufferPtr indices = allocateIndices(rows.end(), rowVector->pool());
   auto rawIndices = indices->asMutable<vector_size_t>();
   vector_size_t cnt = 0;
   rows.applyToSelected([&](vector_size_t row) { rawIndices[cnt++] = row; });
-  VELOX_CHECK_GT(cnt, 0);
   indices->setSize(cnt * sizeof(vector_size_t));
   // Top level row vector is not expected to be encoded, therefore we copy
   // instead of wrapping in the indices.
@@ -194,12 +199,14 @@ void transformInputTestCases(
   const auto [transformedInputs, transformProjections] =
       referenceQueryRunner->inputProjections(input);
   for (const auto& expr : transformProjections) {
-    transformPlans.push_back(core::Expressions::inferTypes(
-        expr, transformedInputs[0]->type(), pool));
+    transformPlans.push_back(
+        core::Expressions::inferTypes(
+            expr, transformedInputs[0]->type(), pool));
   }
   for (int i = 0; i < transformedInputs.size(); ++i) {
-    transformedInputTestCases.push_back(fuzzer::InputTestCase{
-        transformedInputs[i], inputTestCases[i].activeRows});
+    transformedInputTestCases.push_back(
+        fuzzer::InputTestCase{
+            transformedInputs[i], inputTestCases[i].activeRows});
   }
 }
 
@@ -432,6 +439,7 @@ ExpressionVerifier::verify(
             // Throws in case only one evaluation path throws exception.
             // Otherwise, return false to signal that the expression failed.
             if (exceptionCommonPtr && exceptionReference) {
+              LOG(INFO) << "Both paths threw exception.";
               verificationStates.push_back(VerificationState::kBothPathsThrow);
             } else {
               verificationStates.push_back(

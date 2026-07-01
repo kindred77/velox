@@ -31,7 +31,6 @@
 #include "velox/common/testutil/TestValue.h"
 
 DECLARE_bool(velox_memory_leak_check_enabled);
-DECLARE_bool(velox_memory_pool_debug_enabled);
 DECLARE_int32(velox_memory_num_shared_leaf_pools);
 
 using namespace ::testing;
@@ -61,15 +60,16 @@ struct TestParam {
 class MemoryPoolTest : public testing::TestWithParam<TestParam> {
  public:
   static const std::vector<TestParam> getTestParams() {
-    std::vector<TestParam> params;
-    params.push_back({true, true, false});
-    params.push_back({true, false, false});
-    params.push_back({false, true, false});
-    params.push_back({false, false, false});
-    params.push_back({true, true, true});
-    params.push_back({true, false, true});
-    params.push_back({false, true, true});
-    params.push_back({false, false, true});
+    std::vector<TestParam> params = {
+        {true, true, false},
+        {true, false, false},
+        {false, true, false},
+        {false, false, false},
+        {true, true, true},
+        {true, false, true},
+        {false, true, true},
+        {false, false, true},
+    };
     return params;
   }
 
@@ -165,13 +165,14 @@ TEST_P(MemoryPoolTest, ctor) {
     auto fakeRoot = std::make_shared<MemoryPoolImpl>(
         &manager, "fake_root", MemoryPool::Kind::kAggregate, nullptr, nullptr);
     // We can't construct an aggregate memory pool with non-thread safe.
-    ASSERT_ANY_THROW(std::make_shared<MemoryPoolImpl>(
-        &manager,
-        "fake_root",
-        MemoryPool::Kind::kAggregate,
-        nullptr,
-        nullptr,
-        MemoryPool::Options{.threadSafe = false}));
+    ASSERT_ANY_THROW(
+        std::make_shared<MemoryPoolImpl>(
+            &manager,
+            "fake_root",
+            MemoryPool::Kind::kAggregate,
+            nullptr,
+            nullptr,
+            MemoryPool::Options{.threadSafe = false}));
     ASSERT_EQ("fake_root", fakeRoot->name());
     ASSERT_EQ(
         static_cast<MemoryPoolImpl*>(root.get())->testingAllocator(),
@@ -442,6 +443,89 @@ TEST_P(MemoryPoolTest, usedBytes) {
   ASSERT_EQ(root->usedBytes(), 0);
 }
 
+TEST_P(MemoryPoolTest, reportExternalAllocation) {
+  auto manager = getMemoryManager();
+  auto root = manager->addRootPool();
+  auto child =
+      root->addLeafChild("reportExternalAllocation", isLeafThreadSafe_);
+
+  const int64_t kReportSize{1L * MB};
+  const auto initialStats = child->stats();
+  ASSERT_EQ(child->usedBytes(), 0);
+  ASSERT_EQ(initialStats.numExternalAllocs, 0);
+  ASSERT_EQ(initialStats.numExternalFrees, 0);
+  ASSERT_EQ(initialStats.cumulativeExternalBytes, 0);
+
+  // reportExternalAllocation does not allocate memory but should account for
+  // it in usedBytes/reservedBytes and bump the external-allocation stats.
+  // It must not increment numAllocs (reserved for real pool allocations).
+  child->reportExternalAllocation(kReportSize);
+  ASSERT_EQ(child->usedBytes(), kReportSize);
+  ASSERT_GE(child->reservedBytes(), kReportSize);
+  auto stats = child->stats();
+  ASSERT_EQ(stats.numAllocs, initialStats.numAllocs);
+  ASSERT_EQ(stats.numExternalAllocs, 1);
+  ASSERT_EQ(stats.cumulativeExternalBytes, kReportSize);
+  ASSERT_EQ(stats.peakBytes, kReportSize);
+
+  // A paired reportExternalFree of the same size returns the pool to its
+  // original bookkeeping state and bumps the external-free stat without
+  // touching numFrees. peak stays at its max. cumulativeExternalBytes is a
+  // running total of all external allocations and never decreases.
+  child->reportExternalFree(kReportSize);
+  ASSERT_EQ(child->usedBytes(), 0);
+  ASSERT_EQ(child->reservedBytes(), 0);
+  stats = child->stats();
+  ASSERT_EQ(stats.numFrees, initialStats.numFrees);
+  ASSERT_EQ(stats.numExternalFrees, 1);
+  ASSERT_EQ(stats.cumulativeExternalBytes, kReportSize);
+  ASSERT_EQ(stats.peakBytes, kReportSize);
+}
+
+TEST_P(MemoryPoolTest, reportExternalAllocationCapacityExceeded) {
+  const uint64_t kMaxCap = 128L * MB;
+  MemoryManager::Options options;
+  options.allocatorCapacity = kMaxCap;
+  options.arbitratorCapacity = kMaxCap;
+  options.extraArbitratorConfigs = {
+      {std::string(SharedArbitrator::ExtraConfig::kReservedCapacity),
+       folly::to<std::string>(kMaxCap / 2) + "B"}};
+  setupMemory(options);
+  auto manager = getMemoryManager();
+  auto root = manager->addRootPool("reportExternalCap", kMaxCap);
+  auto pool = root->addLeafChild("reportExternalCap", isLeafThreadSafe_);
+
+  // Reporting more than the pool's capacity must trip the same memory-cap
+  // path that allocate() does, leaving usage at zero.
+  VELOX_ASSERT_THROW(
+      pool->reportExternalAllocation(static_cast<int64_t>(kMaxCap) + 1L * MB),
+      "Exceeded memory pool capacity");
+  ASSERT_EQ(pool->usedBytes(), 0);
+  ASSERT_EQ(pool->reservedBytes(), 0);
+}
+
+TEST_P(MemoryPoolTest, reportExternalAllocationRejectsNonPositiveSize) {
+  auto manager = getMemoryManager();
+  auto root = manager->addRootPool();
+  auto child =
+      root->addLeafChild("reportExternalNonPositive", isLeafThreadSafe_);
+
+  VELOX_ASSERT_THROW(
+      child->reportExternalAllocation(0),
+      "(0 vs. 0) reportExternalAllocation requires positive size");
+  VELOX_ASSERT_THROW(
+      child->reportExternalAllocation(-1),
+      "(-1 vs. 0) reportExternalAllocation requires positive size");
+  VELOX_ASSERT_THROW(
+      child->reportExternalFree(0),
+      "(0 vs. 0) reportExternalFree requires positive size");
+  VELOX_ASSERT_THROW(
+      child->reportExternalFree(-1),
+      "(-1 vs. 0) reportExternalFree requires positive size");
+  ASSERT_EQ(child->usedBytes(), 0);
+  ASSERT_EQ(child->reservedBytes(), 0);
+}
+
 TEST_P(MemoryPoolTest, DISABLED_memoryLeakCheck) {
   gflags::FlagSaver flagSaver;
   testing::FLAGS_gtest_death_test_style = "fast";
@@ -690,7 +774,7 @@ TEST_P(MemoryPoolTest, alignmentCheck) {
       0,
       MemoryAllocator::kMinAlignment,
       MemoryAllocator::kMinAlignment * 2,
-      MemoryAllocator::kMaxAlignment};
+      MemoryAllocator::kDefaultAlignment};
   for (const auto& alignment : alignments) {
     SCOPED_TRACE(fmt::format("alignment:{}", alignment));
     MemoryManager::Options options;
@@ -756,23 +840,18 @@ TEST_P(MemoryPoolTest, memoryCapExceptions) {
         ASSERT_TRUE(ex.isRetriable());
         if (useMmap_) {
           if (useCache_) {
-            ASSERT_EQ(
-                fmt::format(
-                    "allocate failed with 128.00MB from Memory Pool["
-                    "static_quota LEAF root[MemoryCapExceptions] "
-                    "parent[MemoryCapExceptions] MMAP track-usage {}]<max "
-                    "capacity 256.00MB capacity 256.00MB used 0B available 0B "
-                    "reservation [used 0B, reserved 0B, min 0B] counters [allocs "
-                    "1, frees 0, reserves 0, releases 0, collisions 0])> Failed to"
-                    " evict from cache state: AsyncDataCache:\nCache size: 0B "
-                    "tinySize: 0B large size: 0B\nCache entries: 0 read pins: "
-                    "0 write pins: 0 pinned shared: 0B pinned exclusive: 0B\n "
-                    "num write wait: 0 empty entries: 0\nCache access miss: 0 "
-                    "hit: 0 hit bytes: 0B eviction: 0 savable eviction: 0 eviction checks: 0 "
-                    "aged out: 0 stales: 0\nPrefetch entries: 0 bytes: 0B\nAlloc Megaclocks 0\n"
-                    "Allocated pages: 0 cached pages: 0\n",
-                    isLeafThreadSafe_ ? "thread-safe" : "non-thread-safe"),
-                ex.message());
+            ASSERT_THAT(
+                ex.message(),
+                HasSubstr(
+                    fmt::format(
+                        "allocate failed with 128.00MB from Memory Pool["
+                        "static_quota LEAF root[MemoryCapExceptions] "
+                        "parent[MemoryCapExceptions] MMAP track-usage {}]",
+                        isLeafThreadSafe_ ? "thread-safe"
+                                          : "non-thread-safe")));
+            ASSERT_THAT(
+                ex.message(),
+                HasSubstr("Failed to evict from cache state: AsyncDataCache:"));
           } else {
             ASSERT_EQ(
                 fmt::format(
@@ -781,7 +860,9 @@ TEST_P(MemoryPoolTest, memoryCapExceptions) {
                     "parent[MemoryCapExceptions] MMAP track-usage {}]<max "
                     "capacity 256.00MB capacity 256.00MB used 0B available 0B "
                     "reservation [used 0B, reserved 0B, min 0B] counters [allocs "
-                    "1, frees 0, reserves 0, releases 0, collisions 0])> "
+                    "1, frees 0, reserves 0, releases 0, collisions 0, "
+                    "external-allocs 0, external-frees 0, cumulative-external "
+                    "0B])> "
                     "Exceeded memory allocator limit when allocating 32769 "
                     "new pages for total allocation of 32769 pages, the memory"
                     " allocator capacity is 32768 pages, the allocated pages is 32769",
@@ -790,23 +871,18 @@ TEST_P(MemoryPoolTest, memoryCapExceptions) {
           }
         } else {
           if (useCache_) {
-            ASSERT_EQ(
-                fmt::format(
-                    "allocate failed with 128.00MB from Memory Pool"
-                    "[static_quota LEAF root[MemoryCapExceptions] "
-                    "parent[MemoryCapExceptions] MALLOC track-usage {}]"
-                    "<max capacity 256.00MB capacity 256.00MB used 0B available "
-                    "0B reservation [used 0B, reserved 0B, min 0B] counters "
-                    "[allocs 1, frees 0, reserves 0, releases 0, collisions 0])>"
-                    " Failed to evict from cache state: AsyncDataCache:\nCache "
-                    "size: 0B tinySize: 0B large size: 0B\nCache entries: 0 "
-                    "read pins: 0 write pins: 0 pinned shared: 0B pinned "
-                    "exclusive: 0B\n num write wait: 0 empty entries: 0\nCache "
-                    "access miss: 0 hit: 0 hit bytes: 0B eviction: 0 savable eviction: 0 eviction "
-                    "checks: 0 aged out: 0 stales: 0\nPrefetch entries: 0 bytes: 0B\nAlloc Megaclocks"
-                    " 0\nAllocated pages: 0 cached pages: 0\n",
-                    isLeafThreadSafe_ ? "thread-safe" : "non-thread-safe"),
-                ex.message());
+            ASSERT_THAT(
+                ex.message(),
+                HasSubstr(
+                    fmt::format(
+                        "allocate failed with 128.00MB from Memory Pool"
+                        "[static_quota LEAF root[MemoryCapExceptions] "
+                        "parent[MemoryCapExceptions] MALLOC track-usage {}]",
+                        isLeafThreadSafe_ ? "thread-safe"
+                                          : "non-thread-safe")));
+            ASSERT_THAT(
+                ex.message(),
+                HasSubstr("Failed to evict from cache state: AsyncDataCache:"));
           } else {
             ASSERT_EQ(
                 fmt::format(
@@ -815,7 +891,9 @@ TEST_P(MemoryPoolTest, memoryCapExceptions) {
                     "parent[MemoryCapExceptions] MALLOC track-usage {}]"
                     "<max capacity 256.00MB capacity 256.00MB used 0B available "
                     "0B reservation [used 0B, reserved 0B, min 0B] counters "
-                    "[allocs 1, frees 0, reserves 0, releases 0, collisions 0])>"
+                    "[allocs 1, frees 0, reserves 0, releases 0, collisions 0, "
+                    "external-allocs 0, external-frees 0, cumulative-external "
+                    "0B])>"
                     " Failed to allocateBytes 128.00MB: Exceeded memory "
                     "allocator limit of 128.00MB",
                     isLeafThreadSafe_ ? "thread-safe" : "non-thread-safe"),
@@ -832,7 +910,7 @@ TEST(MemoryPoolTest, GetAlignment) {
     MemoryManager::Options options;
     options.allocatorCapacity = kMaxMemory;
     EXPECT_EQ(
-        MemoryAllocator::kMaxAlignment,
+        MemoryAllocator::kDefaultAlignment,
         MemoryManager{options}.addRootPool()->alignment());
   }
   {
@@ -842,6 +920,56 @@ TEST(MemoryPoolTest, GetAlignment) {
     MemoryManager manager{options};
     EXPECT_EQ(64, manager.addRootPool()->alignment());
   }
+}
+
+TEST(MemoryPoolTest, allocateAligned) {
+  MemoryManager::testingSetInstance({});
+  auto pool = memoryManager()->addLeafPool("allocateAlignedTest");
+
+  struct TestCase {
+    int64_t size;
+    uint32_t alignment;
+    std::string debugString() const {
+      return fmt::format("size={}, alignment={}", size, alignment);
+    }
+  };
+  std::vector<TestCase> testCases = {
+      {4'096, 4'096},
+      {8'192, 4'096},
+      {4'096, 128},
+      {1'024, 512},
+      {16'384, 4'096},
+  };
+
+  for (const auto& testCase : testCases) {
+    SCOPED_TRACE(testCase.debugString());
+    auto* buffer = pool->allocateAligned(testCase.size, testCase.alignment);
+    ASSERT_NE(buffer, nullptr);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(buffer) % testCase.alignment, 0);
+    std::memset(buffer, 0x42, testCase.size);
+    pool->freeAligned(buffer, testCase.size, testCase.alignment);
+  }
+}
+
+TEST(MemoryPoolTest, allocateAlignedInvalidAlignment) {
+  MemoryManager::testingSetInstance({});
+  auto pool = memoryManager()->addLeafPool("allocateAlignedInvalidTest");
+
+  VELOX_ASSERT_THROW(pool->allocateAligned(4'096, 3), "power of two");
+  VELOX_ASSERT_THROW(pool->allocateAligned(0, 4'096), "");
+}
+
+TEST(MemoryPoolTest, allocateAlignedTracksUsage) {
+  MemoryManager::testingSetInstance({});
+  auto root =
+      memoryManager()->addRootPool("allocateAlignedUsageRoot", kMaxMemory);
+  auto pool = root->addLeafChild("allocateAlignedUsageTest");
+
+  const auto statsBefore = pool->stats();
+  auto* buffer = pool->allocateAligned(4'096, 4'096);
+  EXPECT_GT(pool->stats().numAllocs, statsBefore.numAllocs);
+  pool->freeAligned(buffer, 4'096, 4'096);
+  EXPECT_GT(pool->stats().numFrees, statsBefore.numFrees);
 }
 
 TEST_P(MemoryPoolTest, MemoryManagerGlobalCap) {
@@ -1059,6 +1187,22 @@ TEST_P(MemoryPoolTest, allocatorOverflow) {
   StlAllocator<int64_t> alloc(pool);
   EXPECT_THROW(alloc.allocate(1ULL << 62), VeloxException);
   EXPECT_THROW(alloc.deallocate(nullptr, 1ULL << 62), VeloxException);
+}
+
+TEST_P(MemoryPoolTest, allocatorSwap) {
+  MemoryManager& manager = *getMemoryManager();
+  auto root = manager.addRootPool("swapRoot");
+  auto leaf1 = root->addLeafChild("leaf1");
+  auto leaf2 = root->addLeafChild("leaf2");
+
+  StlAllocator<int64_t> alloc1(*leaf1);
+  StlAllocator<int64_t> alloc2(*leaf2);
+  ASSERT_EQ(alloc1.pool, leaf1.get());
+  ASSERT_EQ(alloc2.pool, leaf2.get());
+
+  std::swap(alloc1, alloc2);
+  EXPECT_EQ(alloc1.pool, leaf2.get());
+  EXPECT_EQ(alloc2.pool, leaf1.get());
 }
 
 TEST_P(MemoryPoolTest, contiguousAllocate) {
@@ -1402,71 +1546,73 @@ TEST_P(MemoryPoolTest, persistentNonContiguousAllocateFailure) {
           static_cast<uint64_t>(numNewPages),
           injectedFailure);
     }
-  } testSettings[] = {// Cap failure injection.
-                      {0, 100, MemoryAllocator::InjectedFailure::kCap},
-                      {0,
-                       Allocation::PageRun::kMaxPagesInRun / 2,
-                       MemoryAllocator::InjectedFailure::kCap},
-                      {0,
-                       Allocation::PageRun::kMaxPagesInRun,
-                       MemoryAllocator::InjectedFailure::kCap},
-                      {100, 100, MemoryAllocator::InjectedFailure::kCap},
-                      {Allocation::PageRun::kMaxPagesInRun / 2,
-                       Allocation::PageRun::kMaxPagesInRun / 2,
-                       MemoryAllocator::InjectedFailure::kCap},
-                      {Allocation::PageRun::kMaxPagesInRun,
-                       Allocation::PageRun::kMaxPagesInRun,
-                       MemoryAllocator::InjectedFailure::kCap},
-                      {200, 100, MemoryAllocator::InjectedFailure::kCap},
-                      {Allocation::PageRun::kMaxPagesInRun / 2 + 100,
-                       Allocation::PageRun::kMaxPagesInRun / 2,
-                       MemoryAllocator::InjectedFailure::kCap},
-                      {Allocation::PageRun::kMaxPagesInRun,
-                       Allocation::PageRun::kMaxPagesInRun - 1,
-                       MemoryAllocator::InjectedFailure::kCap},
-                      {Allocation::PageRun::kMaxPagesInRun,
-                       Allocation::PageRun::kMaxPagesInRun / 2,
-                       MemoryAllocator::InjectedFailure::kCap},
-                      // Allocate failure injection.
-                      {0, 100, MemoryAllocator::InjectedFailure::kAllocate},
-                      {0,
-                       Allocation::PageRun::kMaxPagesInRun / 2,
-                       MemoryAllocator::InjectedFailure::kAllocate},
-                      {0,
-                       Allocation::PageRun::kMaxPagesInRun,
-                       MemoryAllocator::InjectedFailure::kCap},
-                      {100, 100, MemoryAllocator::InjectedFailure::kAllocate},
-                      {Allocation::PageRun::kMaxPagesInRun / 2,
-                       Allocation::PageRun::kMaxPagesInRun / 2,
-                       MemoryAllocator::InjectedFailure::kAllocate},
-                      {Allocation::PageRun::kMaxPagesInRun,
-                       Allocation::PageRun::kMaxPagesInRun,
-                       MemoryAllocator::InjectedFailure::kAllocate},
-                      {200, 100, MemoryAllocator::InjectedFailure::kAllocate},
-                      {Allocation::PageRun::kMaxPagesInRun / 2 + 100,
-                       Allocation::PageRun::kMaxPagesInRun / 2,
-                       MemoryAllocator::InjectedFailure::kAllocate},
-                      {Allocation::PageRun::kMaxPagesInRun,
-                       Allocation::PageRun::kMaxPagesInRun - 1,
-                       MemoryAllocator::InjectedFailure::kAllocate},
-                      {Allocation::PageRun::kMaxPagesInRun,
-                       Allocation::PageRun::kMaxPagesInRun / 2,
-                       MemoryAllocator::InjectedFailure::kAllocate},
-                      // Madvise failure injection.
-                      {0, 100, MemoryAllocator::InjectedFailure::kMadvise},
-                      {0,
-                       Allocation::PageRun::kMaxPagesInRun / 2,
-                       MemoryAllocator::InjectedFailure::kMadvise},
-                      {0,
-                       Allocation::PageRun::kMaxPagesInRun,
-                       MemoryAllocator::InjectedFailure::kMadvise},
-                      {200, 100, MemoryAllocator::InjectedFailure::kMadvise}};
+  } testSettings[] = {
+      // Cap failure injection.
+      {0, 100, MemoryAllocator::InjectedFailure::kCap},
+      {0,
+       Allocation::PageRun::kMaxPagesInRun / 2,
+       MemoryAllocator::InjectedFailure::kCap},
+      {0,
+       Allocation::PageRun::kMaxPagesInRun,
+       MemoryAllocator::InjectedFailure::kCap},
+      {100, 100, MemoryAllocator::InjectedFailure::kCap},
+      {Allocation::PageRun::kMaxPagesInRun / 2,
+       Allocation::PageRun::kMaxPagesInRun / 2,
+       MemoryAllocator::InjectedFailure::kCap},
+      {Allocation::PageRun::kMaxPagesInRun,
+       Allocation::PageRun::kMaxPagesInRun,
+       MemoryAllocator::InjectedFailure::kCap},
+      {200, 100, MemoryAllocator::InjectedFailure::kCap},
+      {Allocation::PageRun::kMaxPagesInRun / 2 + 100,
+       Allocation::PageRun::kMaxPagesInRun / 2,
+       MemoryAllocator::InjectedFailure::kCap},
+      {Allocation::PageRun::kMaxPagesInRun,
+       Allocation::PageRun::kMaxPagesInRun - 1,
+       MemoryAllocator::InjectedFailure::kCap},
+      {Allocation::PageRun::kMaxPagesInRun,
+       Allocation::PageRun::kMaxPagesInRun / 2,
+       MemoryAllocator::InjectedFailure::kCap},
+      // Allocate failure injection.
+      {0, 100, MemoryAllocator::InjectedFailure::kAllocate},
+      {0,
+       Allocation::PageRun::kMaxPagesInRun / 2,
+       MemoryAllocator::InjectedFailure::kAllocate},
+      {0,
+       Allocation::PageRun::kMaxPagesInRun,
+       MemoryAllocator::InjectedFailure::kCap},
+      {100, 100, MemoryAllocator::InjectedFailure::kAllocate},
+      {Allocation::PageRun::kMaxPagesInRun / 2,
+       Allocation::PageRun::kMaxPagesInRun / 2,
+       MemoryAllocator::InjectedFailure::kAllocate},
+      {Allocation::PageRun::kMaxPagesInRun,
+       Allocation::PageRun::kMaxPagesInRun,
+       MemoryAllocator::InjectedFailure::kAllocate},
+      {200, 100, MemoryAllocator::InjectedFailure::kAllocate},
+      {Allocation::PageRun::kMaxPagesInRun / 2 + 100,
+       Allocation::PageRun::kMaxPagesInRun / 2,
+       MemoryAllocator::InjectedFailure::kAllocate},
+      {Allocation::PageRun::kMaxPagesInRun,
+       Allocation::PageRun::kMaxPagesInRun - 1,
+       MemoryAllocator::InjectedFailure::kAllocate},
+      {Allocation::PageRun::kMaxPagesInRun,
+       Allocation::PageRun::kMaxPagesInRun / 2,
+       MemoryAllocator::InjectedFailure::kAllocate},
+      // Madvise failure injection.
+      {0, 100, MemoryAllocator::InjectedFailure::kMadvise},
+      {0,
+       Allocation::PageRun::kMaxPagesInRun / 2,
+       MemoryAllocator::InjectedFailure::kMadvise},
+      {0,
+       Allocation::PageRun::kMaxPagesInRun,
+       MemoryAllocator::InjectedFailure::kMadvise},
+      {200, 100, MemoryAllocator::InjectedFailure::kMadvise}};
   for (const auto& testData : testSettings) {
-    SCOPED_TRACE(fmt::format(
-        "{}, useMmap:{}, useCache:{}",
-        testData.debugString(),
-        useMmap_,
-        useCache_));
+    SCOPED_TRACE(
+        fmt::format(
+            "{}, useMmap:{}, useCache:{}",
+            testData.debugString(),
+            useMmap_,
+            useCache_));
     if ((testData.injectedFailure !=
          MemoryAllocator::InjectedFailure::kAllocate) &&
         !useMmap_) {
@@ -1584,11 +1730,12 @@ TEST_P(MemoryPoolTest, transientNonContiguousAllocateFailure) {
        MemoryAllocator::InjectedFailure::kMadvise},
       {200, 100, 100, MemoryAllocator::InjectedFailure::kMadvise}};
   for (const auto& testData : testSettings) {
-    SCOPED_TRACE(fmt::format(
-        "{}, useMmap:{}, useCache:{}",
-        testData.debugString(),
-        useMmap_,
-        useCache_));
+    SCOPED_TRACE(
+        fmt::format(
+            "{}, useMmap:{}, useCache:{}",
+            testData.debugString(),
+            useMmap_,
+            useCache_));
     if ((testData.injectedFailure !=
          MemoryAllocator::InjectedFailure::kAllocate) &&
         !useMmap_) {
@@ -1672,81 +1819,82 @@ TEST_P(MemoryPoolTest, persistentContiguousAllocateFailure) {
           numNewPages,
           injectedFailure);
     }
-  } testSettings[] = {// Cap failure injection.
-                      {0, 100, MemoryAllocator::InjectedFailure::kCap},
-                      {0,
-                       Allocation::PageRun::kMaxPagesInRun / 2,
-                       MemoryAllocator::InjectedFailure::kCap},
-                      {0,
-                       Allocation::PageRun::kMaxPagesInRun,
-                       MemoryAllocator::InjectedFailure::kCap},
-                      {100, 100, MemoryAllocator::InjectedFailure::kCap},
-                      {Allocation::PageRun::kMaxPagesInRun / 2,
-                       Allocation::PageRun::kMaxPagesInRun / 2,
-                       MemoryAllocator::InjectedFailure::kCap},
-                      {Allocation::PageRun::kMaxPagesInRun,
-                       Allocation::PageRun::kMaxPagesInRun,
-                       MemoryAllocator::InjectedFailure::kCap},
-                      {200, 100, MemoryAllocator::InjectedFailure::kCap},
-                      {Allocation::PageRun::kMaxPagesInRun / 2 + 100,
-                       Allocation::PageRun::kMaxPagesInRun / 2,
-                       MemoryAllocator::InjectedFailure::kCap},
-                      {Allocation::PageRun::kMaxPagesInRun,
-                       Allocation::PageRun::kMaxPagesInRun - 1,
-                       MemoryAllocator::InjectedFailure::kCap},
-                      {Allocation::PageRun::kMaxPagesInRun,
-                       Allocation::PageRun::kMaxPagesInRun / 2,
-                       MemoryAllocator::InjectedFailure::kCap},
-                      // Mmap failure injection.
-                      {0, 100, MemoryAllocator::InjectedFailure::kMmap},
-                      {0,
-                       Allocation::PageRun::kMaxPagesInRun / 2,
-                       MemoryAllocator::InjectedFailure::kMmap},
-                      {0,
-                       Allocation::PageRun::kMaxPagesInRun,
-                       MemoryAllocator::InjectedFailure::kCap},
-                      {100, 100, MemoryAllocator::InjectedFailure::kMmap},
-                      {Allocation::PageRun::kMaxPagesInRun / 2,
-                       Allocation::PageRun::kMaxPagesInRun / 2,
-                       MemoryAllocator::InjectedFailure::kMmap},
-                      {Allocation::PageRun::kMaxPagesInRun,
-                       Allocation::PageRun::kMaxPagesInRun,
-                       MemoryAllocator::InjectedFailure::kMmap},
-                      {200, 100, MemoryAllocator::InjectedFailure::kMmap},
-                      {Allocation::PageRun::kMaxPagesInRun / 2 + 100,
-                       Allocation::PageRun::kMaxPagesInRun / 2,
-                       MemoryAllocator::InjectedFailure::kMmap},
-                      {Allocation::PageRun::kMaxPagesInRun,
-                       Allocation::PageRun::kMaxPagesInRun - 1,
-                       MemoryAllocator::InjectedFailure::kMmap},
-                      {Allocation::PageRun::kMaxPagesInRun,
-                       Allocation::PageRun::kMaxPagesInRun / 2,
-                       MemoryAllocator::InjectedFailure::kMmap},
-                      // Madvise failure injection.
-                      {0, 100, MemoryAllocator::InjectedFailure::kMadvise},
-                      {0,
-                       Allocation::PageRun::kMaxPagesInRun / 2,
-                       MemoryAllocator::InjectedFailure::kMadvise},
-                      {0,
-                       Allocation::PageRun::kMaxPagesInRun,
-                       MemoryAllocator::InjectedFailure::kMadvise},
-                      {100, 100, MemoryAllocator::InjectedFailure::kMadvise},
-                      {Allocation::PageRun::kMaxPagesInRun / 2,
-                       Allocation::PageRun::kMaxPagesInRun / 2,
-                       MemoryAllocator::InjectedFailure::kMadvise},
-                      {Allocation::PageRun::kMaxPagesInRun,
-                       Allocation::PageRun::kMaxPagesInRun,
-                       MemoryAllocator::InjectedFailure::kMadvise},
-                      {200, 100, MemoryAllocator::InjectedFailure::kMadvise},
-                      {Allocation::PageRun::kMaxPagesInRun / 2 + 100,
-                       Allocation::PageRun::kMaxPagesInRun / 2,
-                       MemoryAllocator::InjectedFailure::kMadvise},
-                      {Allocation::PageRun::kMaxPagesInRun,
-                       Allocation::PageRun::kMaxPagesInRun - 1,
-                       MemoryAllocator::InjectedFailure::kMadvise},
-                      {Allocation::PageRun::kMaxPagesInRun,
-                       Allocation::PageRun::kMaxPagesInRun / 2,
-                       MemoryAllocator::InjectedFailure::kMadvise}};
+  } testSettings[] = {
+      // Cap failure injection.
+      {0, 100, MemoryAllocator::InjectedFailure::kCap},
+      {0,
+       Allocation::PageRun::kMaxPagesInRun / 2,
+       MemoryAllocator::InjectedFailure::kCap},
+      {0,
+       Allocation::PageRun::kMaxPagesInRun,
+       MemoryAllocator::InjectedFailure::kCap},
+      {100, 100, MemoryAllocator::InjectedFailure::kCap},
+      {Allocation::PageRun::kMaxPagesInRun / 2,
+       Allocation::PageRun::kMaxPagesInRun / 2,
+       MemoryAllocator::InjectedFailure::kCap},
+      {Allocation::PageRun::kMaxPagesInRun,
+       Allocation::PageRun::kMaxPagesInRun,
+       MemoryAllocator::InjectedFailure::kCap},
+      {200, 100, MemoryAllocator::InjectedFailure::kCap},
+      {Allocation::PageRun::kMaxPagesInRun / 2 + 100,
+       Allocation::PageRun::kMaxPagesInRun / 2,
+       MemoryAllocator::InjectedFailure::kCap},
+      {Allocation::PageRun::kMaxPagesInRun,
+       Allocation::PageRun::kMaxPagesInRun - 1,
+       MemoryAllocator::InjectedFailure::kCap},
+      {Allocation::PageRun::kMaxPagesInRun,
+       Allocation::PageRun::kMaxPagesInRun / 2,
+       MemoryAllocator::InjectedFailure::kCap},
+      // Mmap failure injection.
+      {0, 100, MemoryAllocator::InjectedFailure::kMmap},
+      {0,
+       Allocation::PageRun::kMaxPagesInRun / 2,
+       MemoryAllocator::InjectedFailure::kMmap},
+      {0,
+       Allocation::PageRun::kMaxPagesInRun,
+       MemoryAllocator::InjectedFailure::kCap},
+      {100, 100, MemoryAllocator::InjectedFailure::kMmap},
+      {Allocation::PageRun::kMaxPagesInRun / 2,
+       Allocation::PageRun::kMaxPagesInRun / 2,
+       MemoryAllocator::InjectedFailure::kMmap},
+      {Allocation::PageRun::kMaxPagesInRun,
+       Allocation::PageRun::kMaxPagesInRun,
+       MemoryAllocator::InjectedFailure::kMmap},
+      {200, 100, MemoryAllocator::InjectedFailure::kMmap},
+      {Allocation::PageRun::kMaxPagesInRun / 2 + 100,
+       Allocation::PageRun::kMaxPagesInRun / 2,
+       MemoryAllocator::InjectedFailure::kMmap},
+      {Allocation::PageRun::kMaxPagesInRun,
+       Allocation::PageRun::kMaxPagesInRun - 1,
+       MemoryAllocator::InjectedFailure::kMmap},
+      {Allocation::PageRun::kMaxPagesInRun,
+       Allocation::PageRun::kMaxPagesInRun / 2,
+       MemoryAllocator::InjectedFailure::kMmap},
+      // Madvise failure injection.
+      {0, 100, MemoryAllocator::InjectedFailure::kMadvise},
+      {0,
+       Allocation::PageRun::kMaxPagesInRun / 2,
+       MemoryAllocator::InjectedFailure::kMadvise},
+      {0,
+       Allocation::PageRun::kMaxPagesInRun,
+       MemoryAllocator::InjectedFailure::kMadvise},
+      {100, 100, MemoryAllocator::InjectedFailure::kMadvise},
+      {Allocation::PageRun::kMaxPagesInRun / 2,
+       Allocation::PageRun::kMaxPagesInRun / 2,
+       MemoryAllocator::InjectedFailure::kMadvise},
+      {Allocation::PageRun::kMaxPagesInRun,
+       Allocation::PageRun::kMaxPagesInRun,
+       MemoryAllocator::InjectedFailure::kMadvise},
+      {200, 100, MemoryAllocator::InjectedFailure::kMadvise},
+      {Allocation::PageRun::kMaxPagesInRun / 2 + 100,
+       Allocation::PageRun::kMaxPagesInRun / 2,
+       MemoryAllocator::InjectedFailure::kMadvise},
+      {Allocation::PageRun::kMaxPagesInRun,
+       Allocation::PageRun::kMaxPagesInRun - 1,
+       MemoryAllocator::InjectedFailure::kMadvise},
+      {Allocation::PageRun::kMaxPagesInRun,
+       Allocation::PageRun::kMaxPagesInRun / 2,
+       MemoryAllocator::InjectedFailure::kMadvise}};
   for (const auto& testData : testSettings) {
     SCOPED_TRACE(testData.debugString());
     if (!useMmap_) {
@@ -1790,87 +1938,89 @@ TEST_P(MemoryPoolTest, transientContiguousAllocateFailure) {
           numNewPages,
           injectedFailure);
     }
-  } testSettings[] = {// Cap failure injection.
-                      {0, 100, MemoryAllocator::InjectedFailure::kCap},
-                      {0,
-                       Allocation::PageRun::kMaxPagesInRun / 2,
-                       MemoryAllocator::InjectedFailure::kCap},
-                      {0,
-                       Allocation::PageRun::kMaxPagesInRun,
-                       MemoryAllocator::InjectedFailure::kCap},
-                      {100, 100, MemoryAllocator::InjectedFailure::kCap},
-                      {Allocation::PageRun::kMaxPagesInRun / 2,
-                       Allocation::PageRun::kMaxPagesInRun / 2,
-                       MemoryAllocator::InjectedFailure::kCap},
-                      {Allocation::PageRun::kMaxPagesInRun,
-                       Allocation::PageRun::kMaxPagesInRun,
-                       MemoryAllocator::InjectedFailure::kCap},
-                      {200, 100, MemoryAllocator::InjectedFailure::kCap},
-                      {Allocation::PageRun::kMaxPagesInRun / 2 + 100,
-                       Allocation::PageRun::kMaxPagesInRun / 2,
-                       MemoryAllocator::InjectedFailure::kCap},
-                      {Allocation::PageRun::kMaxPagesInRun,
-                       Allocation::PageRun::kMaxPagesInRun - 1,
-                       MemoryAllocator::InjectedFailure::kCap},
-                      {Allocation::PageRun::kMaxPagesInRun,
-                       Allocation::PageRun::kMaxPagesInRun / 2,
-                       MemoryAllocator::InjectedFailure::kCap},
-                      // Mmap failure injection.
-                      {0, 100, MemoryAllocator::InjectedFailure::kMmap},
-                      {0,
-                       Allocation::PageRun::kMaxPagesInRun / 2,
-                       MemoryAllocator::InjectedFailure::kMmap},
-                      {0,
-                       Allocation::PageRun::kMaxPagesInRun,
-                       MemoryAllocator::InjectedFailure::kCap},
-                      {100, 100, MemoryAllocator::InjectedFailure::kMmap},
-                      {Allocation::PageRun::kMaxPagesInRun / 2,
-                       Allocation::PageRun::kMaxPagesInRun / 2,
-                       MemoryAllocator::InjectedFailure::kMmap},
-                      {Allocation::PageRun::kMaxPagesInRun,
-                       Allocation::PageRun::kMaxPagesInRun,
-                       MemoryAllocator::InjectedFailure::kMmap},
-                      {200, 100, MemoryAllocator::InjectedFailure::kMmap},
-                      {Allocation::PageRun::kMaxPagesInRun / 2 + 100,
-                       Allocation::PageRun::kMaxPagesInRun / 2,
-                       MemoryAllocator::InjectedFailure::kMmap},
-                      {Allocation::PageRun::kMaxPagesInRun,
-                       Allocation::PageRun::kMaxPagesInRun - 1,
-                       MemoryAllocator::InjectedFailure::kMmap},
-                      {Allocation::PageRun::kMaxPagesInRun,
-                       Allocation::PageRun::kMaxPagesInRun / 2,
-                       MemoryAllocator::InjectedFailure::kMmap},
-                      // Madvise failure injection.
-                      {0, 100, MemoryAllocator::InjectedFailure::kMadvise},
-                      {0,
-                       Allocation::PageRun::kMaxPagesInRun / 2,
-                       MemoryAllocator::InjectedFailure::kMadvise},
-                      {0,
-                       Allocation::PageRun::kMaxPagesInRun,
-                       MemoryAllocator::InjectedFailure::kMadvise},
-                      {100, 100, MemoryAllocator::InjectedFailure::kMadvise},
-                      {Allocation::PageRun::kMaxPagesInRun / 2,
-                       Allocation::PageRun::kMaxPagesInRun / 2,
-                       MemoryAllocator::InjectedFailure::kMadvise},
-                      {Allocation::PageRun::kMaxPagesInRun,
-                       Allocation::PageRun::kMaxPagesInRun,
-                       MemoryAllocator::InjectedFailure::kMadvise},
-                      {200, 100, MemoryAllocator::InjectedFailure::kMadvise},
-                      {Allocation::PageRun::kMaxPagesInRun / 2 + 100,
-                       Allocation::PageRun::kMaxPagesInRun / 2,
-                       MemoryAllocator::InjectedFailure::kMadvise},
-                      {Allocation::PageRun::kMaxPagesInRun,
-                       Allocation::PageRun::kMaxPagesInRun - 1,
-                       MemoryAllocator::InjectedFailure::kMadvise},
-                      {Allocation::PageRun::kMaxPagesInRun,
-                       Allocation::PageRun::kMaxPagesInRun / 2,
-                       MemoryAllocator::InjectedFailure::kMadvise}};
+  } testSettings[] = {
+      // Cap failure injection.
+      {0, 100, MemoryAllocator::InjectedFailure::kCap},
+      {0,
+       Allocation::PageRun::kMaxPagesInRun / 2,
+       MemoryAllocator::InjectedFailure::kCap},
+      {0,
+       Allocation::PageRun::kMaxPagesInRun,
+       MemoryAllocator::InjectedFailure::kCap},
+      {100, 100, MemoryAllocator::InjectedFailure::kCap},
+      {Allocation::PageRun::kMaxPagesInRun / 2,
+       Allocation::PageRun::kMaxPagesInRun / 2,
+       MemoryAllocator::InjectedFailure::kCap},
+      {Allocation::PageRun::kMaxPagesInRun,
+       Allocation::PageRun::kMaxPagesInRun,
+       MemoryAllocator::InjectedFailure::kCap},
+      {200, 100, MemoryAllocator::InjectedFailure::kCap},
+      {Allocation::PageRun::kMaxPagesInRun / 2 + 100,
+       Allocation::PageRun::kMaxPagesInRun / 2,
+       MemoryAllocator::InjectedFailure::kCap},
+      {Allocation::PageRun::kMaxPagesInRun,
+       Allocation::PageRun::kMaxPagesInRun - 1,
+       MemoryAllocator::InjectedFailure::kCap},
+      {Allocation::PageRun::kMaxPagesInRun,
+       Allocation::PageRun::kMaxPagesInRun / 2,
+       MemoryAllocator::InjectedFailure::kCap},
+      // Mmap failure injection.
+      {0, 100, MemoryAllocator::InjectedFailure::kMmap},
+      {0,
+       Allocation::PageRun::kMaxPagesInRun / 2,
+       MemoryAllocator::InjectedFailure::kMmap},
+      {0,
+       Allocation::PageRun::kMaxPagesInRun,
+       MemoryAllocator::InjectedFailure::kCap},
+      {100, 100, MemoryAllocator::InjectedFailure::kMmap},
+      {Allocation::PageRun::kMaxPagesInRun / 2,
+       Allocation::PageRun::kMaxPagesInRun / 2,
+       MemoryAllocator::InjectedFailure::kMmap},
+      {Allocation::PageRun::kMaxPagesInRun,
+       Allocation::PageRun::kMaxPagesInRun,
+       MemoryAllocator::InjectedFailure::kMmap},
+      {200, 100, MemoryAllocator::InjectedFailure::kMmap},
+      {Allocation::PageRun::kMaxPagesInRun / 2 + 100,
+       Allocation::PageRun::kMaxPagesInRun / 2,
+       MemoryAllocator::InjectedFailure::kMmap},
+      {Allocation::PageRun::kMaxPagesInRun,
+       Allocation::PageRun::kMaxPagesInRun - 1,
+       MemoryAllocator::InjectedFailure::kMmap},
+      {Allocation::PageRun::kMaxPagesInRun,
+       Allocation::PageRun::kMaxPagesInRun / 2,
+       MemoryAllocator::InjectedFailure::kMmap},
+      // Madvise failure injection.
+      {0, 100, MemoryAllocator::InjectedFailure::kMadvise},
+      {0,
+       Allocation::PageRun::kMaxPagesInRun / 2,
+       MemoryAllocator::InjectedFailure::kMadvise},
+      {0,
+       Allocation::PageRun::kMaxPagesInRun,
+       MemoryAllocator::InjectedFailure::kMadvise},
+      {100, 100, MemoryAllocator::InjectedFailure::kMadvise},
+      {Allocation::PageRun::kMaxPagesInRun / 2,
+       Allocation::PageRun::kMaxPagesInRun / 2,
+       MemoryAllocator::InjectedFailure::kMadvise},
+      {Allocation::PageRun::kMaxPagesInRun,
+       Allocation::PageRun::kMaxPagesInRun,
+       MemoryAllocator::InjectedFailure::kMadvise},
+      {200, 100, MemoryAllocator::InjectedFailure::kMadvise},
+      {Allocation::PageRun::kMaxPagesInRun / 2 + 100,
+       Allocation::PageRun::kMaxPagesInRun / 2,
+       MemoryAllocator::InjectedFailure::kMadvise},
+      {Allocation::PageRun::kMaxPagesInRun,
+       Allocation::PageRun::kMaxPagesInRun - 1,
+       MemoryAllocator::InjectedFailure::kMadvise},
+      {Allocation::PageRun::kMaxPagesInRun,
+       Allocation::PageRun::kMaxPagesInRun / 2,
+       MemoryAllocator::InjectedFailure::kMadvise}};
   for (const auto& testData : testSettings) {
-    SCOPED_TRACE(fmt::format(
-        "{}, useCache:{} , useMmap:{}",
-        testData.debugString(),
-        useCache_,
-        useMmap_));
+    SCOPED_TRACE(
+        fmt::format(
+            "{}, useCache:{} , useMmap:{}",
+            testData.debugString(),
+            useCache_,
+            useMmap_));
     if (!useMmap_) {
       // No failure injections supported for contiguous allocation of
       // MallocAllocator.
@@ -1944,33 +2094,34 @@ TEST_P(MemoryPoolTest, persistentContiguousGrowAllocateFailure) {
           injectedFailure,
           expectedErrorMessage);
     }
-  } testSettings[] = {// Cap failure injection.
-                      {10,
-                       100,
-                       MemoryAllocator::InjectedFailure::kCap,
-                       "growContiguous failed with 100 pages from Memory Pool"},
-                      {100,
-                       10,
-                       MemoryAllocator::InjectedFailure::kCap,
-                       "growContiguous failed with 10 pages from Memory Pool"},
-                      // Mmap failure injection.
-                      {10,
-                       100,
-                       MemoryAllocator::InjectedFailure::kMmap,
-                       "growContiguous failed with 100 pages from Memory Pool"},
-                      {100,
-                       10,
-                       MemoryAllocator::InjectedFailure::kMmap,
-                       "growContiguous failed with 10 pages from Memory Pool"},
-                      // Madvise failure injection.
-                      {10,
-                       100,
-                       MemoryAllocator::InjectedFailure::kMadvise,
-                       "growContiguous failed with 100 pages from Memory Pool"},
-                      {100,
-                       10,
-                       MemoryAllocator::InjectedFailure::kMadvise,
-                       "growContiguous failed with 10 pages from Memory Pool"}};
+  } testSettings[] = {
+      // Cap failure injection.
+      {10,
+       100,
+       MemoryAllocator::InjectedFailure::kCap,
+       "growContiguous failed with 100 pages from Memory Pool"},
+      {100,
+       10,
+       MemoryAllocator::InjectedFailure::kCap,
+       "growContiguous failed with 10 pages from Memory Pool"},
+      // Mmap failure injection.
+      {10,
+       100,
+       MemoryAllocator::InjectedFailure::kMmap,
+       "growContiguous failed with 100 pages from Memory Pool"},
+      {100,
+       10,
+       MemoryAllocator::InjectedFailure::kMmap,
+       "growContiguous failed with 10 pages from Memory Pool"},
+      // Madvise failure injection.
+      {10,
+       100,
+       MemoryAllocator::InjectedFailure::kMadvise,
+       "growContiguous failed with 100 pages from Memory Pool"},
+      {100,
+       10,
+       MemoryAllocator::InjectedFailure::kMadvise,
+       "growContiguous failed with 10 pages from Memory Pool"}};
   for (const auto& testData : testSettings) {
     SCOPED_TRACE(testData.debugString());
     if (!useMmap_) {
@@ -2014,21 +2165,23 @@ TEST_P(MemoryPoolTest, transientContiguousGrowAllocateFailure) {
           numGrowPages,
           injectedFailure);
     }
-  } testSettings[] = {// Cap failure injection.
-                      {10, 100, MemoryAllocator::InjectedFailure::kCap},
-                      {100, 10, MemoryAllocator::InjectedFailure::kCap},
-                      // Mmap failure injection.
-                      {10, 100, MemoryAllocator::InjectedFailure::kMmap},
-                      {100, 10, MemoryAllocator::InjectedFailure::kMmap},
-                      // Madvise failure injection.
-                      {10, 100, MemoryAllocator::InjectedFailure::kMadvise},
-                      {100, 10, MemoryAllocator::InjectedFailure::kMadvise}};
+  } testSettings[] = {
+      // Cap failure injection.
+      {10, 100, MemoryAllocator::InjectedFailure::kCap},
+      {100, 10, MemoryAllocator::InjectedFailure::kCap},
+      // Mmap failure injection.
+      {10, 100, MemoryAllocator::InjectedFailure::kMmap},
+      {100, 10, MemoryAllocator::InjectedFailure::kMmap},
+      // Madvise failure injection.
+      {10, 100, MemoryAllocator::InjectedFailure::kMadvise},
+      {100, 10, MemoryAllocator::InjectedFailure::kMadvise}};
   for (const auto& testData : testSettings) {
-    SCOPED_TRACE(fmt::format(
-        "{}, useCache:{} , useMmap:{}",
-        testData.debugString(),
-        useCache_,
-        useMmap_));
+    SCOPED_TRACE(
+        fmt::format(
+            "{}, useCache:{} , useMmap:{}",
+            testData.debugString(),
+            useCache_,
+            useMmap_));
     if (!useMmap_) {
       // No failure injections supported for contiguous allocation of
       // MallocAllocator.
@@ -2520,7 +2673,6 @@ TEST_P(MemoryPoolTest, concurrentUpdateToDifferentPools) {
 }
 
 TEST_P(MemoryPoolTest, concurrentUpdatesToTheSamePool) {
-  FLAGS_velox_memory_pool_debug_enabled = true;
   if (!isLeafThreadSafe_) {
     return;
   }
@@ -2706,7 +2858,6 @@ TEST(MemoryPoolTest, visitChildren) {
 }
 
 TEST(MemoryPoolTest, debugMode) {
-  FLAGS_velox_memory_pool_debug_enabled = true;
   constexpr int64_t kMaxMemory = 10 * GB;
   constexpr int64_t kNumIterations = 100;
   const std::vector<int64_t> kAllocSizes = {128, 8 * KB, 2 * MB};
@@ -2726,12 +2877,23 @@ TEST(MemoryPoolTest, debugMode) {
                   ->addLeafChild("child");
   const auto& allocRecords = std::dynamic_pointer_cast<MemoryPoolImpl>(pool)
                                  ->testingDebugAllocRecords();
+
   std::vector<void*> smallAllocs;
+  smallAllocs.reserve(kNumIterations);
   for (int32_t i = 0; i < kNumIterations; i++) {
     smallAllocs.push_back(pool->allocate(kAllocSizes[0]));
   }
   EXPECT_EQ(allocRecords.size(), kNumIterations);
   checkAllocs(allocRecords, kAllocSizes[0]);
+
+  // Check toString() works with debug mode enabled
+  const auto poolString = pool->toString();
+  EXPECT_FALSE(poolString.empty());
+  EXPECT_TRUE(
+      poolString.find(
+          "======== 100 allocations of 12.50KB total size ========") !=
+      std::string::npos);
+
   for (int32_t i = 0; i < kNumIterations; i++) {
     pool->free(smallAllocs[i], kAllocSizes[0]);
   }
@@ -2779,14 +2941,16 @@ TEST(MemoryPoolTest, debugModeWithFilter) {
         "root0",
         kMaxMemory,
         nullptr,
-        debugEnabled ? std::optional(MemoryPool::DebugOptions{
-                           .debugPoolNameRegex = "NO-MATCH"})
-                     : std::nullopt);
+        debugEnabled
+            ? std::optional(
+                  MemoryPool::DebugOptions{.debugPoolNameRegex = "NO-MATCH"})
+            : std::nullopt);
     auto pool0_0 = root0->addLeafChild("PartialAggregation.0.0");
     auto* buffer0 = pool0_0->allocate(1 * KB);
-    EXPECT_TRUE(std::dynamic_pointer_cast<MemoryPoolImpl>(pool0_0)
-                    ->testingDebugAllocRecords()
-                    .empty());
+    EXPECT_TRUE(
+        std::dynamic_pointer_cast<MemoryPoolImpl>(pool0_0)
+            ->testingDebugAllocRecords()
+            .empty());
     pool0_0->free(buffer0, 1 * KB);
 
     // leaf child created from MemoryPool, match filter
@@ -2794,8 +2958,9 @@ TEST(MemoryPoolTest, debugModeWithFilter) {
         "root1",
         kMaxMemory,
         nullptr,
-        debugEnabled ? std::optional(MemoryPool::DebugOptions{
-                           .debugPoolNameRegex = ".*PartialAggregation.*"})
+        debugEnabled ? std::optional(
+                           MemoryPool::DebugOptions{
+                               .debugPoolNameRegex = ".*PartialAggregation.*"})
                      : std::nullopt);
     auto pool1_0 = root1->addLeafChild("PartialAggregation.0.1");
     auto* buffer1 = pool1_0->allocate(1 * KB);
@@ -2816,9 +2981,10 @@ TEST(MemoryPoolTest, debugModeWithFilter) {
 
     // old pool from root0 should not be affected by root1
     buffer0 = pool0_0->allocate(1 * KB);
-    EXPECT_TRUE(std::dynamic_pointer_cast<MemoryPoolImpl>(pool0_0)
-                    ->testingDebugAllocRecords()
-                    .empty());
+    EXPECT_TRUE(
+        std::dynamic_pointer_cast<MemoryPoolImpl>(pool0_0)
+            ->testingDebugAllocRecords()
+            .empty());
     pool0_0->free(buffer0, 1 * KB);
 
     // leaf child created from MemoryPool, match filter
@@ -2826,9 +2992,10 @@ TEST(MemoryPoolTest, debugModeWithFilter) {
         "root2",
         kMaxMemory,
         nullptr,
-        debugEnabled ? std::optional(MemoryPool::DebugOptions{
-                           .debugPoolNameRegex = ".*OrderBy.*"})
-                     : std::nullopt);
+        debugEnabled
+            ? std::optional(
+                  MemoryPool::DebugOptions{.debugPoolNameRegex = ".*OrderBy.*"})
+            : std::nullopt);
     auto pool2_0 = root2->addLeafChild("OrderBy.0.0");
     auto* buffer2 = pool2_0->allocate(1 * KB);
     if (!debugEnabled) {
@@ -2879,10 +3046,48 @@ TEST(MemoryPoolTest, debugModeWithFilter) {
     // leaf child created from MemoryManager, not match filter
     auto sysLeaf = manager.addLeafPool("Arbitrator.0.0");
     auto* buffer5 = sysLeaf->allocate(1 * KB);
-    EXPECT_TRUE(std::dynamic_pointer_cast<MemoryPoolImpl>(sysLeaf)
-                    ->testingDebugAllocRecords()
-                    .empty());
+    EXPECT_TRUE(
+        std::dynamic_pointer_cast<MemoryPoolImpl>(sysLeaf)
+            ->testingDebugAllocRecords()
+            .empty());
     sysLeaf->free(buffer5, 1 * KB);
+  }
+}
+
+TEST_P(MemoryPoolTest, debugModeWrapCapException) {
+  const uint64_t kMaxCap = 128L * MB;
+  MemoryManager::Options options;
+  options.allocatorCapacity = kMaxCap;
+  options.arbitratorCapacity = kMaxCap;
+  options.extraArbitratorConfigs = {
+      {std::string(SharedArbitrator::ExtraConfig::kReservedCapacity),
+       folly::to<std::string>(kMaxCap / 2) + "B"}};
+  setupMemory(options);
+  auto manager = getMemoryManager();
+  auto root =
+      manager->addRootPool("MemoryCapExceptions", kMaxCap, nullptr, {{".*"}});
+  auto pool1 = root->addLeafChild("static_quota_1", isLeafThreadSafe_);
+  auto pool2 = root->addLeafChild("static_quota_2", isLeafThreadSafe_);
+  {
+    std::vector<void*> buffers{
+        pool1->allocate(64L * MB), pool1->allocate(64L * MB)};
+    try {
+      pool2->allocate(1L * MB);
+    } catch (const velox::VeloxRuntimeError& ex) {
+      ASSERT_EQ(error_source::kErrorSourceRuntime.c_str(), ex.errorSource());
+      ASSERT_EQ(error_code::kMemCapExceeded.c_str(), ex.errorCode());
+      EXPECT_TRUE(
+          ex.message().find(
+              "Exceeded memory pool capacity.\n\n"
+              "======= Current Allocations ======\n"
+              "Memory pool 'static_quota_1' - Found 2 allocations with 128.00MB total size:\n"
+              "======== 2 allocations of 128.00MB total size ========") !=
+          std::string::npos)
+          << "Actual error message: " << ex.message();
+    }
+    for (auto buffer : buffers) {
+      pool1->free(buffer, 64L * MB);
+    }
   }
 }
 
@@ -3167,13 +3372,13 @@ TEST_P(MemoryPoolTest, usageTrackerOptionTest) {
   ASSERT_EQ(
       child->toString(),
       fmt::format(
-          "Memory Pool[usageTrackerOptionTest LEAF root[usageTrackerOptionTest] parent[usageTrackerOptionTest] {} track-usage {}]<unlimited max capacity unlimited capacity used 0B available 0B reservation [used 0B, reserved 0B, min 0B] counters [allocs 0, frees 0, reserves 0, releases 0, collisions 0])>",
+          "Memory Pool[usageTrackerOptionTest LEAF root[usageTrackerOptionTest] parent[usageTrackerOptionTest] {} track-usage {}]<unlimited max capacity unlimited capacity used 0B available 0B reservation [used 0B, reserved 0B, min 0B] counters [allocs 0, frees 0, reserves 0, releases 0, collisions 0, external-allocs 0, external-frees 0, cumulative-external 0B])>",
           useMmap_ ? "MMAP" : "MALLOC",
           isLeafThreadSafe_ ? "thread-safe" : "non-thread-safe"));
   ASSERT_EQ(
       root->toString(),
       fmt::format(
-          "Memory Pool[usageTrackerOptionTest AGGREGATE root[usageTrackerOptionTest] parent[null] {} track-usage thread-safe]<unlimited max capacity unlimited capacity used 0B available 0B reservation [used 0B, reserved 0B, min 0B] counters [allocs 0, frees 0, reserves 0, releases 0, collisions 0])>",
+          "Memory Pool[usageTrackerOptionTest AGGREGATE root[usageTrackerOptionTest] parent[null] {} track-usage thread-safe]<unlimited max capacity unlimited capacity used 0B available 0B reservation [used 0B, reserved 0B, min 0B] counters [allocs 0, frees 0, reserves 0, releases 0, collisions 0, external-allocs 0, external-frees 0, cumulative-external 0B])>",
           useMmap_ ? "MMAP" : "MALLOC"));
 }
 
@@ -3190,54 +3395,54 @@ TEST_P(MemoryPoolTest, statsAndToString) {
   void* buf1 = leafChild1->allocate(bufferSize);
   ASSERT_EQ(
       leafChild1->stats().toString(),
-      "usedBytes:1.00KB reservedBytes:1.00MB peakBytes:1.00KB cumulativeBytes:1.00KB numAllocs:1 numFrees:0 numReserves:0 numReleases:0 numShrinks:0 numReclaims:0 numCollisions:0 numCapacityGrowths:0");
+      "usedBytes:1.00KB reservedBytes:1.00MB peakBytes:1.00KB cumulativeBytes:1.00KB numAllocs:1 numFrees:0 numReserves:0 numReleases:0 numShrinks:0 numReclaims:0 numCollisions:0 numCapacityGrowths:0 numExternalAllocs:0 numExternalFrees:0 cumulativeExternalBytes:0B");
   ASSERT_EQ(
       leafChild1->toString(),
       fmt::format(
-          "Memory Pool[leaf-child1 LEAF root[stats] parent[stats] {} track-usage {}]<max capacity 4.00GB capacity 4.00GB used 1.00KB available 1023.00KB reservation [used 1.00KB, reserved 1.00MB, min 0B] counters [allocs 1, frees 0, reserves 0, releases 0, collisions 0])>",
+          "Memory Pool[leaf-child1 LEAF root[stats] parent[stats] {} track-usage {}]<max capacity 4.00GB capacity 4.00GB used 1.00KB available 1023.00KB reservation [used 1.00KB, reserved 1.00MB, min 0B] counters [allocs 1, frees 0, reserves 0, releases 0, collisions 0, external-allocs 0, external-frees 0, cumulative-external 0B])>",
           useMmap_ ? "MMAP" : "MALLOC",
           isLeafThreadSafe_ ? "thread-safe" : "non-thread-safe"));
   ASSERT_EQ(
       leafChild2->stats().toString(),
-      "usedBytes:0B reservedBytes:0B peakBytes:0B cumulativeBytes:0B numAllocs:0 numFrees:0 numReserves:0 numReleases:0 numShrinks:0 numReclaims:0 numCollisions:0 numCapacityGrowths:0");
+      "usedBytes:0B reservedBytes:0B peakBytes:0B cumulativeBytes:0B numAllocs:0 numFrees:0 numReserves:0 numReleases:0 numShrinks:0 numReclaims:0 numCollisions:0 numCapacityGrowths:0 numExternalAllocs:0 numExternalFrees:0 cumulativeExternalBytes:0B");
   ASSERT_EQ(
       leafChild1->toString(),
       fmt::format(
-          "Memory Pool[leaf-child1 LEAF root[stats] parent[stats] {} track-usage {}]<max capacity 4.00GB capacity 4.00GB used 1.00KB available 1023.00KB reservation [used 1.00KB, reserved 1.00MB, min 0B] counters [allocs 1, frees 0, reserves 0, releases 0, collisions 0])>",
+          "Memory Pool[leaf-child1 LEAF root[stats] parent[stats] {} track-usage {}]<max capacity 4.00GB capacity 4.00GB used 1.00KB available 1023.00KB reservation [used 1.00KB, reserved 1.00MB, min 0B] counters [allocs 1, frees 0, reserves 0, releases 0, collisions 0, external-allocs 0, external-frees 0, cumulative-external 0B])>",
           useMmap_ ? "MMAP" : "MALLOC",
           isLeafThreadSafe_ ? "thread-safe" : "non-thread-safe"));
   ASSERT_EQ(
       aggregateChild->stats().toString(),
-      "usedBytes:0B reservedBytes:0B peakBytes:0B cumulativeBytes:0B numAllocs:0 numFrees:0 numReserves:0 numReleases:0 numShrinks:0 numReclaims:0 numCollisions:0 numCapacityGrowths:0");
+      "usedBytes:0B reservedBytes:0B peakBytes:0B cumulativeBytes:0B numAllocs:0 numFrees:0 numReserves:0 numReleases:0 numShrinks:0 numReclaims:0 numCollisions:0 numCapacityGrowths:0 numExternalAllocs:0 numExternalFrees:0 cumulativeExternalBytes:0B");
   ASSERT_EQ(
       root->stats().toString(),
-      "usedBytes:1.00KB reservedBytes:1.00MB peakBytes:1.00MB cumulativeBytes:1.00MB numAllocs:0 numFrees:0 numReserves:0 numReleases:0 numShrinks:0 numReclaims:0 numCollisions:0 numCapacityGrowths:0");
+      "usedBytes:1.00KB reservedBytes:1.00MB peakBytes:1.00MB cumulativeBytes:1.00MB numAllocs:0 numFrees:0 numReserves:0 numReleases:0 numShrinks:0 numReclaims:0 numCollisions:0 numCapacityGrowths:0 numExternalAllocs:0 numExternalFrees:0 cumulativeExternalBytes:0B");
   void* buf2 = leafChild2->allocate(bufferSize);
   ASSERT_EQ(
       leafChild1->stats().toString(),
-      "usedBytes:1.00KB reservedBytes:1.00MB peakBytes:1.00KB cumulativeBytes:1.00KB numAllocs:1 numFrees:0 numReserves:0 numReleases:0 numShrinks:0 numReclaims:0 numCollisions:0 numCapacityGrowths:0");
+      "usedBytes:1.00KB reservedBytes:1.00MB peakBytes:1.00KB cumulativeBytes:1.00KB numAllocs:1 numFrees:0 numReserves:0 numReleases:0 numShrinks:0 numReclaims:0 numCollisions:0 numCapacityGrowths:0 numExternalAllocs:0 numExternalFrees:0 cumulativeExternalBytes:0B");
   ASSERT_EQ(
       leafChild2->stats().toString(),
-      "usedBytes:1.00KB reservedBytes:1.00MB peakBytes:1.00KB cumulativeBytes:1.00KB numAllocs:1 numFrees:0 numReserves:0 numReleases:0 numShrinks:0 numReclaims:0 numCollisions:0 numCapacityGrowths:0");
+      "usedBytes:1.00KB reservedBytes:1.00MB peakBytes:1.00KB cumulativeBytes:1.00KB numAllocs:1 numFrees:0 numReserves:0 numReleases:0 numShrinks:0 numReclaims:0 numCollisions:0 numCapacityGrowths:0 numExternalAllocs:0 numExternalFrees:0 cumulativeExternalBytes:0B");
   ASSERT_EQ(
       aggregateChild->stats().toString(),
-      "usedBytes:1.00KB reservedBytes:1.00MB peakBytes:1.00MB cumulativeBytes:1.00MB numAllocs:0 numFrees:0 numReserves:0 numReleases:0 numShrinks:0 numReclaims:0 numCollisions:0 numCapacityGrowths:0");
+      "usedBytes:1.00KB reservedBytes:1.00MB peakBytes:1.00MB cumulativeBytes:1.00MB numAllocs:0 numFrees:0 numReserves:0 numReleases:0 numShrinks:0 numReclaims:0 numCollisions:0 numCapacityGrowths:0 numExternalAllocs:0 numExternalFrees:0 cumulativeExternalBytes:0B");
   ASSERT_EQ(
       root->stats().toString(),
-      "usedBytes:2.00KB reservedBytes:2.00MB peakBytes:2.00MB cumulativeBytes:2.00MB numAllocs:0 numFrees:0 numReserves:0 numReleases:0 numShrinks:0 numReclaims:0 numCollisions:0 numCapacityGrowths:0");
+      "usedBytes:2.00KB reservedBytes:2.00MB peakBytes:2.00MB cumulativeBytes:2.00MB numAllocs:0 numFrees:0 numReserves:0 numReleases:0 numShrinks:0 numReclaims:0 numCollisions:0 numCapacityGrowths:0 numExternalAllocs:0 numExternalFrees:0 cumulativeExternalBytes:0B");
   leafChild1->free(buf1, bufferSize);
   ASSERT_EQ(
       leafChild1->stats().toString(),
-      "usedBytes:0B reservedBytes:0B peakBytes:1.00KB cumulativeBytes:1.00KB numAllocs:1 numFrees:1 numReserves:0 numReleases:0 numShrinks:0 numReclaims:0 numCollisions:0 numCapacityGrowths:0");
+      "usedBytes:0B reservedBytes:0B peakBytes:1.00KB cumulativeBytes:1.00KB numAllocs:1 numFrees:1 numReserves:0 numReleases:0 numShrinks:0 numReclaims:0 numCollisions:0 numCapacityGrowths:0 numExternalAllocs:0 numExternalFrees:0 cumulativeExternalBytes:0B");
   ASSERT_EQ(
       leafChild2->stats().toString(),
-      "usedBytes:1.00KB reservedBytes:1.00MB peakBytes:1.00KB cumulativeBytes:1.00KB numAllocs:1 numFrees:0 numReserves:0 numReleases:0 numShrinks:0 numReclaims:0 numCollisions:0 numCapacityGrowths:0");
+      "usedBytes:1.00KB reservedBytes:1.00MB peakBytes:1.00KB cumulativeBytes:1.00KB numAllocs:1 numFrees:0 numReserves:0 numReleases:0 numShrinks:0 numReclaims:0 numCollisions:0 numCapacityGrowths:0 numExternalAllocs:0 numExternalFrees:0 cumulativeExternalBytes:0B");
   ASSERT_EQ(
       aggregateChild->stats().toString(),
-      "usedBytes:1.00KB reservedBytes:1.00MB peakBytes:1.00MB cumulativeBytes:1.00MB numAllocs:0 numFrees:0 numReserves:0 numReleases:0 numShrinks:0 numReclaims:0 numCollisions:0 numCapacityGrowths:0");
+      "usedBytes:1.00KB reservedBytes:1.00MB peakBytes:1.00MB cumulativeBytes:1.00MB numAllocs:0 numFrees:0 numReserves:0 numReleases:0 numShrinks:0 numReclaims:0 numCollisions:0 numCapacityGrowths:0 numExternalAllocs:0 numExternalFrees:0 cumulativeExternalBytes:0B");
   ASSERT_EQ(
       root->stats().toString(),
-      "usedBytes:1.00KB reservedBytes:1.00MB peakBytes:2.00MB cumulativeBytes:2.00MB numAllocs:0 numFrees:0 numReserves:0 numReleases:0 numShrinks:0 numReclaims:0 numCollisions:0 numCapacityGrowths:0");
+      "usedBytes:1.00KB reservedBytes:1.00MB peakBytes:2.00MB cumulativeBytes:2.00MB numAllocs:0 numFrees:0 numReserves:0 numReleases:0 numShrinks:0 numReclaims:0 numCollisions:0 numCapacityGrowths:0 numExternalAllocs:0 numExternalFrees:0 cumulativeExternalBytes:0B");
   leafChild2->free(buf2, bufferSize);
   std::vector<void*> bufs;
   for (int i = 0; i < 10; ++i) {
@@ -3968,9 +4173,13 @@ TEST_P(MemoryPoolTest, abort) {
       ASSERT_TRUE(rootPool->aborted());
 
       // Allocate more buffer to trigger reservation increment at the root.
-      { VELOX_ASSERT_THROW(leafPool->allocate(capacity / 2), ""); }
+      {
+        VELOX_ASSERT_THROW(leafPool->allocate(capacity / 2), "");
+      }
       // Allocate more buffer to trigger memory arbitration at the root.
-      { VELOX_ASSERT_THROW(leafPool->allocate(capacity * 2), ""); }
+      {
+        VELOX_ASSERT_THROW(leafPool->allocate(capacity * 2), "");
+      }
       // Allocate without trigger memory reservation increment.
       void* buf2 = leafPool->allocate(128);
       ASSERT_EQ(leafPool->usedBytes(), 256);
@@ -4035,6 +4244,213 @@ TEST_P(MemoryPoolTest, allocationWithCoveredCollateral) {
   pool->allocateContiguous(50, contiguousAllocation);
   ASSERT_LT(pool->usedBytes(), prevReservedBytes);
   pool->freeContiguous(contiguousAllocation);
+}
+
+TEST_P(MemoryPoolTest, transferTo) {
+  MemoryManager::Options options;
+  options.alignment = MemoryAllocator::kMinAlignment;
+  options.allocatorCapacity = kDefaultCapacity;
+  setupMemory(options);
+  auto manager = getMemoryManager();
+
+  auto largestSizeClass = manager->allocator()->largestSizeClass();
+  std::vector<MachinePageCount> pageCounts{
+      largestSizeClass,
+      largestSizeClass + 1,
+      largestSizeClass / 10,
+      1,
+      largestSizeClass * 2,
+      largestSizeClass * 3 + 1};
+
+  auto assertEqualBytes = [](const memory::MemoryPool* pool,
+                             int64_t usedBytes,
+                             int64_t peakBytes,
+                             int64_t reservedBytes) {
+    EXPECT_EQ(pool->usedBytes(), usedBytes);
+    EXPECT_EQ(pool->peakBytes(), peakBytes);
+    EXPECT_EQ(pool->reservedBytes(), reservedBytes);
+  };
+
+  auto assertZeroByte = [](const memory::MemoryPool* pool) {
+    EXPECT_EQ(pool->usedBytes(), 0);
+    EXPECT_EQ(pool->reservedBytes(), 0);
+  };
+
+  auto getMemoryBytes = [](const memory::MemoryPool* pool) {
+    return std::make_tuple(
+        pool->usedBytes(), pool->peakBytes(), pool->reservedBytes());
+  };
+
+  auto createPools = [&manager](bool betweenDifferentRoots) {
+    auto root1 = manager->addRootPool("root1");
+    auto root2 = manager->addRootPool("root2");
+    std::shared_ptr<MemoryPool> from;
+    std::shared_ptr<MemoryPool> to;
+    if (betweenDifferentRoots) {
+      from = root1->addLeafChild("from");
+      to = root2->addLeafChild("to");
+    } else {
+      from = root1->addLeafChild("from");
+      to = root1->addLeafChild("to");
+    }
+    return std::make_tuple(root1, root2, from, to);
+  };
+
+  auto testTransferAllocate = [&assertZeroByte,
+                               &assertEqualBytes,
+                               &getMemoryBytes,
+                               &createPools](bool betweenDifferentRoots) {
+    auto [root1, root2, from, to] = createPools(betweenDifferentRoots);
+    assertZeroByte(from.get());
+    assertZeroByte(to.get());
+    assertZeroByte(from->root());
+    assertZeroByte(to->root());
+
+    const auto kSize = 1024;
+    int64_t usedBytes, rootUsedBytes;
+    int64_t peakBytes, rootPeakBytes;
+    int64_t reservedBytes, rootReservedBytes;
+    auto buffer = from->allocate(kSize);
+    // Transferring between non-leaf pools is not allowed.
+    EXPECT_FALSE(from->root()->transferTo(to.get(), buffer, kSize));
+    EXPECT_FALSE(from->transferTo(to->root(), buffer, kSize));
+
+    std::tie(usedBytes, peakBytes, reservedBytes) = getMemoryBytes(from.get());
+    std::tie(rootUsedBytes, rootPeakBytes, rootReservedBytes) =
+        getMemoryBytes(from->root());
+    from->transferTo(to.get(), buffer, kSize);
+    assertEqualBytes(to.get(), usedBytes, peakBytes, reservedBytes);
+    if (from->root() == to->root()) {
+      rootPeakBytes *= 2;
+    }
+    assertEqualBytes(
+        to->root(), rootUsedBytes, rootPeakBytes, rootReservedBytes);
+    to->free(buffer, kSize);
+    assertZeroByte(from.get());
+    assertZeroByte(to.get());
+    assertZeroByte(from->root());
+    assertZeroByte(to->root());
+  };
+
+  auto testTransferAllocateZeroFilled =
+      [&assertZeroByte, &assertEqualBytes, &getMemoryBytes, &createPools](
+          bool betweenDifferentRoots) {
+        auto [root1, root2, from, to] = createPools(betweenDifferentRoots);
+        assertZeroByte(from.get());
+        assertZeroByte(to.get());
+        assertZeroByte(from->root());
+        assertZeroByte(to->root());
+
+        const auto kSize = 1024;
+        int64_t usedBytes, rootUsedBytes;
+        int64_t peakBytes, rootPeakBytes;
+        int64_t reservedBytes, rootReservedBytes;
+        auto buffer = from->allocateZeroFilled(8, kSize / 8);
+        std::tie(usedBytes, peakBytes, reservedBytes) =
+            getMemoryBytes(from.get());
+        std::tie(rootUsedBytes, rootPeakBytes, rootReservedBytes) =
+            getMemoryBytes(from->root());
+        from->transferTo(to.get(), buffer, kSize);
+        assertEqualBytes(to.get(), usedBytes, peakBytes, reservedBytes);
+        if (from->root() == to->root()) {
+          rootPeakBytes *= 2;
+        }
+        assertEqualBytes(
+            to->root(), rootUsedBytes, rootPeakBytes, rootReservedBytes);
+        to->free(buffer, kSize);
+        assertZeroByte(from.get());
+        assertZeroByte(to.get());
+        assertZeroByte(from->root());
+        assertZeroByte(to->root());
+      };
+
+  auto testTransferAllocateContiguous =
+      [&assertZeroByte, &assertEqualBytes, &getMemoryBytes, &createPools](
+          uint64_t pageCount, bool betweenDifferentRoots) {
+        auto [root1, root2, from, to] = createPools(betweenDifferentRoots);
+        assertZeroByte(from.get());
+        assertZeroByte(to.get());
+        assertZeroByte(from->root());
+        assertZeroByte(to->root());
+
+        int64_t usedBytes, rootUsedBytes;
+        int64_t peakBytes, rootPeakBytes;
+        int64_t reservedBytes, rootReservedBytes;
+        ContiguousAllocation out;
+        from->allocateContiguous(pageCount, out);
+        std::tie(usedBytes, peakBytes, reservedBytes) =
+            getMemoryBytes(from.get());
+        std::tie(rootUsedBytes, rootPeakBytes, rootReservedBytes) =
+            getMemoryBytes(from->root());
+        from->transferTo(to.get(), out.data(), out.size());
+        assertEqualBytes(to.get(), usedBytes, peakBytes, reservedBytes);
+        if (from->root() == to->root()) {
+          rootPeakBytes *= 2;
+        }
+        assertEqualBytes(
+            to->root(), rootUsedBytes, rootPeakBytes, rootReservedBytes);
+        to->freeContiguous(out);
+        assertZeroByte(from.get());
+        assertZeroByte(to.get());
+        assertZeroByte(from->root());
+        assertZeroByte(to->root());
+      };
+
+  auto testTransferAllocateNonContiguous =
+      [&assertZeroByte, &assertEqualBytes, &getMemoryBytes, &createPools](
+          uint64_t pageCount, bool betweenDifferentRoots) {
+        auto [root1, root2, from, to] = createPools(betweenDifferentRoots);
+        assertZeroByte(from.get());
+        assertZeroByte(to.get());
+        assertZeroByte(from->root());
+        assertZeroByte(to->root());
+
+        int64_t usedBytes, rootUsedBytes;
+        int64_t peakBytes, rootPeakBytes;
+        int64_t reservedBytes, rootReservedBytes;
+        Allocation out;
+        from->allocateNonContiguous(pageCount, out);
+        std::tie(usedBytes, peakBytes, reservedBytes) =
+            getMemoryBytes(from.get());
+        std::tie(rootUsedBytes, rootPeakBytes, rootReservedBytes) =
+            getMemoryBytes(from->root());
+        for (auto i = 0; i < out.numRuns(); ++i) {
+          const auto& run = out.runAt(i);
+          from->transferTo(to.get(), run.data(), run.numBytes());
+        }
+        assertEqualBytes(to.get(), usedBytes, peakBytes, reservedBytes);
+        if (from->root() == to->root()) {
+          EXPECT_EQ(to->root()->usedBytes(), rootUsedBytes);
+          // We reserve and release memory run-by-run, so the peak bytes would
+          // be no greater than twice of the original peak bytes.
+          EXPECT_LE(to->root()->peakBytes(), rootPeakBytes * 2);
+          EXPECT_EQ(to->root()->reservedBytes(), rootReservedBytes);
+        } else {
+          assertEqualBytes(
+              to->root(), rootUsedBytes, rootPeakBytes, rootReservedBytes);
+        }
+        to->freeNonContiguous(out);
+        assertZeroByte(from.get());
+        assertZeroByte(to.get());
+        assertZeroByte(from->root());
+        assertZeroByte(to->root());
+      };
+
+  // Test transfer between siblings of the same root pool.
+  testTransferAllocate(false);
+  testTransferAllocateZeroFilled(false);
+  for (auto pageCount : pageCounts) {
+    testTransferAllocateContiguous(pageCount, false);
+    testTransferAllocateNonContiguous(pageCount, false);
+  }
+
+  // Test transfer between different root pools.
+  testTransferAllocate(true);
+  testTransferAllocateZeroFilled(true);
+  for (auto pageCount : pageCounts) {
+    testTransferAllocateContiguous(pageCount, true);
+    testTransferAllocateNonContiguous(pageCount, true);
+  }
 }
 
 VELOX_INSTANTIATE_TEST_SUITE_P(

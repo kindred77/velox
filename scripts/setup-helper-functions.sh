@@ -49,6 +49,7 @@ function prompt {
     done
   ) 2>/dev/null
 }
+
 function github_checkout {
   local REPO=$1
   shift
@@ -69,7 +70,6 @@ function github_checkout {
   if [ ! -d "${DIRNAME}" ]; then
     git clone -q -b $VERSION $GIT_CLONE_PARAMS "git@github.com:${REPO}.git"
   fi
-  cd "${DIRNAME}" || exit
 }
 
 # get_cxx_flags [$CPU_ARCH]
@@ -265,6 +265,11 @@ function cmake_install {
   COMPILER_FLAGS+=${OS_CXXFLAGS}
   COMPILER_FLAGS+=${EXTRA_PKG_CXXFLAGS}
 
+  local CCACHE=
+  if [ "${NAME}" != "duckdb" ] && command -v ccache >/dev/null 2>&1; then
+    # DuckDB sets ccache automatically in its CMakeLists.txt.
+    CCACHE=ccache
+  fi
   # CMAKE_POSITION_INDEPENDENT_CODE is required so that Velox can be built into dynamic libraries \
   cmake -Wno-dev "${CMAKE_OPTIONS}" -B"${BINARY_DIR}" \
     -GNinja \
@@ -273,6 +278,8 @@ function cmake_install {
     "${INSTALL_PREFIX+-DCMAKE_PREFIX_PATH=}${INSTALL_PREFIX-}" \
     "${INSTALL_PREFIX+-DCMAKE_INSTALL_PREFIX=}${INSTALL_PREFIX-}" \
     -DCMAKE_CXX_FLAGS="$COMPILER_FLAGS" \
+    -DCMAKE_C_COMPILER_LAUNCHER=${CCACHE} \
+    -DCMAKE_CXX_COMPILER_LAUNCHER=${CCACHE} \
     -DBUILD_TESTING=OFF \
     "$@"
   # Exit if the build fails.

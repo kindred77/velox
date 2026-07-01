@@ -15,14 +15,24 @@
  */
 #pragma once
 
-#include <iomanip>
-#include <sstream>
+#include <ostream>
 #include <string>
-
-#include <folly/dynamic.h>
+#include <tuple>
 
 #include "velox/common/base/CheckedArithmetic.h"
 #include "velox/type/StringView.h"
+
+namespace folly {
+struct dynamic;
+}
+
+#ifdef _MSC_VER
+#include "velox/type/windows/Int128.h"
+#else
+namespace facebook::velox {
+using int128_t = __int128_t;
+}
+#endif
 
 namespace facebook::velox {
 
@@ -125,11 +135,7 @@ struct Timestamp {
   // Returns the current unix timestamp (ms precision).
   static Timestamp now();
 
-  static Timestamp create(const folly::dynamic& obj) {
-    auto seconds = obj["seconds"].asInt();
-    auto nanos = obj["nanos"].asInt();
-    return Timestamp(seconds, nanos);
-  }
+  static Timestamp create(const folly::dynamic& obj);
 
   int64_t getSeconds() const {
     return seconds_;
@@ -163,15 +169,16 @@ struct Timestamp {
     // but seconds*1000 + nanos does, an example is Timestamp::minMillis().
 
     // If the final result does not fit in int64_t we throw.
-    __int128_t result =
-        (__int128_t)seconds_ * 1'000 + (int64_t)(nanos_ / 1'000'000);
-    if (result < INT64_MIN || result > INT64_MAX) {
+    int128_t result =
+        int128_t(seconds_) * int128_t(1000) + int128_t(nanos_ / 1000000);
+    if (result < int128_t(std::numeric_limits<int64_t>::min()) ||
+        result > int128_t(std::numeric_limits<int64_t>::max())) {
       VELOX_USER_FAIL(
           "Could not convert Timestamp({}, {}) to milliseconds",
           seconds_,
           nanos_);
     }
-    return result;
+    return static_cast<int64_t>(result);
   }
 
   // Keep it in header for getting inlined.
@@ -190,7 +197,7 @@ struct Timestamp {
     // Timestamp(-9223372036855, 224'192'000).
 
     // If the final result does not fit in int64_t we throw.
-    __int128_t result = static_cast<__int128_t>(seconds_) * 1'000'000 +
+    int128_t result = static_cast<int128_t>(seconds_) * 1'000'000 +
         static_cast<int64_t>(nanos_ / 1'000);
     if (result < INT64_MIN || result > INT64_MAX) {
       VELOX_USER_FAIL(
@@ -198,7 +205,7 @@ struct Timestamp {
           seconds_,
           nanos_);
     }
-    return result;
+    return static_cast<int64_t>(result);
   }
 
   Timestamp toPrecision(const TimestampPrecision& precision) const {
@@ -377,8 +384,29 @@ struct Timestamp {
   /// A default time zone that is same across the process.
   static const tz::TimeZone& defaultTimezone();
 
+#if __cplusplus >= 202002L || (defined(_MSVC_LANG) && _MSVC_LANG >= 202002L)
   bool operator==(const Timestamp& b) const = default;
   auto operator<=>(const Timestamp& b) const = default;
+#else
+  bool operator==(const Timestamp& b) const {
+    return seconds_ == b.seconds_ && nanos_ == b.nanos_;
+  }
+  bool operator!=(const Timestamp& b) const {
+    return !(*this == b);
+  }
+  bool operator<(const Timestamp& b) const {
+    return seconds_ < b.seconds_ || (seconds_ == b.seconds_ && nanos_ < b.nanos_);
+  }
+  bool operator<=(const Timestamp& b) const {
+    return !(b < *this);
+  }
+  bool operator>(const Timestamp& b) const {
+    return b < *this;
+  }
+  bool operator>=(const Timestamp& b) const {
+    return !(*this < b);
+  }
+#endif
 
   void operator++() {
     if (nanos_ < kMaxNanos) {
@@ -428,16 +456,9 @@ struct Timestamp {
     return toString();
   }
 
-  operator folly::dynamic() const {
-    return folly::dynamic(seconds_);
-  }
+  operator folly::dynamic() const;
 
-  folly::dynamic serialize() const {
-    folly::dynamic obj = folly::dynamic::object;
-    obj["seconds"] = seconds_;
-    obj["nanos"] = nanos_;
-    return obj;
-  }
+  folly::dynamic serialize() const;
 
   // Pretty printer for gtest.
   friend void PrintTo(const Timestamp& timestamp, std::ostream* os) {
@@ -448,8 +469,6 @@ struct Timestamp {
   int64_t seconds_;
   uint64_t nanos_;
 };
-
-void parseTo(folly::StringPiece in, ::facebook::velox::Timestamp& out);
 
 template <typename T>
 void toAppend(const ::facebook::velox::Timestamp& value, T* result) {
