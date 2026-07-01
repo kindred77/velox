@@ -35,3 +35,5 @@ then cmake:
     -G Ninja -S E:\mywork\projects\cpp\velox -B E:\mywork\projects\cpp\velox\cmake-build-debug-vs2022
 
 then build with ninja.
+
+In Clion, you should use the VS toolchains, with amd64 Architecture and Empty platform.
