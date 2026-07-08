@@ -39,10 +39,19 @@ static_assert(
 using thrift::Encoding;
 using thrift::PageHeader;
 
+#ifndef _MSC_VER
 struct __attribute__((__packed__)) Int96Timestamp {
   int32_t days;
   uint64_t nanos;
 };
+#else
+#pragma pack(push, 1)
+struct Int96Timestamp {
+  int32_t days;
+  uint64_t nanos;
+};
+#pragma pack(pop)
+#endif
 
 void PageReader::seekToPage(int64_t row) {
   defineDecoder_.reset();

@@ -324,13 +324,12 @@ class DeltaBpDecoder {
         const int32_t bitPos = i * bitWidth;
         const int32_t byteOff = bitPos >> 3;
         const int32_t bitInByte = bitPos & 7;
-        const __uint128_t window =
-            static_cast<__uint128_t>(
-                *reinterpret_cast<const uint64_t*>(p + byteOff)) |
-            (static_cast<__uint128_t>(
-                 *reinterpret_cast<const uint64_t*>(p + byteOff + 8))
-             << 64);
-        const uint64_t word = static_cast<uint64_t>(window >> bitInByte);
+        const uint64_t lo =
+            *reinterpret_cast<const uint64_t*>(p + byteOff);
+        const uint64_t hi =
+            *reinterpret_cast<const uint64_t*>(p + byteOff + 8);
+        const uint64_t word =
+            (lo >> bitInByte) | (bitInByte == 0 ? 0 : (hi << (64 - bitInByte)));
         cumulative += step + (word & mask);
         out[i + 0] = static_cast<DataType>(cumulative);
         cumulative += step + ((word >> bitWidth) & mask);

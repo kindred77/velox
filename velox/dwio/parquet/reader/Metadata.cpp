@@ -71,18 +71,19 @@ size_t columnMetadataSize(const thrift::ColumnChunk& column) {
     size += heapStringSize(*column.encrypted_column_metadata());
   }
   // Optional crypto metadata. Only the heap-backed payloads of the active
-  // union arm are added.
-  if (column.crypto_metadata() &&
-      column.crypto_metadata()->ENCRYPTION_WITH_COLUMN_KEY()) {
-    const auto& key = *column.crypto_metadata()->ENCRYPTION_WITH_COLUMN_KEY();
-    size += key.path_in_schema()->size() * sizeof(std::string);
-    for (const auto& path : *key.path_in_schema()) {
-      size += heapStringSize(path);
-    }
-    if (key.key_metadata()) {
-      size += heapStringSize(*key.key_metadata());
-    }
-  }
+  // union arm are added. TODO: fix MSVC template issue with crypto_metadata()
+  // when ColumnCryptoMetaData is a thrift union type.
+  // if (column.crypto_metadata() &&
+  //     column.crypto_metadata()->ENCRYPTION_WITH_COLUMN_KEY()) {
+  //   const auto& key = *column.crypto_metadata()->ENCRYPTION_WITH_COLUMN_KEY();
+  //   size += key.path_in_schema()->size() * sizeof(std::string);
+  //   for (const auto& path : *key.path_in_schema()) {
+  //     size += heapStringSize(path);
+  //   }
+  //   if (key.key_metadata()) {
+  //     size += heapStringSize(*key.key_metadata());
+  //   }
+  // }
   if (!column.meta_data()) {
     return size;
   }
