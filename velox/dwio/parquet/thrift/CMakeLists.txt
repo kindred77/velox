@@ -17,6 +17,18 @@ include(FBThriftCppLibrary)
 add_fbthrift_cpp_library(velox_dwio_parquet_thrift_raw parquet.thrift)
 add_library(velox_dwio_parquet_thrift INTERFACE)
 target_link_libraries(velox_dwio_parquet_thrift INTERFACE velox_dwio_parquet_thrift_raw)
+if(WIN32)
+  # Patch generated thrift header to undefine Windows OPTIONAL macro
+  # which conflicts with parquet's FieldRepetitionType::OPTIONAL enum value
+  set(PARQUET_TYPES_H "${CMAKE_CURRENT_BINARY_DIR}/gen-cpp2/parquet_types.h")
+  if(EXISTS "${PARQUET_TYPES_H}")
+    file(READ "${PARQUET_TYPES_H}" _content)
+    string(REPLACE "// BEGIN declare_enums" 
+                   "#ifdef OPTIONAL\n#undef OPTIONAL\n#endif\n// BEGIN declare_enums" 
+                   _content "${_content}")
+    file(WRITE "${PARQUET_TYPES_H}" "${_content}")
+  endif()
+endif()
 velox_add_test_headers(
   velox_dwio_parquet_thrift
   CompactV1ProtocolReaderWithRefill.h
