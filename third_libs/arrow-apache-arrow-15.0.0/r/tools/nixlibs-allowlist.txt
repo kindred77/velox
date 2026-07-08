@@ -1,5 +1,0 @@
-ubuntu
-centos
-redhat
-rhel
-darwin

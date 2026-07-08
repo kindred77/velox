@@ -1,6 +1,0 @@
-cffi
-hypothesis
-pandas
-pytest
-pytest-lazy-fixture
-pytz
