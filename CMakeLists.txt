@@ -1227,6 +1227,8 @@ if(MSVC)
   # instantiations. The core library masks this via /w; test targets compile at
   # /W3, so suppress it globally here. POSIX builds are unaffected.
   add_compile_options(/wd4716)
+  string(REPLACE "/showIncludes" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+  string(REPLACE "/showIncludes" "" CMAKE_C_FLAGS "${CMAKE_C_FLAGS}")
 endif()
 
 # On Windows, add vcpkg include directory globally to ensure all targets

@@ -1,5 +1,5 @@
-You need use MSVC tool chain(vs2022) and vcpkg(with x64-windows-static-md triplet).
-should use cmake in MSVC.
+use kindred77/vcpkg branch-2025.6.13-msvc-my_gporca
+with x64-windows-static-md triplet
 
 Use visual studio toolchains in Clion, and add cmake options below:
 -DCMAKE_BUILD_TYPE=Debug
