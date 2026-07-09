@@ -305,7 +305,7 @@ struct JsonSizeFunction {
           case simdjson::ondemand::json_type::null:
             singleResultSize = 0;
             break;
-          case simdjson::ondemand::json_type::unknown: {
+          default: {
             return simdjson::INCORRECT_TYPE;
           }
         }
