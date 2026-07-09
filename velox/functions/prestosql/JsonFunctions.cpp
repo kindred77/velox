@@ -33,12 +33,6 @@ template <typename T>
 static simdjson::error_code validate(T value) {
   SIMDJSON_ASSIGN_OR_RAISE(auto type, value.type());
   switch (type) {
-    case simdjson::ondemand::json_type::unknown: {
-      // In simdjson 4.0.7+, unknown type is returned for invalid JSON values
-      // like NaN, Infinity, etc. Return INCORRECT_TYPE to indicate invalid
-      // JSON.
-      return simdjson::INCORRECT_TYPE;
-    }
     case simdjson::ondemand::json_type::array: {
       SIMDJSON_ASSIGN_OR_RAISE(auto array, value.get_array());
       for (auto elementOrError : array) {
@@ -64,6 +58,12 @@ static simdjson::error_code validate(T value) {
     case simdjson::ondemand::json_type::null: {
       SIMDJSON_ASSIGN_OR_RAISE(auto isNull, value.is_null());
       return isNull ? simdjson::SUCCESS : simdjson::N_ATOM_ERROR;
+    }
+    default: {
+      // In simdjson 4.0.7+, unknown type is returned for invalid JSON values
+      // like NaN, Infinity, etc. Return INCORRECT_TYPE to indicate invalid
+      // JSON.
+      return simdjson::INCORRECT_TYPE;
     }
   }
   VELOX_UNREACHABLE();
@@ -397,12 +397,6 @@ class JsonParseImpl {
   simdjson::error_code generateViews(T value) const {
     SIMDJSON_ASSIGN_OR_RAISE(auto type, value.type());
     switch (type) {
-      case simdjson::ondemand::json_type::unknown: {
-        // In simdjson 4.0.7+, unknown type is returned for invalid JSON values
-        // like NaN, Infinity, etc. Return INCORRECT_TYPE to indicate invalid
-        // JSON.
-        return simdjson::INCORRECT_TYPE;
-      }
       case simdjson::ondemand::json_type::array: {
         SIMDJSON_ASSIGN_OR_RAISE(auto array, value.get_array());
         return generateViewsFromArray<kNeedNormalize>(array);
@@ -422,10 +416,17 @@ class JsonParseImpl {
       case simdjson::ondemand::json_type::boolean:
         addOrMergeViews(views_, trimToken(value.raw_json_token()));
         return value.get_bool().error();
-      case simdjson::ondemand::json_type::null:
+      case simdjson::ondemand::json_type::null: {
         SIMDJSON_ASSIGN_OR_RAISE(auto isNull, value.is_null());
         addOrMergeViews(views_, trimToken(value.raw_json_token()));
         return isNull ? simdjson::SUCCESS : simdjson::N_ATOM_ERROR;
+      }
+      default: {
+        // In simdjson 4.0.7+, unknown type is returned for invalid JSON values
+        // like NaN, Infinity, etc. Return INCORRECT_TYPE to indicate invalid
+        // JSON.
+        return simdjson::INCORRECT_TYPE;
+      }
     }
     VELOX_UNREACHABLE();
   }
@@ -785,12 +786,6 @@ struct JsonExtractImpl {
       // contents directly) and we might miss invalid JSON.
       SIMDJSON_ASSIGN_OR_RAISE(auto vtype, v.type());
       switch (vtype) {
-        case simdjson::ondemand::json_type::unknown: {
-          // In simdjson 4.0.7+, unknown type is returned for invalid JSON
-          // values like NaN, Infinity, etc. Return INCORRECT_TYPE to indicate
-          // invalid JSON.
-          return simdjson::INCORRECT_TYPE;
-        }
         case simdjson::ondemand::json_type::object: {
           SIMDJSON_ASSIGN_OR_RAISE(
               auto jsonStr, simdjson::to_json_string(v.get_object()));
@@ -813,6 +808,12 @@ struct JsonExtractImpl {
         case simdjson::ondemand::json_type::null:
           results.push_back(kNullString);
           break;
+        default: {
+          // In simdjson 4.0.7+, unknown type is returned for invalid JSON
+          // values like NaN, Infinity, etc. Return INCORRECT_TYPE to indicate
+          // invalid JSON.
+          return simdjson::INCORRECT_TYPE;
+        }
       }
       return simdjson::SUCCESS;
     };
