@@ -1,4 +1,4 @@
-﻿# Copyright (c) Facebook, Inc. and its affiliates.
+# Copyright (c) Facebook, Inc. and its affiliates.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,21 +21,12 @@ if(WIN32)
   # Patch generated thrift header to undefine Windows OPTIONAL macro
   # which conflicts with parquet's FieldRepetitionType::OPTIONAL enum value
   set(PARQUET_TYPES_H "${CMAKE_CURRENT_BINARY_DIR}/gen-cpp2/parquet_types.h")
-  # Build-time patch: runs AFTER thrift codegen (DEPENDS on parquet_types.h)
-  # but BEFORE library compilation (add_dependencies on the library target).
   set(PARQUET_PATCH_MARKER "${CMAKE_CURRENT_BINARY_DIR}/gen-cpp2/.optional_patched")
-  set(PARQUET_PATCH_SCRIPT "${CMAKE_CURRENT_BINARY_DIR}/patch_parquet_optional.cmake")
-  set(__pc [[
-file(READ "@P@" _c)
-string(REPLACE "// BEGIN declare_enums" "#ifdef OPTIONAL\n#undef OPTIONAL\n#endif\n// BEGIN declare_enums" _c "${_c}")
-file(WRITE "@P@" "${_c}")
-file(WRITE "@M@" "")
-]])
-  string(REPLACE "@P@" "${PARQUET_TYPES_H}" __pc "${__pc}")
-  string(REPLACE "@M@" "${PARQUET_PATCH_MARKER}" __pc "${__pc}")
-  file(WRITE "${PARQUET_PATCH_SCRIPT}" "${__pc}")
   add_custom_command(OUTPUT "${PARQUET_PATCH_MARKER}"
-    COMMAND ${CMAKE_COMMAND} -P "${PARQUET_PATCH_SCRIPT}"
+    COMMAND ${CMAKE_COMMAND}
+      -D PATCH_FILE="${PARQUET_TYPES_H}"
+      -D MARKER="${PARQUET_PATCH_MARKER}"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/../../../../CMake/third-party/undef_optional.cmake"
     DEPENDS "${PARQUET_TYPES_H}"
     COMMENT "[Win32] Patching parquet_types.h to undefine OPTIONAL macro"
   )
