@@ -39,7 +39,7 @@ void scalarGatherCopy(
   using T = typename TypeTraits<kind>::NativeType;
   auto* flatVector = target->template asUnchecked<FlatVector<T>>();
   uint64_t* rawNulls = nullptr;
-  if (std::is_same_v<T, StringView>) {
+  if constexpr (std::is_same_v<T, StringView>) {
     for (int i = 0; i < count; ++i) {
       VELOX_DCHECK(!sources[i]->mayHaveNulls());
       if (sources[i]
