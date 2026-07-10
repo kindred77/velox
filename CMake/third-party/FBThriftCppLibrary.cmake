@@ -102,8 +102,17 @@ function(add_fbthrift_cpp_library LIB_NAME THRIFT_FILE)
   endif()
   set(
     thrift_include_options
-    "-I;$<JOIN:$<TARGET_PROPERTY:${LIB_NAME}.thrift_includes,INTERFACE_INCLUDE_DIRECTORIES>,;-I;>"
+   "-I;$<JOIN:$<TARGET_PROPERTY:${LIB_NAME}.thrift_includes,INTERFACE_INCLUDE_DIRECTORIES>,;-I;>"
   )
+
+  # LD_LIBRARY_PATH is a Unix-only concept; skip on Windows to avoid
+  # broken command lines when the environment variable contains spaces
+  # from MinGW or other Windows toolchains.
+  if(WIN32)
+    set(FBTHRIFT_LAUNCHER "${FBTHRIFT_COMPILER}")
+  else()
+    set(FBTHRIFT_LAUNCHER "${CMAKE_COMMAND}" -E env "LD_LIBRARY_PATH=/usr/local/lib:/usr/local/lib64:$ENV{LD_LIBRARY_PATH}" "${FBTHRIFT_COMPILER}")
+  endif()
 
   # Emit the rule to run the thrift compiler
   add_custom_command(
@@ -114,8 +123,7 @@ function(add_fbthrift_cpp_library LIB_NAME THRIFT_FILE)
     COMMAND
       "${CMAKE_COMMAND}" -E make_directory "${output_dir}"
     COMMAND
-      "${CMAKE_COMMAND}" -E env "LD_LIBRARY_PATH=/usr/local/lib:/usr/local/lib64:$ENV{LD_LIBRARY_PATH}"
-      "${FBTHRIFT_COMPILER}"
+      ${FBTHRIFT_LAUNCHER}
       --legacy-strict
       --gen "mstch_cpp2:${GEN_ARG_STR}"
       "${thrift_include_options}"
