@@ -22,6 +22,8 @@
 #include "velox/connectors/hive/FileConnectorSplit.h"
 #include "velox/connectors/hive/FileConnectorUtil.h"
 #include "velox/dwio/common/ReaderFactory.h"
+#include "velox/common/base/PerfTracer.h"
+#include "velox/common/base/PerfTracer.h"
 #include "velox/type/DecimalUtil.h"
 
 namespace facebook::velox::connector::hive {
@@ -193,21 +195,38 @@ void FileSplitReader::prepareSplit(
     std::shared_ptr<common::MetadataFilter> metadataFilter,
     dwio::common::RuntimeStatistics& runtimeStats,
     const folly::F14FastMap<std::string, std::string>& fileReadOps) {
-  createReader(fileReadOps);
+  namespace pt = facebook::velox::perf;
+  {
+    pt::ScopedTimer _st(&pt::PerfTracer::instance().ps_createReader);
+    createReader(fileReadOps);
+  }
   if (emptySplit_) {
     return;
   }
   auto rowType = getAdaptedRowType();
 
-  if (checkIfSplitIsEmpty(runtimeStats)) {
-    VELOX_CHECK(emptySplit_);
-    return;
+  {
+    pt::ScopedTimer _st(&pt::PerfTracer::instance().ps_checkEmpty);
+    if (checkIfSplitIsEmpty(runtimeStats)) {
+      VELOX_CHECK(emptySplit_);
+      return;
+    }
   }
 
-  createRowReader(std::move(metadataFilter), std::move(rowType), std::nullopt);
+  // Defer row reader creation: save params for lazy init in next().
+  deferredMetadataFilter_ = metadataFilter;
+  deferredRowType_ = rowType;
 }
 
 uint64_t FileSplitReader::next(uint64_t size, VectorPtr& output) {
+  if (!baseRowReader_) {
+    // Lazily create row reader on first next() call.
+    // This runs on the driver thread, not the IO preload thread.
+    createRowReader(
+        std::move(deferredMetadataFilter_),
+        deferredRowType_,
+        std::nullopt);
+  }
   if (!baseReaderOpts_.randomSkip()) {
     return baseRowReader_->next(size, output);
   }
@@ -290,18 +309,22 @@ void FileSplitReader::createReader(
     fileProperties.fileReadOps[kTableNameKey] = tableHandle_->name();
   }
 
-  try {
-    fileHandleCachePtr = fileHandleFactory_->generate(
-        fileHandleKey, &fileProperties, ioStats_ ? ioStats_.get() : nullptr);
-    VELOX_CHECK_NOT_NULL(fileHandleCachePtr.get());
-  } catch (const VeloxRuntimeError& e) {
-    if (e.errorCode() == error_code::kFileNotFound &&
-        fileConfig_->ignoreMissingFiles(
-            connectorQueryCtx_->sessionProperties())) {
-      emptySplit_ = true;
-      return;
+  {
+    namespace pt = facebook::velox::perf;
+    pt::ScopedTimer _st(&pt::PerfTracer::instance().cr_fhGenerate);
+    try {
+      fileHandleCachePtr = fileHandleFactory_->generate(
+          fileHandleKey, &fileProperties, ioStats_ ? ioStats_.get() : nullptr);
+      VELOX_CHECK_NOT_NULL(fileHandleCachePtr.get());
+    } catch (const VeloxRuntimeError& e) {
+      if (e.errorCode() == error_code::kFileNotFound &&
+          fileConfig_->ignoreMissingFiles(
+              connectorQueryCtx_->sessionProperties())) {
+        emptySplit_ = true;
+        return;
+      }
+      throw;
     }
-    throw;
   }
 
   // Here we keep adding new entries to CacheTTLController when new fileHandles
@@ -316,19 +339,28 @@ void FileSplitReader::createReader(
     baseReaderOpts_.setCache(cache);
   }
 
-  auto baseFileInput = BufferedInputBuilder::getInstance()->create(
-      *fileHandleCachePtr,
-      baseReaderOpts_,
-      connectorQueryCtx_,
-      dataIoStats_,
-      ioStats_,
-      ioExecutor_,
-      fileReadOps);
+  std::unique_ptr<dwio::common::BufferedInput> baseFileInput;
+  {
+    namespace pt = facebook::velox::perf;
+    pt::ScopedTimer _st(&pt::PerfTracer::instance().cr_createBufferedInput);
+    baseFileInput = BufferedInputBuilder::getInstance()->create(
+        *fileHandleCachePtr,
+        baseReaderOpts_,
+        connectorQueryCtx_,
+        dataIoStats_,
+        ioStats_,
+        ioExecutor_,
+        fileReadOps);
+  }
 
-  baseReader_ = dwio::common::getReaderFactory(baseReaderOpts_.fileFormat())
-                    ->createReader(std::move(baseFileInput), baseReaderOpts_);
-  if (!baseReader_) {
-    emptySplit_ = true;
+  {
+    namespace pt = facebook::velox::perf;
+    pt::ScopedTimer _st(&pt::PerfTracer::instance().cr_createParquetReader);
+    baseReader_ = dwio::common::getReaderFactory(baseReaderOpts_.fileFormat())
+                      ->createReader(std::move(baseFileInput), baseReaderOpts_);
+    if (!baseReader_) {
+      emptySplit_ = true;
+    }
   }
 }
 

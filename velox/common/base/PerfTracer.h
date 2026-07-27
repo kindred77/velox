@@ -38,6 +38,26 @@ struct PerfTracer {
     Counter ts_preloadMove;
     Counter ts_setFromDataSource;
 
+    // FileSplitReader::createReader breakdown
+    Counter cr_fhGenerate;
+    Counter cr_createBufferedInput;
+    Counter cr_createParquetReader;
+
+    // FileSplitReader::prepareSplit breakdown
+    Counter ps_createReader;
+    Counter ps_checkEmpty;
+    Counter ps_createRowReader;
+
+    // ReaderBase (parquet footer/schema) breakdown
+    Counter rb_loadFileMetaData;
+    Counter rb_initializeSchema;
+
+    // ParquetRowReader::Impl constructor breakdown
+    Counter prr_buildColumnReader;
+    Counter prr_filterRowGroups;
+    Counter prr_advanceToNextRG;
+
+
     // GroupingSet (global aggregation)
     Counter gs_addGlobalAggTotal;
     Counter gs_addRawInput;
@@ -70,6 +90,17 @@ struct PerfTracer {
         d("ts_addSplit", ts_addSplit);
         d("ts_preloadMove", ts_preloadMove);
         d("ts_setFromDataSource", ts_setFromDataSource);
+        d("ps_createReader", ps_createReader);
+        d("cr_fhGenerate", cr_fhGenerate);
+        d("cr_createBufferedInput", cr_createBufferedInput);
+        d("cr_createParquetReader", cr_createParquetReader);
+        d("ps_checkEmpty", ps_checkEmpty);
+        d("ps_createRowReader", ps_createRowReader);
+        d("rb_loadFileMetaData", rb_loadFileMetaData);
+        d("rb_initializeSchema", rb_initializeSchema);
+        d("prr_buildColumnReader", prr_buildColumnReader);
+        d("prr_filterRowGroups", prr_filterRowGroups);
+        d("prr_advanceToNextRG", prr_advanceToNextRG);
         d("gs_addGlobalAggTotal", gs_addGlobalAggTotal);
         d("gs_addRawInput", gs_addRawInput);
         d("op_getOutput", op_getOutput);

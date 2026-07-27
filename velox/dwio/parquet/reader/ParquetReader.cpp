@@ -17,6 +17,8 @@
 #include "velox/dwio/parquet/reader/ParquetReader.h"
 
 #include <thrift/lib/cpp2/FieldRef.h>
+#include "velox/common/base/PerfTracer.h"
+#include "velox/common/base/PerfTracer.h"
 
 #include "velox/common/Casts.h"
 #include "velox/dwio/common/StatisticsBuilder.h"
@@ -324,6 +326,10 @@ class ReaderBase {
   size_t initialThriftSize_{0};
 };
 
+// === Static cache: file path -> deserialized FileMetaData ===
+static std::mutex g_parquetMetaCacheMutex;
+static std::unordered_map<std::string, thrift::FileMetaData> g_parquetMetaCache;
+
 ReaderBase::ReaderBase(
     std::unique_ptr<dwio::common::BufferedInput> input,
     const dwio::common::ReaderOptions& options)
@@ -336,8 +342,29 @@ ReaderBase::ReaderBase(
   VELOX_CHECK_GT(fileLength_, 0, "Parquet file is empty");
   VELOX_CHECK_GE(fileLength_, 12, "Parquet file is too small");
 
-  loadFileMetaData();
-  initializeSchema();
+  auto filePath = input_->getReadFile()->getName();
+  {
+    // Double-checked locking: only one thread loads the Thrift metadata.
+    std::lock_guard<std::mutex> lock(g_parquetMetaCacheMutex);
+    auto it = g_parquetMetaCache.find(filePath);
+    if (it != g_parquetMetaCache.end()) {
+      fileMetaData_ = std::make_unique<thrift::FileMetaData>(it->second);
+    } else {
+      {
+        namespace pt = facebook::velox::perf;
+        pt::ScopedTimer _st(&pt::PerfTracer::instance().rb_loadFileMetaData);
+        loadFileMetaData();
+      }
+      if (fileMetaData_) {
+        g_parquetMetaCache[filePath] = *fileMetaData_;
+      }
+    }
+  }
+  {
+    namespace pt = facebook::velox::perf;
+    pt::ScopedTimer _st(&pt::PerfTracer::instance().rb_initializeSchema);
+    initializeSchema();
+  }
   initializeVersion();
 
   // Report the thrift footer reservation only after all other initialization
@@ -1428,20 +1455,32 @@ class ParquetRowReader::Impl {
         options_.timestampPrecision());
     requestedType_ = options_.requestedType() ? options_.requestedType()
                                               : readerBase_->schema();
-    columnReader_ = ParquetColumnReader::build(
-        columnReaderOptions_,
-        requestedType_,
-        readerBase_->schemaWithId(), // Id is schema id
-        params,
-        *options_.scanSpec());
+    {
+      namespace pt = facebook::velox::perf;
+      pt::ScopedTimer _st_build(&pt::PerfTracer::instance().prr_buildColumnReader);
+      columnReader_ = ParquetColumnReader::build(
+          columnReaderOptions_,
+          requestedType_,
+          readerBase_->schemaWithId(), // Id is schema id
+          params,
+          *options_.scanSpec());
+    }
     columnReader_->setIsTopLevel();
 
-    filterRowGroups();
+    {
+      namespace pt = facebook::velox::perf;
+      pt::ScopedTimer _st_fg(&pt::PerfTracer::instance().prr_filterRowGroups);
+      filterRowGroups();
+    }
     if (!rowGroupIds_.empty()) {
       // schedule prefetch of first row group right after reading the metadata.
       // This is usually on a split preload thread before the split goes to
       // table scan.
-      advanceToNextRowGroup();
+      {
+        namespace pt = facebook::velox::perf;
+        pt::ScopedTimer _st_rg(&pt::PerfTracer::instance().prr_advanceToNextRG);
+        advanceToNextRowGroup();
+      }
     }
 
     columnReaderOptions_ =

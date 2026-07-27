@@ -242,6 +242,8 @@ class FileSplitReader {
   std::unique_ptr<dwio::common::RowReader> baseRowReader_;
   dwio::common::ReaderOptions baseReaderOpts_;
   dwio::common::RowReaderOptions baseRowReaderOpts_;
+  std::shared_ptr<common::MetadataFilter> deferredMetadataFilter_;
+  RowTypePtr deferredRowType_;
   bool emptySplit_;
 };
 
