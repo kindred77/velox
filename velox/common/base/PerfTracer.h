@@ -1,0 +1,80 @@
+#pragma once
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <iostream>
+
+namespace facebook::velox::perf {
+
+struct Counter {
+    std::atomic<uint64_t> total{0};
+    std::atomic<uint64_t> cnt{0};
+
+    void add(uint64_t us) {
+        total.fetch_add(us, std::memory_order_relaxed);
+        cnt.fetch_add(1, std::memory_order_relaxed);
+    }
+};
+
+struct ScopedTimer {
+    using clock = std::chrono::steady_clock;
+    clock::time_point start_;
+    Counter* counter_;
+
+    ScopedTimer(Counter* c) : start_(clock::now()), counter_(c) {}
+    ~ScopedTimer() {
+        counter_->add(std::chrono::duration_cast<std::chrono::microseconds>(clock::now() - start_).count());
+    }
+};
+
+struct PerfTracer {
+    // TableScan
+    Counter ts_getOutputTotal;
+    Counter ts_getSplit;
+    Counter ts_dataSourceNext;
+    Counter ts_postNext;
+    Counter ts_createDataSource;
+    Counter ts_addSplit;
+    Counter ts_preloadMove;
+    Counter ts_setFromDataSource;
+
+    // GroupingSet (global aggregation)
+    Counter gs_addGlobalAggTotal;
+    Counter gs_addRawInput;
+
+    // Driver (operator-level)
+    Counter op_getOutput;
+    Counter op_addInput;
+
+    static PerfTracer& instance() {
+        static PerfTracer inst;
+        return inst;
+    }
+
+    void dumpAll() {
+        auto d = [](const char* name, Counter& c) {
+            uint64_t cnt = c.cnt.load();
+            if (!cnt) return;
+            std::cerr << "[PERF] " << name
+                      << " total=" << c.total.load() << " us"
+                      << " cnt=" << cnt
+                      << " avg=" << (c.total.load() / cnt) << " us"
+                      << std::endl;
+        };
+        std::cerr << "======= PERF COUNTERS =======" << std::endl;
+        d("ts_getOutputTotal", ts_getOutputTotal);
+        d("ts_getSplit", ts_getSplit);
+        d("ts_dataSourceNext", ts_dataSourceNext);
+        d("ts_postNext", ts_postNext);
+        d("ts_createDataSource", ts_createDataSource);
+        d("ts_addSplit", ts_addSplit);
+        d("ts_preloadMove", ts_preloadMove);
+        d("ts_setFromDataSource", ts_setFromDataSource);
+        d("gs_addGlobalAggTotal", gs_addGlobalAggTotal);
+        d("gs_addRawInput", gs_addRawInput);
+        d("op_getOutput", op_getOutput);
+        d("op_addInput", op_addInput);
+    }
+};
+
+} // namespace facebook::velox::perf

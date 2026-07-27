@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "velox/exec/TableScan.h"
+#include "velox/common/base/PerfTracer.h"
 #include "velox/common/testutil/TestValue.h"
 #include "velox/common/time/Timer.h"
 #include "velox/connectors/ConnectorRegistry.h"
@@ -144,6 +145,8 @@ bool TableScan::shouldStop(StopReason taskStopReason) const {
 }
 
 RowVectorPtr TableScan::getOutput() {
+  namespace pt = facebook::velox::perf;
+  pt::ScopedTimer _st_total(&facebook::velox::perf::PerfTracer::instance().ts_getOutputTotal);
   VELOX_CHECK(!blockingFuture_.valid());
   blockingReason_ = BlockingReason::kNotBlocked;
 
@@ -198,6 +201,7 @@ RowVectorPtr TableScan::getOutput() {
 
     checkPreload();
     if (needNewSplit_) {
+      pt::ScopedTimer _st_split(&facebook::velox::perf::PerfTracer::instance().ts_getSplit);
       const auto hasNewSplit = getSplit();
       if (!hasNewSplit) {
         VELOX_CHECK(needNewSplit_);
@@ -222,6 +226,8 @@ RowVectorPtr TableScan::getOutput() {
       auto lk = driverCtx_->driver->pushdownFilters()->at(0).rlock();
       dataOptional = dataSource_->next(readBatchSize, blockingFuture_);
     }
+    facebook::velox::perf::PerfTracer::instance().ts_dataSourceNext.add(ioTimeUs);
+    pt::ScopedTimer _st_post(&facebook::velox::perf::PerfTracer::instance().ts_postNext);
 
     {
       auto lockedStats = stats_.wlock();
@@ -365,6 +371,7 @@ bool TableScan::getSplit() {
   if (dataSource_ == nullptr) {
     connectorQueryCtx_ = operatorCtx_->createConnectorQueryCtx(
         connectorSplit->connectorId, planNodeId(), connectorPool_);
+    facebook::velox::perf::ScopedTimer _st_cds(&facebook::velox::perf::PerfTracer::instance().ts_createDataSource);
     dataSource_ = createDataSource(
         driverCtx_->driver->pushdownFilters()->at(0),
         *connector_,
@@ -395,6 +402,7 @@ bool TableScan::getSplit() {
     // will be nullptr if there was a cancellation.
     numReadyPreloadedSplits_ += connectorSplit->dataSource->hasValue();
     auto startTimeNs = getCurrentTimeNano();
+    facebook::velox::perf::ScopedTimer _st_premove(&facebook::velox::perf::PerfTracer::instance().ts_preloadMove);
     auto preparedDataSource = connectorSplit->dataSource->move();
     auto endTimeNs = getCurrentTimeNano();
     stats_.wlock()->addRuntimeStat(
@@ -410,10 +418,12 @@ bool TableScan::getSplit() {
         RuntimeCounter(
             connectorSplit->dataSource->prepareTiming().wallNanos,
             RuntimeCounter::Unit::kNanos));
+    facebook::velox::perf::ScopedTimer _st_setfds(&facebook::velox::perf::PerfTracer::instance().ts_setFromDataSource);
     dataSource_->setFromDataSource(std::move(preparedDataSource));
   } else {
     uint64_t addSplitTimeUs{0};
     {
+      facebook::velox::perf::ScopedTimer _st_adds(&facebook::velox::perf::PerfTracer::instance().ts_addSplit);
       MicrosecondWallTimer timer(&addSplitTimeUs);
       auto lk = driverCtx_->driver->pushdownFilters()->at(0).rlock();
       dataSource_->addSplit(connectorSplit);

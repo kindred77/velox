@@ -686,12 +686,15 @@ StopReason Driver::runInternal(
 
             withDeltaCpuWallTimer(op, &OperatorStats::getOutputTiming, [&]() {
               TestValue::adjust(
-                  "facebook::velox::exec::Driver::runInternal::getOutput", op);
-              CALL_OPERATOR(
-                  getOutput(op, intermediateResult),
-                  op,
-                  curOperatorId_,
-                  kOpMethodGetOutput);
+                "facebook::velox::exec::Driver::runInternal::getOutput", op);
+            CALL_OPERATOR(
+                getOutput(op, intermediateResult),
+                op,
+                curOperatorId_,
+                kOpMethodGetOutput);
+            if (intermediateResult) {
+            } else {
+            }
               if (intermediateResult) {
                 validateOperatorOutputResult(intermediateResult, *op);
                 if (enableOperatorBatchSizeStats()) {
@@ -721,15 +724,15 @@ StopReason Driver::runInternal(
                           resultBytes, intermediateResult->size());
                     }
 
-                    TestValue::adjust(
-                        "facebook::velox::exec::Driver::runInternal::addInput",
-                        nextOp);
+                   TestValue::adjust(
+                       "facebook::velox::exec::Driver::runInternal::addInput",
+                       nextOp);
 
-                    CALL_OPERATOR(
-                        addInput(nextOp, intermediateResult),
-                        nextOp,
-                        curOperatorId_ + 1,
-                        kOpMethodAddInput);
+                  CALL_OPERATOR(
+                       addInput(nextOp, intermediateResult),
+                       nextOp,
+                       curOperatorId_ + 1,
+                       kOpMethodAddInput);
                   });
               // The next iteration will see if operators_[i + 1] has
               // output now that it got input.
@@ -772,12 +775,12 @@ StopReason Driver::runInternal(
                     nextOp, &OperatorStats::finishTiming, [this, &nextOp]() {
                       TestValue::adjust(
                           "facebook::velox::exec::Driver::runInternal::noMoreInput",
-                          nextOp);
-                      CALL_OPERATOR(
-                          nextOp->noMoreInput(),
-                          nextOp,
-                          curOperatorId_ + 1,
-                          kOpMethodNoMoreInput);
+                     nextOp);
+                     CALL_OPERATOR(
+                         nextOp->noMoreInput(),
+                         nextOp,
+                         curOperatorId_ + 1,
+                         kOpMethodNoMoreInput);
                     });
                 break;
               }
@@ -788,9 +791,12 @@ StopReason Driver::runInternal(
           // control here, so it can advance. If it is again blocked,
           // this will be detected when trying to add input, and we
           // will come back here after this is again on thread.
-          withDeltaCpuWallTimer(op, &OperatorStats::getOutputTiming, [&]() {
-            CALL_OPERATOR(
-                getOutput(op, result), op, curOperatorId_, kOpMethodGetOutput);
+         withDeltaCpuWallTimer(op, &OperatorStats::getOutputTiming, [&]() {
+           CALL_OPERATOR(
+               getOutput(op, result), op, curOperatorId_, kOpMethodGetOutput);
+            if (result) {
+            } else {
+            }
             if (result) {
               validateOperatorOutputResult(result, *op);
               vector_size_t resultByteSize{0};

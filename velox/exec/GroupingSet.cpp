@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "velox/exec/GroupingSet.h"
+#include "velox/common/base/PerfTracer.h"
 #include "velox/common/base/BitUtil.h"
 #include "velox/common/testutil/TestValue.h"
 #include "velox/exec/OperatorUtils.h"
@@ -623,6 +624,8 @@ void GroupingSet::initializeGlobalAggregation() {
 void GroupingSet::addGlobalAggregationInput(
     const RowVectorPtr& input,
     bool mayPushdown) {
+  namespace pt = facebook::velox::perf;
+  pt::ScopedTimer _st_total(&pt::PerfTracer::instance().gs_addGlobalAggTotal);
   initializeGlobalAggregation();
 
   auto numRows = input->size();
@@ -651,10 +654,31 @@ void GroupingSet::addGlobalAggregationInput(
 
     auto& function = aggregates_[i].function;
 
+    // Fast path: raw int64 sum with flat non-nullable input
+    if (isRawInput_ && aggregates_[i].inputs.size() == 1 && rows.isAllSelected()) {
+        auto* flat = input->childAt(aggregates_[i].inputs[0])->as<FlatVector<int64_t>>();
+        if (flat && !flat->mayHaveNulls() && flat->rawValues()) {
+            int64_t localSum = 0;
+            auto* data = flat->rawValues();
+            for (int32_t r = 0; r < numRows; ++r) {
+                localSum += data[r];
+            }
+            VectorPtr _fastVec = BaseVector::create(BIGINT(), 1, pool_);
+            auto* _flat = _fastVec->as<FlatVector<int64_t>>();
+            _flat->set(0, localSum);
+            std::vector<VectorPtr> _args = {_fastVec};
+            SelectivityVector _singleRow(1);
+            _singleRow.setAll();
+            function->addSingleGroupRawInput(group, _singleRow, _args, false);
+            continue;
+        }
+    }
+
     populateTempVectors(i, input);
     const bool canPushdown =
         mayPushdown && mayPushdown_[i] && areAllLazyNotLoaded(tempVectors_);
     if (isRawInput_) {
+      pt::ScopedTimer _st_raw(&pt::PerfTracer::instance().gs_addRawInput);
       function->addSingleGroupRawInput(group, rows, tempVectors_, canPushdown);
     } else {
       function->addSingleGroupIntermediateResults(

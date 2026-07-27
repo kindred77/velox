@@ -16,6 +16,8 @@
 #include "velox/exec/HashAggregation.h"
 
 #include <optional>
+#include <chrono>
+#include <iostream>
 #include "velox/common/testutil/TestValue.h"
 #include "velox/exec/OperatorType.h"
 #include "velox/exec/PrefixSort.h"
@@ -196,10 +198,14 @@ void HashAggregation::addInput(RowVectorPtr input) {
   if (abandonedPartialAggregation_) {
     input_ = input;
     numInputRows_ += input->size();
+    std::cerr << "[PROFILE] HashAgg addInput (abandoned) " << input->size() << " rows" << std::endl;
     return;
   }
+  auto _ha_add_start = std::chrono::steady_clock::now();
   groupingSet_->addInput(input, mayPushdown_);
   numInputRows_ += input->size();
+  auto _ha_add_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _ha_add_start).count();
+  std::cerr << "[PROFILE] HashAgg addInput " << input->size() << " rows " << _ha_add_us << " us" << std::endl;
 
   updateRuntimeStats();
 
@@ -395,13 +401,16 @@ RowVectorPtr HashAggregation::getOutput() {
   const auto maxOutputRows =
       isGlobal_ ? 1 : outputBatchRows(estimatedOutputRowSize_);
   // Reuse output vectors if possible.
-  prepareOutput(maxOutputRows);
+ prepareOutput(maxOutputRows);
+  auto _ha_getout_start = std::chrono::steady_clock::now();
 
-  const bool hasData = groupingSet_->getOutput(
+ const bool hasData = groupingSet_->getOutput(
       maxOutputRows,
       queryConfig.preferredOutputBatchBytes(),
       resultIterator_,
       output_);
+  auto _ha_getout_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _ha_getout_start).count();
+  std::cerr << "[PROFILE] HashAgg getOutput groupingSet_->getOutput " << _ha_getout_us << " us outputRows=" << (output_ ? output_->size() : 0) << std::endl;
   if (!hasData) {
     resultIterator_.reset();
     resetPartialOutputIfNeed();
@@ -530,8 +539,11 @@ RowVectorPtr HashAggregation::getDefaultGlobalGroupingSetOutput() {
 }
 
 void HashAggregation::noMoreInput() {
+  auto _ha_nmi_start = std::chrono::steady_clock::now();
   updateEstimatedOutputRowSize();
   groupingSet_->noMoreInput();
+  auto _ha_nmi_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - _ha_nmi_start).count();
+  std::cerr << "[PROFILE] HashAgg noMoreInput " << _ha_nmi_us << " us" << std::endl;
   Operator::noMoreInput();
 
   // May park this driver on 'future_' for the peer election, surfaced by
