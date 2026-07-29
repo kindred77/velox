@@ -13,11 +13,14 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "velox/common/base/PerfTracer.h"
 #include "velox/exec/FilterProject.h"
 #include "velox/core/Expressions.h"
 #include "velox/exec/Driver.h"
 #include "velox/exec/OperatorType.h"
 #include "velox/expression/Expr.h"
+
+namespace pt = facebook::velox::perf;
 #include "velox/expression/FieldReference.h"
 
 namespace facebook::velox::exec {
@@ -190,6 +193,7 @@ void FilterProject::initialize() {
 }
 
 void FilterProject::addInput(RowVectorPtr input) {
+  pt::ScopedTimer _st(&pt::PerfTracer::instance().fp_addInput);
   input_ = std::move(input);
 }
 
@@ -198,6 +202,7 @@ bool FilterProject::isFinished() {
 }
 
 RowVectorPtr FilterProject::getOutput() {
+  pt::ScopedTimer _st(&pt::PerfTracer::instance().fp_getOutput);
   if (!input_) {
     return nullptr;
   }

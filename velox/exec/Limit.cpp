@@ -13,9 +13,12 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "velox/common/base/PerfTracer.h"
 #include "velox/exec/Limit.h"
 
 #include "velox/exec/OperatorType.h"
+
+namespace pt = facebook::velox::perf;
 
 namespace facebook::velox::exec {
 Limit::Limit(
@@ -48,11 +51,13 @@ bool Limit::needsInput() const {
 }
 
 void Limit::addInput(RowVectorPtr input) {
+  pt::ScopedTimer _st(&pt::PerfTracer::instance().lm_addInput);
   VELOX_CHECK_NULL(input_);
   input_ = input;
 }
 
 RowVectorPtr Limit::getOutput() {
+  pt::ScopedTimer _st(&pt::PerfTracer::instance().lm_getOutput);
   VELOX_DCHECK(!isDraining());
 
   if ((input_ == nullptr) || (remainingOffset_ == 0 && remainingLimit_ == 0)) {

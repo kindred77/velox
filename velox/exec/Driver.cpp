@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "velox/common/base/PerfTracer.h"
 #include "velox/exec/Driver.h"
 
 #include <atomic>
@@ -520,14 +521,19 @@ bool Driver::checkUnderArbitration(ContinueFuture* future) {
   return task()->queryCtx()->checkUnderArbitration(future);
 }
 
+
+namespace pt = facebook::velox::perf;
+
 namespace {
 inline void addInput(Operator* op, const RowVectorPtr& input) {
+  pt::ScopedTimer _st(&pt::PerfTracer::instance().op_addInput);
   if (FOLLY_LIKELY(!op->dryRun())) {
     op->addInput(input);
   }
 }
 
 inline void getOutput(Operator* op, RowVectorPtr& result) {
+  pt::ScopedTimer _st(&pt::PerfTracer::instance().op_getOutput);
   result = op->getOutput();
   if (FOLLY_UNLIKELY(op->shouldDropOutput())) {
     result = nullptr;

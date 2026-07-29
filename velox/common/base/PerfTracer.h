@@ -66,6 +66,22 @@ struct PerfTracer {
     Counter op_getOutput;
     Counter op_addInput;
 
+    // FilterProject
+    Counter fp_addInput;
+    Counter fp_getOutput;
+
+    // HashAggregation
+    Counter ha_addInput;
+    Counter ha_getOutput;
+
+    // OrderBy
+    Counter ob_addInput;
+    Counter ob_getOutput;
+
+    // LocalPartition / LocalMerge / Limit
+    Counter lm_addInput;
+    Counter lm_getOutput;
+
     static PerfTracer& instance() {
         static PerfTracer inst;
         return inst;
@@ -105,6 +121,14 @@ struct PerfTracer {
         d("gs_addRawInput", gs_addRawInput);
         d("op_getOutput", op_getOutput);
         d("op_addInput", op_addInput);
+        d("fp_addInput", fp_addInput);
+        d("fp_getOutput", fp_getOutput);
+        d("ha_addInput", ha_addInput);
+        d("ha_getOutput", ha_getOutput);
+        d("ob_addInput", ob_addInput);
+        d("ob_getOutput", ob_getOutput);
+        d("lm_addInput", lm_addInput);
+        d("lm_getOutput", lm_getOutput);
     }
 };
 

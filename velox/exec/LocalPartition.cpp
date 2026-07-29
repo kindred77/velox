@@ -19,6 +19,9 @@
 #include "velox/exec/OperatorType.h"
 #include "velox/exec/Task.h"
 #include "velox/vector/EncodedVectorCopy.h"
+#include "velox/common/base/PerfTracer.h"
+
+namespace pt = facebook::velox::perf;
 
 namespace facebook::velox::exec {
 namespace {
@@ -284,6 +287,7 @@ BlockingReason LocalExchange::isBlocked(ContinueFuture* future) {
 }
 
 RowVectorPtr LocalExchange::getOutput() {
+  pt::ScopedTimer _st(&pt::PerfTracer::instance().lm_getOutput);
   if (hasDrained()) {
     return nullptr;
   }
@@ -578,6 +582,7 @@ void LocalPartition::populateAndEnqueuePartitions(
 }
 
 void LocalPartition::addInput(RowVectorPtr input) {
+  pt::ScopedTimer _st(&pt::PerfTracer::instance().lm_addInput);
   prepareForInput(input);
   if (input->size() == 0) {
     return;
