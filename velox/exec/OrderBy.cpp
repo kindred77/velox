@@ -46,19 +46,25 @@ OrderBy::OrderBy(
               : std::nullopt) {
   maxOutputRows_ = outputBatchRows(std::nullopt);
   VELOX_CHECK(pool()->trackUsage());
+  orderByNode_ = orderByNode;
+}
+
+void OrderBy::initialize() {
+  Operator::initialize();
+
   std::vector<column_index_t> sortColumnIndices;
   std::vector<CompareFlags> sortCompareFlags;
-  sortColumnIndices.reserve(orderByNode->sortingKeys().size());
-  sortCompareFlags.reserve(orderByNode->sortingKeys().size());
-  for (int i = 0; i < orderByNode->sortingKeys().size(); ++i) {
+  sortColumnIndices.reserve(orderByNode_->sortingKeys().size());
+  sortCompareFlags.reserve(orderByNode_->sortingKeys().size());
+  for (int i = 0; i < orderByNode_->sortingKeys().size(); ++i) {
     const auto channel =
-        exprToChannel(orderByNode->sortingKeys()[i].get(), outputType_);
+        exprToChannel(orderByNode_->sortingKeys()[i].get(), outputType_);
     VELOX_CHECK(
         channel != kConstantChannel,
         "OrderBy doesn't allow constant sorting keys");
     sortColumnIndices.push_back(channel);
     sortCompareFlags.push_back(
-        fromSortOrderToCompareFlags(orderByNode->sortingOrders()[i]));
+        fromSortOrderToCompareFlags(orderByNode_->sortingOrders()[i]));
   }
   sortBuffer_ = std::make_unique<SortBuffer>(
       outputType_,
@@ -66,7 +72,7 @@ OrderBy::OrderBy(
       sortCompareFlags,
       pool(),
       &nonReclaimableSection_,
-      driverCtx->prefixSortConfig(),
+      operatorCtx()->driverCtx()->prefixSortConfig(),
       spillConfig_.has_value() ? &(spillConfig_.value()) : nullptr,
       spillStats_.get());
 }

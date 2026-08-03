@@ -38,6 +38,8 @@ class OrderBy : public Operator {
       DriverCtx* driverCtx,
       const std::shared_ptr<const core::OrderByNode>& orderByNode);
 
+  void initialize() override;
+
   bool needsInput() const override {
     return !finished_;
   }
@@ -62,6 +64,7 @@ class OrderBy : public Operator {
   void close() override;
 
  private:
+  std::shared_ptr<const core::OrderByNode> orderByNode_;
   std::unique_ptr<SortBuffer> sortBuffer_;
   bool finished_ = false;
   vector_size_t maxOutputRows_;
