@@ -53,6 +53,10 @@ class AdaptivePrefetch {
     auto elapsedNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
                          std::chrono::steady_clock::now() - start_)
                          .count();
+    // On a fast machine the
+    // 16 measurement iterations can finish within the same clock tick, making
+    // the division below raise STATUS_INTEGER_DIVIDE_BY_ZERO (0xC0000094).
+    elapsedNs = std::max<int64_t>(elapsedNs, 1);
     lookAhead_ = std::clamp(
         static_cast<int32_t>(
             kCoefficient * kAssumedDramLatencyNs * kMeasurementIterations /
