@@ -31,7 +31,11 @@ struct ParquetStatsContext : dwio::common::StatsContext {
 
   bool shouldIgnoreStatistics(thrift::Type type) const {
     if (!parquetVersion.has_value()) {
-      return true;
+      // Unknown writer (e.g. files written by DuckDB). Numeric min/max
+      // statistics are exact values and safe to use for row-group pruning;
+      // only string statistics may be truncated, so keep them conservative.
+      return type == thrift::Type::BYTE_ARRAY ||
+          type == thrift::Type::FIXED_LEN_BYTE_ARRAY;
     }
     return parquetVersion->shouldIgnoreStatistics(type);
   }
