@@ -1419,7 +1419,8 @@ class ParquetRowReader::Impl {
     if (rowGroups_.empty()) {
       return; // TODO
     }
-    parquetStatsContext_ = ParquetStatsContext(readerBase_->version());
+    parquetStatsContext_ = ParquetStatsContext(
+        readerBase_->version(), readerBase_->fileMetaData().createdBy());
     ParquetParams params(
         pool_,
         columnReaderStats_,
