@@ -661,14 +661,19 @@ struct Gather<T, int32_t, A, 4> {
     std::memcpy(&srcReg, &src, sizeof(src));
     std::memcpy(&maskReg, &mask, sizeof(mask));
     std::memcpy(&vindexReg, &vindex, sizeof(vindex));
-    
-    auto result = _mm256_mask_i32gather_epi32(
-        srcReg,
-        reinterpret_cast<const int32_t*>(base),
-        vindexReg,
-        maskReg,
-        kScale);
-    
+
+    // Portability: the AVX2 *masked* gather (vpgatherdd) raises
+    // STATUS_ILLEGAL_INSTRUCTION (0xC000001D) in some environments even though
+    // CPUID reports AVX2 (unmasked gather works fine). Implement the same
+    // semantics portably: zero the indices of masked-off lanes, do an unmasked
+    // gather (all lanes read a valid address), then blend the src back for the
+    // masked-off lanes. Behavior is identical on all machines.
+    const auto safeIndex = _mm256_blendv_epi8(
+        _mm256_setzero_si256(), vindexReg, maskReg);
+    const auto gathered = _mm256_i32gather_epi32(
+        reinterpret_cast<const int32_t*>(base), safeIndex, kScale);
+    const auto result = _mm256_blendv_epi8(srcReg, gathered, maskReg);
+
     xsimd::batch<T, A> batch;
     std::memcpy(&batch, &result, sizeof(result));
     return batch;
@@ -867,14 +872,21 @@ struct Gather<T, int32_t, A, 8> {
     std::memcpy(&srcReg, &src, sizeof(src));
     std::memcpy(&maskReg, &mask, sizeof(mask));
     std::memcpy(&vindexReg, &vindex, sizeof(vindex));
-    
-    auto result = _mm256_mask_i32gather_epi64(
-        srcReg,
-        reinterpret_cast<const long long*>(base),
-        vindexReg,
-        maskReg,
-        kScale);
-    
+
+    // Portability: see the int32 variant above (masked gather faults in some
+    // environments). Build a per-int32-index mask from the 64-bit lane masks.
+    const int mm = _mm256_movemask_epi8(maskReg);
+    const __m128i indexMask = _mm_setr_epi32(
+        (mm >> 7) & 1 ? -1 : 0,
+        (mm >> 15) & 1 ? -1 : 0,
+        (mm >> 23) & 1 ? -1 : 0,
+        (mm >> 31) & 1 ? -1 : 0);
+    const auto safeIndex =
+        _mm_blendv_epi8(_mm_setzero_si128(), vindexReg, indexMask);
+    const auto gathered = _mm256_i32gather_epi64(
+        reinterpret_cast<const long long*>(base), safeIndex, kScale);
+    const auto result = _mm256_blendv_epi8(srcReg, gathered, maskReg);
+
     xsimd::batch<T, A> batch;
     std::memcpy(&batch, &result, sizeof(result));
     return batch;
@@ -944,12 +956,19 @@ struct Gather<T, int64_t, A, 8> {
       const T* base,
       VIndexType vindex,
       const xsimd::avx2&) {
-    auto result = _mm256_mask_i64gather_epi64(
-        src,
-        reinterpret_cast<const long long*>(base),
-        vindex,
-        mask,
-        kScale);
+    __m256i srcReg, maskReg, vindexReg;
+    std::memcpy(&srcReg, &src, sizeof(src));
+    std::memcpy(&maskReg, &mask, sizeof(mask));
+    std::memcpy(&vindexReg, &vindex, sizeof(vindex));
+
+    // Portability: see the int32 variant above (masked gather faults in some
+    // environments).
+    const auto safeIndex = _mm256_blendv_epi8(
+        _mm256_setzero_si256(), vindexReg, maskReg);
+    const auto gathered = _mm256_i64gather_epi64(
+        reinterpret_cast<const long long*>(base), safeIndex, kScale);
+    const auto result = _mm256_blendv_epi8(srcReg, gathered, maskReg);
+
     xsimd::batch<T, A> batch;
     std::memcpy(&batch, &result, sizeof(result));
     return batch;
