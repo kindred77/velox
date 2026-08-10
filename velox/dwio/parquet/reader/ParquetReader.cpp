@@ -1577,6 +1577,11 @@ class ParquetRowReader::Impl {
     }
 
     currentRowInGroup_ += rowsToRead;
+    // Count rows that actually pass the reader's filters; used for
+    // ordered-scan early termination.
+    if (result != nullptr) {
+      rowsOutput_ += result->size();
+    }
     return rowsToRead;
   }
 
@@ -1614,6 +1619,14 @@ class ParquetRowReader::Impl {
     if (nextRowGroupIdsIdx_ == rowGroupIds_.size()) {
       return false;
     }
+    // Early termination: the completed row-group prefix already produced
+    // enough rows passing the filters. Row groups are processed in file order,
+    // so no later row group can contribute to an ordered top-N beyond the
+    // first `earlyStopRows` matching rows.
+    if (options_.earlyStopRows().has_value() &&
+        rowsOutput_ >= *options_.earlyStopRows()) {
+      return false;
+    }
 
     auto nextRowGroupIndex = rowGroupIds_[nextRowGroupIdsIdx_];
     readerBase_->scheduleRowGroups(
@@ -1642,6 +1655,7 @@ class ParquetRowReader::Impl {
   const thrift::RowGroup* currentRowGroupPtr_{nullptr};
   uint64_t rowsInCurrentRowGroup_;
   uint64_t currentRowInGroup_;
+  uint64_t rowsOutput_{0};
   uint32_t skippedStrides_{0};
 
   std::unique_ptr<dwio::common::SelectiveColumnReader> columnReader_;

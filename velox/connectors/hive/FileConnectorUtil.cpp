@@ -24,6 +24,7 @@
 #include "velox/connectors/hive/FileConfig.h"
 #include "velox/connectors/hive/FileConnectorSplit.h"
 #include "velox/connectors/hive/FileTableHandle.h"
+#include "velox/connectors/hive/HiveConnectorSplit.h"
 #include "velox/dwio/common/Options.h"
 #include "velox/dwio/common/ReaderFactory.h"
 
@@ -187,6 +188,12 @@ void configureRowReaderOptions(
   rowReaderOptions.setMetadataFilter(std::move(metadataFilter));
   rowReaderOptions.setRequestedType(rowType);
   rowReaderOptions.range(fileSplit->start, fileSplit->length);
+  if (auto hiveSplit =
+          std::dynamic_pointer_cast<const HiveConnectorSplit>(fileSplit)) {
+    if (hiveSplit->earlyStopRows.has_value()) {
+      rowReaderOptions.setEarlyStopRows(*hiveSplit->earlyStopRows);
+    }
+  }
   if (fileConfig && sessionProperties) {
     rowReaderOptions.setTimestampPrecision(
         static_cast<TimestampPrecision>(

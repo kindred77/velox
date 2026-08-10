@@ -106,6 +106,9 @@ folly::dynamic HiveConnectorSplit::serialize() const {
     rowIdObj["tableGuid"] = rowIdProperties->tableGuid;
     obj["rowIdProperties"] = rowIdObj;
   }
+  obj["earlyStopRows"] = earlyStopRows.has_value()
+      ? folly::dynamic(earlyStopRows.value())
+      : nullptr;
 
   return obj;
 }
@@ -191,7 +194,7 @@ std::shared_ptr<HiveConnectorSplit> HiveConnectorSplit::create(
         .tableGuid = rowIdObj["tableGuid"].asString()};
   }
 
-  return std::make_shared<HiveConnectorSplit>(
+  auto split = std::make_shared<HiveConnectorSplit>(
       connectorId,
       filePath,
       fileFormat,
@@ -208,6 +211,11 @@ std::shared_ptr<HiveConnectorSplit> HiveConnectorSplit::create(
       properties,
       rowIdProperties,
       bucketConversion);
+  const auto& earlyStopObj = obj.getDefault("earlyStopRows", nullptr);
+  if (earlyStopObj != nullptr) {
+    split->earlyStopRows = earlyStopObj.asInt();
+  }
+  return split;
 }
 
 // static
