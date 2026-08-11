@@ -726,7 +726,7 @@ velox_set_source(gflags)
 if(WIN32)
   velox_resolve_dependency(gflags)
 else()
-  velox_resolve_dependency(gflags COMPONENTS ${VELOX_GFLAGS_TYPE})
+  velox_resolve_dependency(gflags)
 endif()
 
 if(NOT TARGET gflags::gflags)

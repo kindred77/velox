@@ -29,7 +29,7 @@ message(STATUS "Building simdjson from source")
 
 FetchContent_Declare(
   simdjson
-  SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}/../../third_libs/simdjson-3.9.3
+  SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}/../../thirdpart_libs/simdjson-4.1.0
   #URL ${VELOX_SIMDJSON_SOURCE_URL}
   #URL_HASH ${VELOX_SIMDJSON_BUILD_SHA256_CHECKSUM}
 )
