@@ -40,4 +40,4 @@ then build with ninja.
 In Clion, you should use the VS toolchains, with amd64 Architecture and Empty platform.
 
 
-In linux, you should download protobuf-3.21.7,simdjson-4.1.0 and put it in thirdpart_libs with velox source building option.
+In linux, you should download folly_v2026.01.05.00,libstemmer_c-2.2.0,protobuf-3.21.7,simdjson-4.1.0 and put them in thirdpart_libs with velox source building option.

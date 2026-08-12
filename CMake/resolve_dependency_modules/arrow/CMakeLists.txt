@@ -32,6 +32,17 @@ if(VELOX_ENABLE_ARROW)
     ARROW_CMAKE_ARGS
     -DARROW_PARQUET=OFF
     -DARROW_DEPENDENCY_SOURCE=AUTO
+    # vcpkg static triplets (x64-linux / x64-windows-static-md) only ship
+    # static zstd/lz4/snappy/zlib, but Arrow defaults ARROW_DEPENDENCY_USE_SHARED
+    # to ON and then fails with "Zstandard target doesn't exist:
+    # zstd::libzstd_shared". Force static dependencies to match. The per-dep
+    # flags are set explicitly because a stale arrow_ep-build CMakeCache keeps
+    # the old ON defaults even when ARROW_DEPENDENCY_USE_SHARED changes.
+    -DARROW_DEPENDENCY_USE_SHARED=OFF
+    -DARROW_ZSTD_USE_SHARED=OFF
+    -DARROW_LZ4_USE_SHARED=OFF
+    -DARROW_SNAPPY_USE_SHARED=OFF
+    -DARROW_ZLIB_USE_SHARED=OFF
     -DARROW_WITH_LZ4=ON
     -DARROW_WITH_SNAPPY=ON
     -DARROW_WITH_ZLIB=ON
@@ -40,7 +51,11 @@ if(VELOX_ENABLE_ARROW)
     -DARROW_SIMD_LEVEL=NONE
     -DARROW_RUNTIME_SIMD_LEVEL=NONE
     -DARROW_WITH_UTF8PROC=OFF
-    -DARROW_TESTING=ON
+    # Velox's own tests are disabled in this project (VELOX_BUILD_TESTING=OFF),
+    # so arrow_testing is not needed. Building it with vcpkg Boost 1.87+ fails
+    # because arrow 18's arrow/testing/process.cc uses the old boost::process
+    # API, which Boost 1.88 exposes only under boost/process/v1.
+    -DARROW_TESTING=OFF
     -DCMAKE_INSTALL_LIBDIR=lib
     -DCMAKE_INSTALL_PREFIX=${ARROW_PREFIX}/install
     -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
@@ -78,21 +93,23 @@ if(VELOX_ENABLE_ARROW)
     URL_HASH ${VELOX_ARROW_BUILD_SHA256_CHECKSUM}
     SOURCE_SUBDIR cpp
     CMAKE_ARGS ${ARROW_CMAKE_ARGS}
-    BUILD_BYPRODUCTS ${ARROW_LIBDIR}/libarrow.a ${ARROW_LIBDIR}/libarrow_testing.a
+    # When ARROW_TESTING is re-enabled, restore the byproduct below:
+    # BUILD_BYPRODUCTS ${ARROW_LIBDIR}/libarrow.a ${ARROW_LIBDIR}/libarrow_testing.a
+    BUILD_BYPRODUCTS ${ARROW_LIBDIR}/libarrow.a
     PATCH_COMMAND
       patch -p1 -i ${CMAKE_CURRENT_LIST_DIR}/cmake-compatibility.patch && patch -p1 -i
       ${CMAKE_CURRENT_LIST_DIR}/arrow-testing-boost.patch
   )
 
   add_library(arrow STATIC IMPORTED GLOBAL)
-  add_library(arrow_testing STATIC IMPORTED GLOBAL)
+#  add_library(arrow_testing STATIC IMPORTED GLOBAL)
   add_dependencies(arrow arrow_ep)
-  add_dependencies(arrow_testing arrow)
+#  add_dependencies(arrow_testing arrow)
   file(MAKE_DIRECTORY ${ARROW_PREFIX}/install/include)
   set_target_properties(
-    arrow
-    arrow_testing
-    PROPERTIES INTERFACE_INCLUDE_DIRECTORIES ${ARROW_PREFIX}/install/include
+      arrow
+#      arrow_testing
+      PROPERTIES INTERFACE_INCLUDE_DIRECTORIES ${ARROW_PREFIX}/install/include
   )
   set_target_properties(arrow PROPERTIES IMPORTED_LOCATION ${ARROW_LIBDIR}/libarrow.a)
   set_property(TARGET arrow PROPERTY INTERFACE_LINK_LIBRARIES ${RE2})
@@ -100,10 +117,10 @@ if(VELOX_ENABLE_ARROW)
   # the SYSTEM-arrow comment there for the ODR-violation rationale that
   # forces us to use ${ARROW_LIBDIR}/libarrow.a (path) instead of the
   # `arrow` target name.
-  set_target_properties(
-    arrow_testing
-    PROPERTIES
-      IMPORTED_LOCATION ${ARROW_LIBDIR}/libarrow_testing.a
-      INTERFACE_LINK_LIBRARIES ${ARROW_LIBDIR}/libarrow.a
-  )
+#  set_target_properties(
+#    arrow_testing
+#    PROPERTIES
+#      IMPORTED_LOCATION ${ARROW_LIBDIR}/libarrow_testing.a
+#      INTERFACE_LINK_LIBRARIES ${ARROW_LIBDIR}/libarrow.a
+#  )
 endif()

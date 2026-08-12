@@ -54,3 +54,17 @@ set(protobuf_BUILD_TESTS OFF)
 set(protobuf_ABSL_PROVIDER "package")
 FetchContent_MakeAvailable(protobuf)
 set(Protobuf_INCLUDE_DIRS ${protobuf_SOURCE_DIR}/src)
+
+# protobuf's own targets propagate ${protobuf_SOURCE_DIR}/src as an INTERFACE
+# include dir, which CMake emits as -isystem AFTER vcpkg's include dir. GCC then
+# resolves google/protobuf/*.h from vcpkg's protobuf 29.3 headers instead of the
+# bundled 3.21.7 headers, which shows up at link time as undefined
+# 'ZeroCopyInputStream::ReadCord' (a virtual added in newer protobuf). The
+# non-system include_directories(${Protobuf_INCLUDE_DIRS}) in velox CMakeLists
+# already puts the bundled headers first; drop the duplicate interface includes.
+foreach(_protobuf_target IN ITEMS libprotobuf libprotobuf-lite)
+  if(TARGET ${_protobuf_target})
+    set_property(TARGET ${_protobuf_target} PROPERTY INTERFACE_INCLUDE_DIRECTORIES "")
+  endif()
+endforeach()
+unset(_protobuf_target)

@@ -605,9 +605,11 @@ static const flex_int16_t yy_chk[693] =
 #define INITIAL 0
 
 /*windows compatibility case*/
+#ifdef _WIN32
 #include <io.h>
 #define isatty _isatty
 #define fileno _fileno
+#endif
     
 #ifndef YY_EXTRA_TYPE
 #define YY_EXTRA_TYPE void *
@@ -1875,4 +1877,3 @@ facebook::velox::TypePtr facebook::velox::functions::prestosql::parseType(const 
     VELOX_CHECK(type, "Failed to parse type [{}]", typeText);
     return type;
 }
-

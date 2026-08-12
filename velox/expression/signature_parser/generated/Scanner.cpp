@@ -496,9 +496,11 @@ std::string unescape_doublequote(const char* yytext) {
 #define INITIAL 0
 
 /*windows compatibility case*/
+#ifdef _WIN32
 #include <io.h>
 #define isatty _isatty
 #define fileno _fileno
+#endif
     
 #ifndef YY_EXTRA_TYPE
 #define YY_EXTRA_TYPE void *
@@ -1730,4 +1732,3 @@ facebook::velox::exec::TypeSignature facebook::velox::exec::parseTypeSignature(
   VELOX_CHECK(signature, "Failed to parse signature [{}]", signatureText);
   return std::move(*signature);
 }
-

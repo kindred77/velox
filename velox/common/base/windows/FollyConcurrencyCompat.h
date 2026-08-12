@@ -15,16 +15,17 @@
  */
 #pragma once
 
-// Windows build compatibility shim.
+// Build compatibility shim.
 //
 // Velox calls folly::available_concurrency(), a cgroup-aware helper that was
 // added to folly after the folly version pinned by the Windows vcpkg manifest.
 // The pinned folly only provides folly::hardware_concurrency(). Windows has no
-// cgroup CPU accounting, so hardware_concurrency() is an exact substitute.
+// cgroup CPU accounting, so hardware_concurrency() is an exact substitute;
+// on POSIX it is a close approximation (cgroup awareness is not critical for
+// thread-count sizing here).
 //
-// This header is only included on Windows; POSIX builds use folly's real
-// available_concurrency() and never see this shim.
-#ifdef _WIN32
+// The vcpkg folly lacks available_concurrency() on all platforms, so this shim
+// is applied unconditionally.
 #include <folly/system/HardwareConcurrency.h>
 
 namespace folly {
@@ -32,4 +33,3 @@ inline unsigned int available_concurrency() noexcept {
   return hardware_concurrency();
 }
 } // namespace folly
-#endif // _WIN32

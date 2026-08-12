@@ -38,8 +38,14 @@ Timestamp toInt64Timestamp(int64_t value, TimestampPrecision filePrecision) {
 
 Timestamp toInt96Timestamp(const int128_t& value) {
   // Convert int128_t to Int96 Timestamp by extracting days and nanos.
+#ifdef _MSC_VER
   const int32_t days = static_cast<int32_t>(value.high());
   const uint64_t nanos = value.low();
+#else
+  // Native __int128 has no high()/low() accessors; extract via shifts/casts.
+  const int32_t days = static_cast<int32_t>(static_cast<int64_t>(value >> 64));
+  const uint64_t nanos = static_cast<uint64_t>(value);
+#endif
   return Timestamp::fromDaysAndNanos(days, nanos);
 }
 

@@ -42,12 +42,11 @@ endif()
 
 FetchContent_Declare(
   folly
-  SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}/../../../third_libs/folly
+  SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}/../../../thirdpart_libs/folly_v2026.01.05.00
   #URL ${VELOX_FOLLY_SOURCE_URL}
   #URL_HASH ${VELOX_FOLLY_BUILD_SHA256_CHECKSUM}
   #PATCH_COMMAND git apply ${CMAKE_CURRENT_LIST_DIR}/folly-no-export.patch ${glog_patch}
   OVERRIDE_FIND_PACKAGE
-  SYSTEM
   EXCLUDE_FROM_ALL
 )
 
@@ -56,11 +55,30 @@ set(BUILD_SHARED_LIBS ${VELOX_BUILD_SHARED})
 # Enable INT128 support
 set(FOLLY_HAVE_INT128_T ON)
 
+# vcpkg's glog (0.7+) requires consumers to define these macros, otherwise its
+# headers fail with "#error <glog/logging.h> was not included correctly". The
+# bundled folly build does not manage a glog::glog target that would carry them
+# (its TU includes <glog/logging.h> directly, e.g. CancellationToken-inl.h), so
+# provide them for the folly sub-build.
+add_compile_definitions(GLOG_USE_GLOG_EXPORT GLOG_USE_GFLAGS)
+
 FetchContent_MakeAvailable(folly)
 
 # Folly::folly is not valid for FC but we want to match FindFolly
 add_library(Folly::folly ALIAS folly)
 add_library(Folly::follybenchmark ALIAS follybenchmark)
+
+# With vcpkg (system) folly, the glog compile definitions reached velox targets
+# transitively via Folly::folly -> glog::glog. The bundled folly target does not
+# carry that link edge, so velox targets that include glog headers through folly
+# (e.g. velox_encode) would compile without GLOG_USE_GLOG_EXPORT. Attach the
+# same definitions to Folly::folly to keep behavior identical.
+if(TARGET folly)
+  set_property(
+    TARGET folly
+    APPEND PROPERTY INTERFACE_COMPILE_DEFINITIONS GLOG_USE_GLOG_EXPORT GLOG_USE_GFLAGS
+  )
+endif()
 
 if(gflags_SOURCE STREQUAL "BUNDLED")
   add_dependencies(folly glog::glog gflags::gflags fmt::fmt)
