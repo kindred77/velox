@@ -16,9 +16,7 @@
 
 #include "velox/common/memory/SharedArbitrator.h"
 #include <folly/system/HardwareConcurrency.h>
-#ifdef _WIN32
 #include "velox/common/base/windows/FollyConcurrencyCompat.h"
-#endif
 #include <folly/system/ThreadName.h>
 #ifndef _WIN32
 #include <pthread.h>

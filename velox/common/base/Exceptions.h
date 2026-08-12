@@ -320,6 +320,10 @@ struct VeloxCheckFailStringType<std::string> {
 
 DECLARE_CHECK_FAIL_TEMPLATES(::facebook::velox::VeloxRuntimeError)
 
+#ifdef _MSC_VER
+// MSVC's preprocessor needs FB_VA_GLUE to force expansion of the nested
+// variadic call; GCC/Clang expand the direct form fine but leave the
+// FB_VA_GLUE wrapper unexpanded when __VA_ARGS__ is empty.
 #define _VELOX_CHECK_IMPL(expr, exprStr, ...)                 \
   FB_VA_GLUE(                                                  \
       _VELOX_CHECK_AND_THROW_IMPL,                             \
@@ -330,6 +334,17 @@ DECLARE_CHECK_FAIL_TEMPLATES(::facebook::velox::VeloxRuntimeError)
        ::facebook::velox::error_code::kInvalidState,           \
        /* isRetriable */ false,                                \
        ##__VA_ARGS__))
+#else
+#define _VELOX_CHECK_IMPL(expr, exprStr, ...)                 \
+  _VELOX_CHECK_AND_THROW_IMPL(                                \
+      expr,                                                   \
+      exprStr,                                                \
+      ::facebook::velox::VeloxRuntimeError,                   \
+      ::facebook::velox::error_source::kErrorSourceRuntime,   \
+      ::facebook::velox::error_code::kInvalidState,           \
+      /* isRetriable */ false,                                \
+      ##__VA_ARGS__)
+#endif
 
 /// Throws VeloxRuntimeError when functions receive input values out of the
 /// supported range. This should only be used when we want to force TRY() to not
@@ -363,6 +378,7 @@ DECLARE_CHECK_FAIL_TEMPLATES(::facebook::velox::VeloxRuntimeError)
       expr2,                                    \
       ##__VA_ARGS__)
 
+#ifdef _MSC_VER
 #define _VELOX_CHECK_OP_HELPER(implmacro, expr1, expr2, op, ...) \
   do {                                                           \
     if constexpr (FOLLY_PP_DETAIL_NARGS(__VA_ARGS__) > 0) {      \
@@ -378,6 +394,22 @@ DECLARE_CHECK_FAIL_TEMPLATES(::facebook::velox::VeloxRuntimeError)
           expr2);                                                \
     }                                                            \
   } while (0)
+#else
+#define _VELOX_CHECK_OP_HELPER(implmacro, expr1, expr2, op, ...) \
+  do {                                                           \
+    if constexpr (FOLLY_PP_DETAIL_NARGS(__VA_ARGS__) > 0) {      \
+      _VELOX_CHECK_OP_WITH_USER_FMT_HELPER(                     \
+          implmacro, expr1, expr2, op, __VA_ARGS__);             \
+    } else {                                                     \
+      implmacro(                                                 \
+          (expr1)op(expr2),                                      \
+          #expr1 " " #op " " #expr2,                             \
+          "({} vs. {})",                                         \
+          expr1,                                                 \
+          expr2);                                                \
+    }                                                            \
+  } while (0)
+#endif
 
 #define _VELOX_CHECK_OP(expr1, expr2, op, ...) \
   _VELOX_CHECK_OP_HELPER(_VELOX_CHECK_IMPL, expr1, expr2, op, ##__VA_ARGS__)

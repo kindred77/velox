@@ -41,6 +41,13 @@ if(NOT TARGET glog::glog)
   set_target_properties(glog::glog PROPERTIES INTERFACE_INCLUDE_DIRECTORIES "${GLOG_INCLUDE_DIRS}")
   set_target_properties(
     glog::glog
-    PROPERTIES IMPORTED_LINK_INTERFACE_LANGUAGES "C" IMPORTED_LOCATION "${GLOG_LIBRARIES}"
+    PROPERTIES
+      IMPORTED_LINK_INTERFACE_LANGUAGES "C"
+      IMPORTED_LOCATION "${GLOG_LIBRARIES}"
+      # glog 0.7+ (e.g. vcpkg) requires consumers to define these macros,
+      # otherwise glog/logging.h fails with "#error <glog/logging.h> was not
+      # included correctly". Match vcpkg's glog-targets.cmake so velox works
+      # with both system and vcpkg glog on all platforms.
+      INTERFACE_COMPILE_DEFINITIONS "GLOG_USE_GLOG_EXPORT;GLOG_USE_GFLAGS"
   )
 endif()

@@ -444,9 +444,11 @@ static const flex_int16_t yy_chk[62] =
 #define INITIAL 0
 
 /*windows compatibility case*/
+#ifdef _WIN32
 #include <io.h>
 #define isatty _isatty
 #define fileno _fileno
+#endif
     
 #ifndef YY_EXTRA_TYPE
 #define YY_EXTRA_TYPE void *
@@ -1726,4 +1728,3 @@ void facebook::velox::expression::calculation::evaluate(
   facebook::velox::expression::calculate::Parser parser{&scanner};
   parser.parse();
 }
-

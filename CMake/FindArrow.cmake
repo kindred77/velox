@@ -63,21 +63,27 @@ endif()
 include(FindPackageHandleStandardArgs)
 
 find_library(ARROW_LIB libarrow.a)
-find_library(ARROW_TESTING_LIB libarrow_testing.a)
+#find_library(ARROW_TESTING_LIB libarrow_testing.a)
 find_path(ARROW_INCLUDE_PATH arrow/api.h)
 
 find_package_handle_standard_args(
   Arrow
   DEFAULT_MSG
   ARROW_LIB
-  ARROW_TESTING_LIB
+#  ARROW_TESTING_LIB
   ARROW_INCLUDE_PATH
 )
 
 # Only add the libraries once.
 if(Arrow_FOUND AND NOT TARGET arrow)
   add_library(arrow STATIC IMPORTED GLOBAL)
-  add_library(arrow_testing STATIC IMPORTED GLOBAL)
+  # arrow_testing is only used by Velox/Arrow tests, which are disabled in this
+  # project; provide an INTERFACE stand-in so any residual reference still
+  # resolves (mirrors the bundled-arrow branch in
+  # resolve_dependency_modules/arrow/CMakeLists.txt).
+  if(NOT TARGET arrow_testing)
+    add_library(arrow_testing INTERFACE)
+  endif()
 
   set_target_properties(
     arrow
@@ -114,8 +120,11 @@ if(Arrow_FOUND AND NOT TARGET arrow)
   # Proper fix is upstream: FBThrift should not share the apache::thrift::*
   # namespace, or velox should split libvelox so FBThrift-using code and
   # vendored arrow-parquet code never land in the same link line.
-  set_target_properties(
-    arrow_testing
-    PROPERTIES IMPORTED_LOCATION ${ARROW_TESTING_LIB} INTERFACE_LINK_LIBRARIES ${ARROW_LIB}
-  )
+  # Re-enable together with ARROW_TESTING (see
+  # resolve_dependency_modules/arrow/CMakeLists.txt): drop the INTERFACE
+  # stand-in above and restore the static arrow_testing target.
+#  set_target_properties(
+#    arrow_testing
+#    PROPERTIES IMPORTED_LOCATION ${ARROW_TESTING_LIB} INTERFACE_LINK_LIBRARIES ${ARROW_LIB}
+#  )
 endif()

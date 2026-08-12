@@ -601,7 +601,7 @@ class Type : public Tree<const TypePtr>, public velox::ISerializable {
   /// Returns human-readable summary of the type. Useful when full output of
   /// toString() is too large.
   std::string toSummaryString(
-      TypeSummaryOptions options = TypeSummaryOptions{}) const;
+      TypeSummaryOptions options = {0}) const;
 
   /// Types are weakly matched.
   /// Examples: Two RowTypes are equivalent if the children types are

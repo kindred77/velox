@@ -18,9 +18,7 @@
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/synchronization/CallOnce.h>
 #include <folly/system/HardwareConcurrency.h>
-#ifdef _WIN32
 #include "velox/common/base/windows/FollyConcurrencyCompat.h"
-#endif
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/file/File.h"
 

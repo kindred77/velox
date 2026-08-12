@@ -16,9 +16,7 @@
 
 #include "velox/common/memory/MallocAllocator.h"
 #include <folly/system/HardwareConcurrency.h>
-#ifdef _WIN32
 #include "velox/common/base/windows/FollyConcurrencyCompat.h"
-#endif
 #include "velox/common/memory/Memory.h"
 
 #ifndef _WIN32
