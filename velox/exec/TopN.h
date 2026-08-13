@@ -64,6 +64,26 @@ class TopN : public Operator {
   std::unique_ptr<RowContainer> data_;
   RowComparator comparator_;
   std::priority_queue<char*, std::vector<char*>, RowComparator> topRows_;
+
+  // Ring-buffer fast path for streams that arrive monotonically in the
+  // eviction direction: every new row sorts before-or-equal to the previous
+  // row (e.g. `order by id desc` over a file stored in ascending id order).
+  // For such a stream the top-N is exactly the last N rows seen, so the
+  // priority queue can be replaced by an O(1)-per-row ring buffer instead of
+  // an O(log N) heap update per row. The first row that sorts after the
+  // previous one breaks the monotonic prefix: the ring (which still holds the
+  // exact top-N of the prefix) is rebuilt into the priority queue and the
+  // incremental path takes over. The decision is a pure performance
+  // optimization; correctness does not depend on the stream being monotonic.
+  bool monotonic_{true};
+  // Last N rows of the monotonic prefix, in arrival order (ring buffer;
+  // ringHead_ is the index of the oldest row).
+  std::vector<char*> ring_;
+  size_t ringHead_{0};
+  // Row of the most recently seen input row (the newest ring entry). Its
+  // memory stays valid until a later ring advance reuses it, which cannot
+  // happen before N more rows.
+  char* lastSeenRow_{nullptr};
   std::vector<char*> rows_;
 
   std::vector<DecodedVector> decodedVectors_;

@@ -69,6 +69,47 @@ void TopN::addInput(RowVectorPtr input) {
   folly::F14FastMap<void*, vector_size_t> passedRows;
   for (auto row = 0; row < input->size(); ++row) {
     char* newRow = nullptr;
+    if (monotonic_) {
+      // Ring-buffer fast path: while every new row sorts before-or-equal to
+      // the previous one, the top-N is exactly the last N rows seen. Keep
+      // them in a ring with O(1) work per row instead of an O(log N) heap
+      // update (the heap churns when the input is monotonic in the eviction
+      // direction, e.g. `order by id desc` over a file stored in ascending
+      // id order).
+      if (lastSeenRow_ == nullptr ||
+          comparator_.compare(decodedVectors_, row, lastSeenRow_) <= 0) {
+        newRow = (ring_.size() < count_)
+                     ? data_->newRow()
+                     : data_->initializeRow(
+                           ring_[ringHead_], true /* reuse */);
+        data_->initializeFields(newRow);
+        for (const auto col : sortingKeyColumns_) {
+          data_->store(decodedVectors_[col], row, newRow, col);
+        }
+        if (ring_.size() < count_) {
+          ring_.push_back(newRow);
+        } else {
+          ring_[ringHead_] = newRow;
+          ringHead_ = (ringHead_ + 1) % count_;
+        }
+        lastSeenRow_ = newRow;
+        if (hasNonKeyColumn) {
+          passedRows[newRow] = row;
+        }
+        continue;
+      }
+      // The stream stopped being monotonic: the ring still holds the exact
+      // top-N of the prefix. Rebuild the priority queue from it and continue
+      // with the incremental path (the current row sorts after every ring
+      // row, so it is discarded there).
+      monotonic_ = false;
+      for (const auto r : ring_) {
+        topRows_.push(r);
+      }
+      ring_.clear();
+      ringHead_ = 0;
+      lastSeenRow_ = nullptr;
+    }
     if (topRows_.size() < count_) {
       newRow = data_->newRow();
     } else {
@@ -133,6 +174,16 @@ RowVectorPtr TopN::getOutput() {
 
 void TopN::noMoreInput() {
   Operator::noMoreInput();
+  // Drain the ring-buffer fast path, if still active.
+  if (monotonic_) {
+    for (const auto r : ring_) {
+      topRows_.push(r);
+    }
+    ring_.clear();
+    ringHead_ = 0;
+    lastSeenRow_ = nullptr;
+    monotonic_ = false;
+  }
   if (topRows_.empty()) {
     finished_ = true;
     return;
