@@ -18,6 +18,7 @@
 #include "velox/exec/ContainerRowSerde.h"
 #include "velox/exec/OperatorType.h"
 #include "velox/exec/TopN.h"
+#include "velox/type/Filter.h"
 #include "velox/vector/FlatVector.h"
 
 namespace facebook::velox::exec {
@@ -32,6 +33,7 @@ TopN::TopN(
           topNNode->id(),
           OperatorType::kTopN),
       count_(topNNode->count()),
+      dynamicFilterProducer_(topNNode->dynamicFilterProducer()),
       data_(std::make_unique<RowContainer>(outputType_->children(), pool())),
       comparator_(
           outputType_,
@@ -181,6 +183,62 @@ void TopN::addInput(RowVectorPtr input) {
       }
     }
   }
+  publishDynamicFilter();
+}
+
+void TopN::publishDynamicFilter() {
+  if (!dynamicFilterProducer_) {
+    return;
+  }
+  // A valid k-th bound exists only once the top-N is full.
+  char* worst = nullptr;
+  if (monotonic_) {
+    if (ring_.size() < count_) {
+      return;
+    }
+    worst = ring_[ringHead_];
+  } else {
+    if (topRows_.size() < count_) {
+      return;
+    }
+    worst = topRows_.top();
+  }
+  // Only BigintRange-compatible sort keys are supported (integer/date).
+  const auto& keyType = outputType_->childAt(sortingKeyColumns_[0]);
+  if (!keyType->isBigint() && !keyType->isInteger() &&
+      !keyType->isSmallint() && !keyType->isDate()) {
+    return;
+  }
+  const auto offset = data_->columnAt(sortingKeyColumns_[0]).offset();
+  int64_t kth = 0;
+  if (keyType->isBigint()) {
+    kth = data_->readValueAt<int64_t>(worst, offset);
+  } else if (keyType->isDate() || keyType->isInteger()) {
+    kth = data_->readValueAt<int32_t>(worst, offset);
+  } else if (keyType->isSmallint()) {
+    kth = data_->readValueAt<int16_t>(worst, offset);
+  } else {
+    return;
+  }
+  if (published_ && kth == lastPublishedBound_) {
+    return;
+  }
+  lastPublishedBound_ = kth;
+  published_ = true;
+
+  auto* driver = operatorCtx_->driver();
+  driver->pushdownFilters(
+      this,
+      {sortingKeyColumns_[0]},
+      [kth](column_index_t, common::FilterPtr& filter) {
+        // ASC top-N: rows whose sort key exceeds the k-th worst can no longer
+        // enter the top-N; publish an upper bound so the scan prunes row
+        // groups whose minimum key is above it. The final correctness is
+        // still arbitrated by this operator.
+        filter = std::make_shared<common::BigintRange>(
+            std::numeric_limits<int64_t>::min(), kth, true);
+        return true;
+      });
 }
 
 RowVectorPtr TopN::getOutput() {

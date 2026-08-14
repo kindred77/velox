@@ -37,6 +37,11 @@ class TopN : public Operator {
 
   void noMoreInput() override;
 
+  // Publish the current k-th sort-key bound as a dynamic filter to the input
+  // scan. No-op when the top-N is not full yet or the sort key is not a
+  // BigintRange-compatible type.
+  void publishDynamicFilter();
+
   BlockingReason isBlocked(ContinueFuture* /*future*/) override {
     return BlockingReason::kNotBlocked;
   }
@@ -84,6 +89,16 @@ class TopN : public Operator {
   // memory stays valid until a later ring advance reuses it, which cannot
   // happen before N more rows.
   char* lastSeenRow_{nullptr};
+  // Dynamic-filter producer: when enabled (GPORCA decided the input scan is
+  // ordered by the sort key and the filter is not statically pushable), the
+  // operator publishes its current k-th sort-key bound as a runtime filter
+  // (BigintRange) to the scan, so row groups that can no longer improve the
+  // top-N are pruned.
+  bool dynamicFilterProducer_{false};
+  // Last published upper bound of the sort key (ASC top-N: rows with a larger
+  // key cannot enter); used to avoid re-publishing an unchanged bound.
+  int64_t lastPublishedBound_{0};
+  bool published_{false};
   // Number of input rows seen so far, and how many of them broke the
   // monotonic prefix. When the disorder rate is high (disorderRows_ * count_
   // exceeds totalRows_), the O(N) worst scan on every out-of-order row costs

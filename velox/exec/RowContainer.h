@@ -931,6 +931,14 @@ class RowContainer {
     return (row[rowColumn.nullByte()] & rowColumn.nullMask()) != 0;
   }
 
+  /// Returns the value of a fixed-width primitive column of a stored row.
+  /// 'row' is a row pointer returned by newRow()/initializeRow(); 'offset' is
+  /// the byte offset of the column, e.g. columnAt(index).offset().
+  template <typename T>
+  T readValueAt(const char* row, int32_t offset) const {
+    return valueAt<T>(row, offset);
+  }
+
   /// Returns true if the value at rowColumn in row is NaN.
   template <
       typename T,

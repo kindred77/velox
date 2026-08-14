@@ -4450,7 +4450,8 @@ class TopNNode : public PlanNode {
       const std::vector<SortOrder>& sortingOrders,
       int32_t count,
       bool isPartial,
-      const PlanNodePtr& source);
+      const PlanNodePtr& source,
+      bool dynamicFilterProducer = false);
 
   class Builder {
    public:
@@ -4462,6 +4463,7 @@ class TopNNode : public PlanNode {
       sortingOrders_ = other.sortingOrders();
       count_ = other.count();
       isPartial_ = other.isPartial();
+      dynamicFilterProducer_ = other.dynamicFilterProducer();
       VELOX_CHECK_EQ(other.sources().size(), 1);
       source_ = other.sources()[0];
     }
@@ -4491,6 +4493,11 @@ class TopNNode : public PlanNode {
       return *this;
     }
 
+    Builder& dynamicFilterProducer(bool dynamicFilterProducer) {
+      dynamicFilterProducer_ = dynamicFilterProducer;
+      return *this;
+    }
+
     Builder& source(PlanNodePtr source) {
       source_ = std::move(source);
       return *this;
@@ -4512,7 +4519,8 @@ class TopNNode : public PlanNode {
           sortingOrders_.value(),
           count_.value(),
           isPartial_.value(),
-          source_.value());
+          source_.value(),
+          dynamicFilterProducer_.value_or(false));
     }
 
    private:
@@ -4521,6 +4529,7 @@ class TopNNode : public PlanNode {
     std::optional<std::vector<SortOrder>> sortingOrders_;
     std::optional<int32_t> count_;
     std::optional<bool> isPartial_;
+    std::optional<bool> dynamicFilterProducer_;
     std::optional<PlanNodePtr> source_;
   };
 
@@ -4555,6 +4564,10 @@ class TopNNode : public PlanNode {
     return isPartial_;
   }
 
+  bool dynamicFilterProducer() const {
+    return dynamicFilterProducer_;
+  }
+
   std::string_view name() const override {
     return "TopN";
   }
@@ -4570,6 +4583,7 @@ class TopNNode : public PlanNode {
   const std::vector<SortOrder> sortingOrders_;
   const int32_t count_;
   const bool isPartial_;
+  const bool dynamicFilterProducer_;
   const std::vector<PlanNodePtr> sources_;
 };
 

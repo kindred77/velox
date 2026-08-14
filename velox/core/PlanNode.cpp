@@ -3725,12 +3725,14 @@ TopNNode::TopNNode(
     const std::vector<SortOrder>& sortingOrders,
     int32_t count,
     bool isPartial,
-    const PlanNodePtr& source)
+    const PlanNodePtr& source,
+    bool dynamicFilterProducer)
     : PlanNode(id),
       sortingKeys_(sortingKeys),
       sortingOrders_(sortingOrders),
       count_(count),
       isPartial_(isPartial),
+      dynamicFilterProducer_(dynamicFilterProducer),
       sources_{source} {
   VELOX_USER_CHECK(!sortingKeys.empty(), "TopN must specify sorting keys");
   VELOX_USER_CHECK_EQ(
