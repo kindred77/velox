@@ -84,6 +84,13 @@ class TopN : public Operator {
   // memory stays valid until a later ring advance reuses it, which cannot
   // happen before N more rows.
   char* lastSeenRow_{nullptr};
+  // Number of input rows seen so far, and how many of them broke the
+  // monotonic prefix. When the disorder rate is high (disorderRows_ * count_
+  // exceeds totalRows_), the O(N) worst scan on every out-of-order row costs
+  // more than the heap's O(1) discard path, so the ring falls back to the
+  // priority queue.
+  int64_t totalRows_{0};
+  int64_t disorderRows_{0};
   std::vector<char*> rows_;
 
   std::vector<DecodedVector> decodedVectors_;

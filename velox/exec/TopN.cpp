@@ -68,6 +68,7 @@ void TopN::addInput(RowVectorPtr input) {
   // input rows of non-key columns are later stored into data_.
   folly::F14FastMap<void*, vector_size_t> passedRows;
   for (auto row = 0; row < input->size(); ++row) {
+    ++totalRows_;
     char* newRow = nullptr;
     if (monotonic_) {
       // Ring-buffer fast path: while every new row sorts before-or-equal to
@@ -97,6 +98,40 @@ void TopN::addInput(RowVectorPtr input) {
           passedRows[newRow] = row;
         }
         continue;
+      }
+      // The stream stopped being strictly monotone. The ring still holds the
+      // exact top-N of the prefix. If the new row is worse than (or equal to)
+      // the ring's worst (the current k-th best), it cannot be in the top-N:
+      // discard it and keep the ring, so the O(1) fast path can continue
+      // (the invariant "ring == top-N of the prefix" is preserved because
+      // later rows are even better). Only when the new row is better than the
+      // worst does the ring bookkeeping (oldest == worst) break and the heap
+      // fallback below is required.
+      if (ring_.size() == count_) {
+        ++disorderRows_;
+        char* worst = ring_[0];
+        for (size_t i = 1; i < ring_.size(); ++i) {
+          if (comparator_.compare(ring_[i], worst) > 0) {
+            worst = ring_[i];
+          }
+        }
+        if (!comparator_(decodedVectors_, row, worst)) {
+          if (disorderRows_ > totalRows_ / count_) {
+            // The disorder rate is too high: the O(N) worst scan on every
+            // out-of-order row costs more than the heap's O(1) discard path.
+            // Fall back to the priority queue below.
+            monotonic_ = false;
+            for (const auto r : ring_) {
+              topRows_.push(r);
+            }
+            ring_.clear();
+            ringHead_ = 0;
+            lastSeenRow_ = nullptr;
+          } else {
+            // Discard the row and keep the ring.
+            continue;
+          }
+        }
       }
       // The stream stopped being monotonic: the ring still holds the exact
       // top-N of the prefix. Rebuild the priority queue from it and continue
