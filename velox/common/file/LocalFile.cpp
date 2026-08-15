@@ -186,7 +186,7 @@ int32_t openReadFile(const std::string& path, bool directIo) {
   return fd;
 }
 
-long fileSize(int32_t fd, std::string_view path) {
+int64_t fileSize(int32_t fd, std::string_view path) {
 #ifdef _WIN32
   // Use Win32 GetFileSizeEx to reliably get the 64-bit file size. CRT lseek
   // uses 32-bit off_t on Windows and can fail/truncate on files > 2GB.
@@ -197,7 +197,7 @@ long fileSize(int32_t fd, std::string_view path) {
       "GetFileSizeEx failure in LocalReadFile constructor, {} {}.",
       path,
       GetLastError());
-  return static_cast<long>(fileSizeResult.QuadPart);
+  return fileSizeResult.QuadPart;
 #else
   const off_t ret = lseek(fd, 0, SEEK_END);
   VELOX_CHECK_GE(
@@ -207,7 +207,7 @@ long fileSize(int32_t fd, std::string_view path) {
       ret,
       path,
       folly::errnoStr(errno));
-  return ret;
+  return static_cast<int64_t>(ret);
 #endif // _WIN32
 }
 
@@ -368,9 +368,45 @@ uint64_t LocalReadFile::preadv(
     const FileIoContext& context) const {
 #ifdef _WIN32
   // On Windows, folly::preadv uses lseek+readv with 32-bit off_t, which is
-  // not thread-safe and truncates offsets > 2GB. Fall back to the base class
-  // implementation which uses our thread-safe pread (ReadFile + OVERLAPPED).
-  return ReadFile::preadv(offset, buffers, context);
+  // not thread-safe and truncates offsets > 2GB. The base class fallback uses
+  // our thread-safe pread (ReadFile + OVERLAPPED), but it issues one file
+  // read per destination buffer: callers (e.g. parquet column chunks read
+  // into non-contiguous memory allocations) then turn one contiguous file
+  // range into many small random reads, which is seek-bound on slow storage.
+  // Read the whole contiguous span with a single read and scatter into the
+  // per-buffer destinations instead.
+  if (buffers.empty()) {
+    return 0;
+  }
+  for (const auto& range : buffers) {
+    if (range.data() == nullptr) {
+      // Coalesced loads can skip gaps with null buffers; keep the base
+      // per-buffer behavior for that rare shape.
+      return ReadFile::preadv(offset, buffers, context);
+    }
+  }
+  uint64_t totalSize = 0;
+  for (const auto& range : buffers) {
+    totalSize += range.size();
+  }
+  if (totalSize == 0 || offset > size() || totalSize > size() - offset) {
+    // Out-of-file-range requests must be clamped per buffer; keep the base
+    // behavior for that edge case.
+    return ReadFile::preadv(offset, buffers, context);
+  }
+  if (buffers.size() == 1) {
+    // A single destination buffer needs no staging copy.
+    preadInternal(offset, buffers[0].size(), buffers[0].data());
+    return buffers[0].size();
+  }
+  std::string temp(totalSize, '\0');
+  preadInternal(offset, totalSize, temp.data());
+  uint64_t dest = 0;
+  for (const auto& range : buffers) {
+    std::memcpy(range.data(), temp.data() + dest, range.size());
+    dest += range.size();
+  }
+  return totalSize;
 #else
   // Dropped bytes sized so that a typical dropped range of 50K is not
   // too many iovecs.

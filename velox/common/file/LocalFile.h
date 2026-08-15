@@ -95,7 +95,7 @@ class LocalReadFile final : public ReadFile {
   const bool useIoUring_{false};
   const std::string path_;
   const int32_t fd_;
-  const long size_;
+  const int64_t size_;
   const uint64_t readAlignment_;
 };
 
