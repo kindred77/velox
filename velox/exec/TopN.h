@@ -89,6 +89,66 @@ class TopN : public Operator {
   // memory stays valid until a later ring advance reuses it, which cannot
   // happen before N more rows.
   char* lastSeenRow_{nullptr};
+  // Compact ring-buffer storage (alternative to the RowContainer-backed ring
+  // above): when every output column is fixed-width, monotonic rows are kept
+  // as raw images (1 null byte + value per column) in a preallocated ring
+  // instead of round-tripping through the RowContainer on every row. The
+  // per-row RowContainer cost (newRow/initializeFields/store) dominates for
+  // 100M+ row monotonic streams (e.g. reverse top-N over a large ordered
+  // table: `order by id, discount limit 10 offset 99999980`), while the
+  // compact ring is a plain memcpy per column. Rows are materialized into the
+  // RowContainer only when the ring exits (disorder break or noMoreInput),
+  // i.e. at most count_ rows. Correctness does not depend on the compact path.
+  bool compactRing_{false};
+  // Per-column layout of a compact slot: null-flag byte then fixed-width value.
+  struct CompactColumn {
+    size_t nullOffset;
+    size_t valueOffset;
+    size_t valueSize;
+  };
+  std::vector<CompactColumn> compactColumns_;
+  size_t compactRowSize_{0};
+  std::vector<char> compactRingStorage_;
+  // Index of the oldest compact slot (next one to be overwritten).
+  size_t compactHead_{0};
+  // Number of valid slots (0..count_).
+  size_t compactCount_{0};
+  char* lastSeenSlot_{nullptr};
+  // Sort orders of the sorting keys, kept for the compact comparator.
+  std::vector<core::SortOrder> sortingOrders_;
+  // Upper bound on compact ring allocation; larger counts use the
+  // RowContainer-backed ring to avoid a big upfront allocation.
+  static constexpr size_t kMaxCompactRingBytes = 64 << 20;
+
+  char* compactSlot(size_t i) {
+    return compactRingStorage_.data() + i * compactRowSize_;
+  }
+
+  const char* compactSlot(size_t i) const {
+    return compactRingStorage_.data() + i * compactRowSize_;
+  }
+
+  // Writes the i-th row of the decoded input vectors into the compact slot.
+  void compactStore(char* slot, vector_size_t row);
+
+  // Returns <0 if the input row sorts before the compact slot row (mirrors
+  // RowComparator::compare(decodedVectors_, row, other)).
+  int32_t compactCompareToDecoded(char* slot, vector_size_t row) const;
+
+  // Returns <0 if 'a' sorts before 'b' (both compact slots).
+  int32_t compactCompareSlots(const char* a, const char* b) const;
+
+  // Converts the compact ring into RowContainer rows (in arrival order),
+  // fills ring_ and switches back to the RowContainer-backed ring.
+  void materializeCompactRing();
+
+  // Moves the ring contents into the priority queue and disables the ring
+  // fast path (used when the stream stops being monotonic).
+  void rebuildHeapFromRing();
+
+  // Enables the compact ring if the output columns are all fixed-width and the
+  // ring allocation is bounded.
+  void maybeEnableCompactRing();
   // Dynamic-filter producer: when enabled (GPORCA decided the input scan is
   // ordered by the sort key and the filter is not statically pushable), the
   // operator publishes its current k-th sort-key bound as a runtime filter
