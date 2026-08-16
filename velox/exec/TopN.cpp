@@ -555,16 +555,22 @@ void TopN::publishDynamicFilter() {
   published_ = true;
 
   auto* driver = operatorCtx_->driver();
+  const bool ascending =
+      sortingOrders_.empty() || sortingOrders_[0].isAscending();
   driver->pushdownFilters(
       this,
       {sortingKeyColumns_[0]},
-      [kth](column_index_t, common::FilterPtr& filter) {
-        // ASC top-N: rows whose sort key exceeds the k-th worst can no longer
-        // enter the top-N; publish an upper bound so the scan prunes row
-        // groups whose minimum key is above it. The final correctness is
-        // still arbitrated by this operator.
-        filter = std::make_shared<common::BigintRange>(
-            std::numeric_limits<int64_t>::min(), kth, true);
+      [kth, ascending](column_index_t, common::FilterPtr& filter) {
+        // Prune row groups that can no longer enter the top-N: an upper bound
+        // for ASC, a lower bound for DESC. Final correctness is still
+        // arbitrated by this operator.
+        if (ascending) {
+          filter = std::make_shared<common::BigintRange>(
+              std::numeric_limits<int64_t>::min(), kth, true);
+        } else {
+          filter = std::make_shared<common::BigintRange>(
+              kth, std::numeric_limits<int64_t>::max(), true);
+        }
         return true;
       });
 }
