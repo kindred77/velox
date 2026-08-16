@@ -25,6 +25,14 @@ namespace facebook::velox::exec {
 
 namespace {
 
+// Range-filterable sort keys: integer/date map to BigintRange, varchar maps to
+// BytesRange. Keep in sync with GPORCA CTypeCapability::FRangeFilterEligible;
+// a new sort-key type must be registered in both places.
+bool isRangeFilterableSortKey(const TypePtr& keyType) {
+  return keyType->isBigint() || keyType->isInteger() ||
+      keyType->isSmallint() || keyType->isDate() || keyType->isVarchar();
+}
+
 // Fixed-width primitive kinds supported by the compact ring storage. The row
 // image of these types is a plain memcpy-able value and their comparison
 // matches RowContainer's (both go through SimpleVector::comparePrimitiveAsc).
@@ -524,12 +532,10 @@ void TopN::publishDynamicFilter() {
     }
     worst = topRows_.top();
   }
-  // BigintRange-compatible sort keys (integer/date) and BytesRange-compatible
-  // text keys (varchar) are supported.
+  // Range-filterable sort keys only (see isRangeFilterableSortKey below).
   const auto& keyType = outputType_->childAt(sortingKeyColumns_[0]);
   const bool isStringKey = keyType->isVarchar();
-  if (!keyType->isBigint() && !keyType->isInteger() && !keyType->isSmallint() &&
-      !keyType->isDate() && !isStringKey) {
+  if (!isRangeFilterableSortKey(keyType)) {
     return;
   }
   const auto offset = data_->columnAt(sortingKeyColumns_[0]).offset();
