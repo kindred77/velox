@@ -524,16 +524,45 @@ void TopN::publishDynamicFilter() {
     }
     worst = topRows_.top();
   }
-  // Only BigintRange-compatible sort keys are supported (integer/date).
+  // BigintRange-compatible sort keys (integer/date) and BytesRange-compatible
+  // text keys (varchar) are supported.
   const auto& keyType = outputType_->childAt(sortingKeyColumns_[0]);
+  const bool isStringKey = keyType->isVarchar();
   if (!keyType->isBigint() && !keyType->isInteger() && !keyType->isSmallint() &&
-      !keyType->isDate()) {
+      !keyType->isDate() && !isStringKey) {
     return;
   }
   const auto offset = data_->columnAt(sortingKeyColumns_[0]).offset();
   const char* raw = compact
       ? worst + compactColumns_[sortingKeyColumns_[0]].valueOffset
       : worst + offset;
+
+  auto* driver = operatorCtx_->driver();
+  const bool ascending =
+      sortingOrders_.empty() || sortingOrders_[0].isAscending();
+  if (isStringKey) {
+    // String keys are stored as StringView in the row container (the compact
+    // ring is fixed-width only). Publish a byte range on the k-th bound;
+    // re-publishing the same bound is cheap, so no dedup is needed here.
+    StringView kthView;
+    memcpy(&kthView, raw, sizeof(StringView));
+    const std::string kthStr = kthView.str();
+    driver->pushdownFilters(
+        this,
+        {sortingKeyColumns_[0]},
+        [kthStr, ascending](column_index_t, common::FilterPtr& filter) {
+          if (ascending) {
+            filter = std::make_shared<common::BytesRange>(
+                "", true, false, kthStr, false, false, true);
+          } else {
+            filter = std::make_shared<common::BytesRange>(
+                kthStr, false, false, "", true, false, true);
+          }
+          return true;
+        });
+    return;
+  }
+
   int64_t kth = 0;
   if (keyType->isBigint()) {
     memcpy(&kth, raw, sizeof(int64_t));
@@ -554,9 +583,6 @@ void TopN::publishDynamicFilter() {
   lastPublishedBound_ = kth;
   published_ = true;
 
-  auto* driver = operatorCtx_->driver();
-  const bool ascending =
-      sortingOrders_.empty() || sortingOrders_[0].isAscending();
   driver->pushdownFilters(
       this,
       {sortingKeyColumns_[0]},
