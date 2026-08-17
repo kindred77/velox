@@ -16,6 +16,7 @@
 #pragma once
 
 #include <folly/container/F14Set.h>
+#include <limits>
 
 #include <velox/type/Filter.h>
 #include "velox/common/memory/RawVector.h"
@@ -130,8 +131,11 @@ class VectorHasher {
   // Largest range that can be a part of a normalized key. 59 bits,
   // corresponds to 7 byte strings represented as numbers (56 bits of
   // data and 3 of length).
-  static constexpr int64_t kMaxRange = ~0UL >> 5;
-  static constexpr uint64_t kRangeTooLarge = ~0UL;
+  // MSVC 'unsigned long' is 32-bit, so ~0UL is NOT the uint64 sentinel.
+  static constexpr int64_t kMaxRange =
+      std::numeric_limits<int64_t>::max() >> 4;
+  static constexpr uint64_t kRangeTooLarge =
+      std::numeric_limits<uint64_t>::max();
   // Stop counting distinct values after this many and revert to regular hash.
   static constexpr int32_t kMaxDistinct = 100'000;
 

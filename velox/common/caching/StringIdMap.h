@@ -17,6 +17,7 @@
 #pragma once
 
 #include <string_view>
+#include <limits>
 
 #include <folly/container/F14Map.h>
 
@@ -26,7 +27,8 @@ namespace facebook::velox {
 
 class StringIdMap {
  public:
-  static constexpr uint64_t kNoId = ~0UL;
+  // MSVC 'unsigned long' is 32-bit; use the uint64 sentinel on every platform.
+  static constexpr uint64_t kNoId = std::numeric_limits<uint64_t>::max();
 
   StringIdMap() = default;
 
