@@ -106,7 +106,12 @@ class LocalMergeSource : public MergeSource {
     });
   }
 
-  void close() override {}
+  void close() override {
+    queue_.withWLock([&](auto& queue) {
+      ScopedPromiseNotification notification(2);
+      queue.close(notification);
+    });
+  }
 
  private:
   class LocalMergeSourceQueue {
@@ -120,7 +125,7 @@ class LocalMergeSource : public MergeSource {
     }
 
     BlockingReason started(ContinueFuture* future) {
-      if (started_) {
+      if (started_ || closed_) {
         return BlockingReason::kNotBlocked;
       }
       producerPromises_.emplace_back("LocalMergeSourceQueue::started");
@@ -165,10 +170,25 @@ class LocalMergeSource : public MergeSource {
       notifyConsumers(notification);
     }
 
+    // Called by the consumer when it is done with the source (normal finish or
+    // task termination). Resolve both sides' pending promises so blocked
+    // producers/consumers are woken instead of seeing a broken promise when
+    // the queue is destroyed; mark atEnd so any later next() drains cleanly.
+    void close(ScopedPromiseNotification& notification) {
+      closed_ = true;
+      atEnd_ = true;
+      notifyConsumers(notification);
+      notifyProducers(notification);
+    }
+
     BlockingReason enqueue(
         RowVectorPtr input,
         ContinueFuture* future,
         ScopedPromiseNotification& notification) {
+      if (closed_) {
+        // The consumer is gone (finish or termination); drop further input.
+        return BlockingReason::kNotBlocked;
+      }
       if (!input) {
         atEnd_ = true;
         notifyConsumers(notification);
@@ -206,6 +226,7 @@ class LocalMergeSource : public MergeSource {
     bool started_{false};
     bool atEnd_{false};
     bool drained_{false};
+    bool closed_{false};
     boost::circular_buffer<RowVectorPtr> data_;
     std::vector<ContinuePromise> consumerPromises_;
     std::vector<ContinuePromise> producerPromises_;
