@@ -53,6 +53,7 @@ const auto& filterKindNames() {
       {FilterKind::kNegatedBytesRange, "NegatedBytesRange"},
       {FilterKind::kBytesValues, "BytesValues"},
       {FilterKind::kNegatedBytesValues, "NegatedBytesValues"},
+      {FilterKind::kLike, "Like"},
       {FilterKind::kBigintMultiRange, "BigintMultiRange"},
       {FilterKind::kMultiRange, "MultiRange"},
       {FilterKind::kHugeintRange, "HugeintRange"},
@@ -137,6 +138,7 @@ void Filter::registerSerDe() {
   registry.Register("BytesValues", BytesValues::create);
   registry.Register("BigintMultiRange", BigintMultiRange::create);
   registry.Register("NegatedBytesValues", NegatedBytesValues::create);
+  registry.Register("Like", LikeFilter::create);
   registry.Register("MultiRange", MultiRange::create);
   registry.Register("TimestampRange", TimestampRange::create);
 }
@@ -640,6 +642,34 @@ bool BytesValues::testingEquals(const Filter& other) const {
     return true;
   }
 
+  return false;
+}
+
+folly::dynamic LikeFilter::serialize() const {
+  auto obj = Filter::serializeBase();
+  obj["pattern"] = pattern_;
+  if (escapeChar_.has_value()) {
+    obj["escapeChar"] = std::string(1, *escapeChar_);
+  }
+  return obj;
+}
+
+std::unique_ptr<Filter> LikeFilter::create(const folly::dynamic& obj) {
+  auto nullAllowed = deserializeNullAllowed(obj);
+  std::string pattern = obj["pattern"].asString();
+  std::optional<char> escapeChar;
+  if (obj.count("escapeChar") != 0 && obj["escapeChar"].isString()) {
+    escapeChar = obj["escapeChar"].asString()[0];
+  }
+  return std::make_unique<LikeFilter>(
+      StringView(pattern), escapeChar, nullAllowed);
+}
+
+bool LikeFilter::testingEquals(const Filter& other) const {
+  if (const auto* otherLike = Filter::testingBaseEquals<LikeFilter>(other)) {
+    return otherLike->pattern_ == pattern_ &&
+        otherLike->escapeChar_ == escapeChar_;
+  }
   return false;
 }
 

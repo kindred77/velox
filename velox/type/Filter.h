@@ -15,6 +15,9 @@
  */
 #pragma once
 
+#include <fmt/format.h>
+#include <re2/re2.h>
+
 #include <folly/Range.h>
 #include <folly/container/F14Set.h>
 #include <xsimd/xsimd.hpp>
@@ -47,6 +50,7 @@ enum class FilterKind {
   kNegatedBytesRange,
   kBytesValues,
   kNegatedBytesValues,
+  kLike,
   kBigintMultiRange,
   kMultiRange,
   kHugeintRange,
@@ -2409,6 +2413,187 @@ class NegatedBytesValues final : public Filter {
 
  private:
   std::unique_ptr<BytesValues> nonNegated_;
+};
+
+namespace detail {
+
+/// Converts a SQL LIKE pattern to an anchored RE2 regular expression,
+/// mirroring the engine's `like` expression semantics
+/// (velox/functions/lib/Re2Functions.cpp::likePatternToRe2). `%` matches any
+/// sequence, `_` matches a single character; `escapeChar` (when present)
+/// escapes `%`, `_` and itself. Sets `validPattern` to false for a trailing
+/// escape or an escaped character that is not `%`, `_` or the escape
+/// character.
+inline std::string likePatternToRe2(
+    StringView pattern,
+    std::optional<char> escapeChar,
+    bool& validPattern) {
+  std::string regex;
+  validPattern = true;
+  regex.reserve(pattern.size() * 2);
+  regex.append("^");
+  bool escaped = false;
+  for (const char c : pattern) {
+    if (escaped && !(c == '%' || c == '_' || c == escapeChar)) {
+      validPattern = false;
+    }
+    if (!escaped && c == escapeChar) {
+      escaped = true;
+    } else {
+      switch (c) {
+        case '%':
+          regex.append(escaped ? "%" : ".*");
+          escaped = false;
+          break;
+        case '_':
+          regex.append(escaped ? "_" : ".");
+          escaped = false;
+          break;
+        // Escape all the meta characters in re2.
+        case '\\':
+        case '|':
+        case '^':
+        case '$':
+        case '.':
+        case '*':
+        case '+':
+        case '?':
+        case '(':
+        case ')':
+        case '[':
+        case ']':
+        case '{':
+        case '}':
+          regex.append("\\"); // Append the meta character after the escape.
+          [[fallthrough]];
+        default:
+          regex.append(1, c);
+          escaped = false;
+      }
+    }
+  }
+  if (escaped) {
+    validPattern = false;
+  }
+
+  regex.append("$");
+  return regex;
+}
+
+} // namespace detail
+
+/// SQL LIKE pattern filter ('%' matches any sequence, '_' matches a single
+/// character, optional escape character). Used for exact scan-level pushdown
+/// of LIKE predicates on string columns: the reader evaluates the pattern on
+/// dictionary values once per row group and drops rows whose dictionary index
+/// cannot match, so non-matching data is never materialized. Row-group
+/// min/max pruning is impossible for non-prefix patterns, so testBytesRange
+/// and testLength are conservative (always maybe).
+class LikeFilter final : public Filter {
+ public:
+  LikeFilter(
+      StringView pattern,
+      std::optional<char> escapeChar = std::nullopt,
+      bool nullAllowed = true)
+      : Filter(true, nullAllowed, FilterKind::kLike),
+        pattern_(pattern.data(), pattern.size()),
+        escapeChar_(escapeChar) {
+    compile();
+  }
+
+  LikeFilter(const LikeFilter& other, bool nullAllowed)
+      : Filter(true, nullAllowed, FilterKind::kLike),
+        pattern_(other.pattern_),
+        escapeChar_(other.escapeChar_) {
+    compile();
+  }
+
+  /// The pattern string.
+  const std::string& pattern() const {
+    return pattern_;
+  }
+
+  /// The escape character, if any.
+  std::optional<char> escapeChar() const {
+    return escapeChar_;
+  }
+
+  bool testBytes(const char* value, int32_t length) const final {
+    return testStringView(StringView(value, length));
+  }
+
+  bool testStringView(const StringView& view) const final {
+    return RE2::FullMatch(re2::StringPiece(view.data(), view.size()), *re_);
+  }
+
+  bool testLength(int32_t /* unused */) const final {
+    // A non-prefix LIKE cannot be decided from the value length alone.
+    return true;
+  }
+
+  bool testBytesRange(
+      std::optional<std::string_view> /*min*/,
+      std::optional<std::string_view> /*max*/,
+      bool /*hasNull*/) const final {
+    // A non-prefix LIKE can match anywhere in [min, max]; never prune.
+    return true;
+  }
+
+  folly::dynamic serialize() const override;
+
+  static std::unique_ptr<Filter> create(const folly::dynamic& obj);
+
+  std::unique_ptr<Filter> clone(
+      std::optional<bool> nullAllowed = std::nullopt) const final {
+    return std::make_unique<LikeFilter>(
+        *this, nullAllowed.value_or(this->nullAllowed()));
+  }
+
+  std::unique_ptr<Filter> mergeWith(const Filter* other) const final {
+    if (const auto* otherLike = other->as<LikeFilter>();
+        otherLike != nullptr && otherLike->pattern_ == pattern_ &&
+        otherLike->escapeChar_ == escapeChar_) {
+      return std::make_unique<LikeFilter>(
+          *this, nullAllowed() && other->nullAllowed());
+    }
+    // Two different LIKE patterns (or a LIKE merged with another filter kind)
+    // on the same column cannot be combined into one filter; keep the
+    // existing filter (a superset of the conjunction; the Filter node or the
+    // top-N operator still arbitrate correctness, just without the new
+    // pruning).
+    return this->clone();
+  }
+
+  bool testingEquals(const Filter& other) const final;
+
+  std::string toString() const final {
+    return fmt::format(
+        "LikeFilter(pattern:{}{}, {})",
+        pattern_,
+        escapeChar_ ? fmt::format(", escape:{}", *escapeChar_) : "",
+        nullAllowed_ ? "with nulls" : "no nulls");
+  }
+
+ private:
+  void compile() {
+    bool validPattern = true;
+    RE2::Options options{RE2::Quiet};
+    options.set_dot_nl(true);
+    re_ = std::make_unique<RE2>(
+        detail::likePatternToRe2(
+            StringView(pattern_), escapeChar_, validPattern),
+        options);
+    VELOX_CHECK(validPattern, "Invalid LIKE pattern '{}'", pattern_);
+    VELOX_CHECK(
+        re_->ok(),
+        "Failed to compile LIKE pattern '{}': {}",
+        pattern_,
+        re_->error());
+  }
+
+  std::string pattern_;
+  std::optional<char> escapeChar_;
+  std::unique_ptr<RE2> re_;
 };
 
 /// Represents a combination of two of more filters with

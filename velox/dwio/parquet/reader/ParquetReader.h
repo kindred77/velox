@@ -81,6 +81,8 @@ class ParquetRowReader : public dwio::common::RowReader {
 
   void resetFilterCaches() override;
 
+  void reFilterRowGroups() override;
+
   std::optional<size_t> estimatedRowSize() const override;
 
   bool allPrefetchIssued() const override {

@@ -119,6 +119,8 @@ class FileSplitReader {
 
   void resetFilterCaches();
 
+  void reFilterRowGroups();
+
   bool emptySplit() const;
 
   void resetSplit();

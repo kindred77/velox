@@ -222,6 +222,12 @@ void FileSplitReader::resetFilterCaches() {
   }
 }
 
+void FileSplitReader::reFilterRowGroups() {
+  if (baseRowReader_) {
+    baseRowReader_->reFilterRowGroups();
+  }
+}
+
 bool FileSplitReader::emptySplit() const {
   return emptySplit_;
 }

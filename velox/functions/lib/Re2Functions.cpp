@@ -15,6 +15,7 @@
  */
 #include "velox/functions/lib/Re2Functions.h"
 #include "velox/functions/lib/string/StringImpl.h"
+#include "velox/type/Filter.h"
 #include "velox/vector/FunctionVector.h"
 
 namespace facebook::velox::functions {
@@ -155,62 +156,6 @@ bool re2Extract(
     result.setNull(row, true);
     return false;
   }
-}
-
-std::string likePatternToRe2(
-    StringView pattern,
-    std::optional<char> escapeChar,
-    bool& validPattern) {
-  std::string regex;
-  validPattern = true;
-  regex.reserve(pattern.size() * 2);
-  regex.append("^");
-  bool escaped = false;
-  for (const char c : pattern) {
-    if (escaped && !(c == '%' || c == '_' || c == escapeChar)) {
-      validPattern = false;
-    }
-    if (!escaped && c == escapeChar) {
-      escaped = true;
-    } else {
-      switch (c) {
-        case '%':
-          regex.append(escaped ? "%" : ".*");
-          escaped = false;
-          break;
-        case '_':
-          regex.append(escaped ? "_" : ".");
-          escaped = false;
-          break;
-        // Escape all the meta characters in re2
-        case '\\':
-        case '|':
-        case '^':
-        case '$':
-        case '.':
-        case '*':
-        case '+':
-        case '?':
-        case '(':
-        case ')':
-        case '[':
-        case ']':
-        case '{':
-        case '}':
-          regex.append("\\"); // Append the meta character after the escape.
-          [[fallthrough]];
-        default:
-          regex.append(1, c);
-          escaped = false;
-      }
-    }
-  }
-  if (escaped) {
-    validPattern = false;
-  }
-
-  regex.append("$");
-  return regex;
 }
 
 template <bool (*Fn)(StringView, const RE2&)>
@@ -857,7 +802,9 @@ class LikeWithRe2 final : public exec::VectorFunction {
     RE2::Options opt{RE2::Quiet};
     opt.set_dot_nl(true);
     re_.emplace(
-        toStringPiece(likePatternToRe2(pattern, escapeChar, validPattern_)),
+        toStringPiece(
+            common::detail::likePatternToRe2(
+                pattern, escapeChar, validPattern_)),
         opt);
   }
 
@@ -1050,7 +997,8 @@ class LikeGeneric final : public exec::VectorFunction {
         "Max number of regex reached");
 
     bool validEscapeUsage;
-    auto regex = likePatternToRe2(pattern, escapeChar, validEscapeUsage);
+    auto regex = common::detail::likePatternToRe2(
+        pattern, escapeChar, validEscapeUsage);
     VELOX_USER_CHECK(
         validEscapeUsage,
         "Escape character must be followed by '%', '_' or the escape character itself");

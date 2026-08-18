@@ -625,6 +625,10 @@ void FileDataSource::addDynamicFilter(
   scanSpec_->resetCachedValues(true);
   if (splitReader_) {
     splitReader_->resetFilterCaches();
+    // A dynamic filter can arrive after the split's row-group schedule was
+    // built; re-run the statistics filter so row groups that can no longer
+    // match are dropped from the remaining schedule.
+    splitReader_->reFilterRowGroups();
   }
 }
 

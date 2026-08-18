@@ -108,6 +108,16 @@ class RowReader {
   virtual void resetFilterCaches() = 0;
 
   /**
+   * Re-run the row-group statistics filter with the current ScanSpec filters
+   * (e.g. a dynamic filter published after the initial row-group schedule was
+   * built), dropping row groups that can no longer match from the remaining
+   * schedule. Purely an optimization; row-level filters still arbitrate
+   * correctness. No-op by default; formats that schedule row groups from
+   * per-row-group statistics may override.
+   */
+  virtual void reFilterRowGroups() {}
+
+  /**
    * Get an estimated row size basing on available statistics. Can
    * differ from the actual row size due to variable-length values.
    * @return Estimate of the row size or std::nullopt if cannot estimate.

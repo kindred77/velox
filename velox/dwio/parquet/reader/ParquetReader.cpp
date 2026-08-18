@@ -1610,6 +1610,59 @@ class ParquetRowReader::Impl {
     columnReader_->resetFilterCaches();
   }
 
+  // Re-runs the row-group statistics filter for the row groups that have not
+  // been read yet, so a dynamic filter published after the split's schedule
+  // was built (e.g. a top-N k-th bound from the same driver) can still prune
+  // row groups that can no longer match. Purely an optimization: the per-row
+  // filter continues to arbitrate correctness. Row groups before the current
+  // read position are preserved unchanged; out-of-range groups that were
+  // cleared of metadata by the initial filter are never touched.
+  void reFilterRowGroups() {
+    if (nextRowGroupIdsIdx_ >= rowGroupIds_.size()) {
+      return;
+    }
+
+    // Only the unread suffix of the schedule is a candidate: re-evaluating
+    // already-read/current row groups would be wasteful and the initial
+    // filter may have cleared metadata of out-of-range groups.
+    std::vector<bool> isCandidate(rowGroups_.size(), false);
+    for (auto i = nextRowGroupIdsIdx_; i < rowGroupIds_.size(); ++i) {
+      isCandidate[rowGroupIds_[i]] = true;
+    }
+
+    ParquetData::FilterRowGroupsResult res;
+    res.totalCount = rowGroups_.size();
+    res.filterResult.assign(bits::nwords(res.totalCount), 0);
+    for (auto i = 0; i < rowGroups_.size(); ++i) {
+      if (!isCandidate[i]) {
+        bits::setBit(res.filterResult.data(), i);
+      }
+    }
+    columnReader_->filterRowGroups(0, parquetStatsContext_, res);
+
+    // Rebuild the schedule, preserving the already-read/current prefix and
+    // dropping newly excluded suffix row groups.
+    std::vector<uint32_t> newRowGroupIds;
+    std::vector<uint64_t> newFirstRow;
+    newRowGroupIds.reserve(rowGroupIds_.size());
+    newFirstRow.reserve(rowGroupIds_.size());
+    uint64_t rowNumber = 0;
+    for (auto i = 0; i < rowGroupIds_.size(); ++i) {
+      const auto id = rowGroupIds_[i];
+      const bool keep = i < nextRowGroupIdsIdx_ ||
+          !bits::isBitSet(res.filterResult.data(), id);
+      if (keep) {
+        newRowGroupIds.push_back(id);
+        newFirstRow.push_back(rowNumber);
+      } else {
+        ++skippedStrides_;
+      }
+      rowNumber += *rowGroups_[id].num_rows();
+    }
+    rowGroupIds_ = std::move(newRowGroupIds);
+    firstRowOfRowGroup_ = std::move(newFirstRow);
+  }
+
   bool isRowGroupBuffered(int32_t rowGroupIndex) const {
     return readerBase_->isRowGroupBuffered(rowGroupIndex);
   }
@@ -1701,6 +1754,10 @@ void ParquetRowReader::updateRuntimeStats(
 
 void ParquetRowReader::resetFilterCaches() {
   impl_->resetFilterCaches();
+}
+
+void ParquetRowReader::reFilterRowGroups() {
+  impl_->reFilterRowGroups();
 }
 
 bool ParquetRowReader::isRowGroupBuffered(int32_t rowGroupIndex) const {
