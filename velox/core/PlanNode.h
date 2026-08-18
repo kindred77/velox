@@ -24,6 +24,7 @@
 #include "velox/connectors/Connector.h"
 #include "velox/core/Expressions.h"
 #include "velox/core/QueryConfig.h"
+#include "velox/type/Variant.h"
 #include "velox/vector/VectorStream.h"
 
 struct ArrowArrayStream;
@@ -2368,17 +2369,32 @@ class MergeExchangeNode : public ExchangeNode {
 
 using MergeExchangeNodePtr = std::shared_ptr<const MergeExchangeNode>;
 
+/// Range partitioning of a local merge's sources: when set, the source
+/// pipeline's sink routes every row by the first sort key into one of
+/// 'numPartitions' merge sources (range buckets), and the merge runs one
+/// driver per bucket, each merging that bucket's slices. 'boundaries' holds
+/// numPartitions-1 ascending values; rows with key < boundaries[j] go to
+/// bucket j. Buckets are disjoint and ordered, so concatenating the bucket
+/// outputs in partition order yields the globally sorted stream. Boundaries
+/// are performance hints: correctness is independent of their quality.
+struct RangePartitionSpec {
+  int numPartitions{1};
+  std::vector<facebook::velox::variant> boundaries;
+};
+
 class LocalMergeNode : public PlanNode {
  public:
   LocalMergeNode(
       const PlanNodeId& id,
       std::vector<FieldAccessTypedExprPtr> sortingKeys,
       std::vector<SortOrder> sortingOrders,
-      std::vector<PlanNodePtr> sources)
+      std::vector<PlanNodePtr> sources,
+      std::optional<RangePartitionSpec> rangePartitionSpec = std::nullopt)
       : PlanNode(id),
         sources_{std::move(sources)},
         sortingKeys_{std::move(sortingKeys)},
-        sortingOrders_{std::move(sortingOrders)} {}
+        sortingOrders_{std::move(sortingOrders)},
+        rangePartitionSpec_{std::move(rangePartitionSpec)} {}
 
   class Builder {
    public:
@@ -2389,6 +2405,7 @@ class LocalMergeNode : public PlanNode {
       sortingKeys_ = other.sortingKeys();
       sortingOrders_ = other.sortingOrders();
       sources_ = other.sources();
+      rangePartitionSpec_ = other.rangePartitionSpec();
     }
 
     Builder& id(PlanNodeId id) {
@@ -2411,6 +2428,12 @@ class LocalMergeNode : public PlanNode {
       return *this;
     }
 
+    Builder& rangePartitionSpec(
+        std::optional<RangePartitionSpec> rangePartitionSpec) {
+      rangePartitionSpec_ = std::move(rangePartitionSpec);
+      return *this;
+    }
+
     std::shared_ptr<LocalMergeNode> build() const {
       VELOX_USER_CHECK(id_.has_value(), "LocalMergeNode id is not set");
       VELOX_USER_CHECK(
@@ -2425,7 +2448,8 @@ class LocalMergeNode : public PlanNode {
           id_.value(),
           sortingKeys_.value(),
           sortingOrders_.value(),
-          sources_.value());
+          sources_.value(),
+          rangePartitionSpec_);
     }
 
    private:
@@ -2433,6 +2457,7 @@ class LocalMergeNode : public PlanNode {
     std::optional<std::vector<FieldAccessTypedExprPtr>> sortingKeys_;
     std::optional<std::vector<SortOrder>> sortingOrders_;
     std::optional<std::vector<PlanNodePtr>> sources_;
+    std::optional<RangePartitionSpec> rangePartitionSpec_;
   };
 
   const RowTypePtr& outputType() const override {
@@ -2447,7 +2472,7 @@ class LocalMergeNode : public PlanNode {
       const override;
 
   bool requiresSingleThread() const override {
-    return true;
+    return !rangePartitionSpec_.has_value();
   }
 
   const std::vector<FieldAccessTypedExprPtr>& sortingKeys() const {
@@ -2460,6 +2485,11 @@ class LocalMergeNode : public PlanNode {
 
   const std::vector<SortOrder>& sortingOrders() const {
     return sortingOrders_;
+  }
+
+  /// Range partitioning spec, if the merge is range-partitioned.
+  const std::optional<RangePartitionSpec>& rangePartitionSpec() const {
+    return rangePartitionSpec_;
   }
 
   std::string_view name() const override {
@@ -2476,6 +2506,48 @@ class LocalMergeNode : public PlanNode {
   const std::vector<PlanNodePtr> sources_;
   const std::vector<FieldAccessTypedExprPtr> sortingKeys_;
   const std::vector<SortOrder> sortingOrders_;
+  const std::optional<RangePartitionSpec> rangePartitionSpec_;
+};
+
+/// Concatenates its sources in a fixed order. Used to reassemble the ordered
+/// bucket streams of a range-partitioned merge: the merge sources carry
+/// partition ids and are drained in partition order, which yields a globally
+/// sorted stream because the buckets are disjoint ordered ranges.
+class OrderedConcatNode : public PlanNode {
+ public:
+  OrderedConcatNode(const PlanNodeId& id, std::vector<PlanNodePtr> sources)
+      : PlanNode(id), sources_{std::move(sources)} {
+    VELOX_USER_CHECK(
+        !sources_.empty(), "OrderedConcatNode requires at least one source");
+  }
+
+  const RowTypePtr& outputType() const override {
+    return sources_[0]->outputType();
+  }
+
+  const std::vector<PlanNodePtr>& sources() const override {
+    return sources_;
+  }
+
+  void accept(const PlanNodeVisitor& visitor, PlanNodeVisitorContext& context)
+      const override;
+
+  bool requiresSingleThread() const override {
+    return true;
+  }
+
+  std::string_view name() const override {
+    return "OrderedConcat";
+  }
+
+  folly::dynamic serialize() const override;
+
+  static PlanNodePtr create(const folly::dynamic& obj, void* context);
+
+ private:
+  void addDetails(std::stringstream& stream) const override;
+
+  const std::vector<PlanNodePtr> sources_;
 };
 
 using LocalMergeNodePtr = std::shared_ptr<const LocalMergeNode>;
@@ -6275,6 +6347,10 @@ class PlanNodeVisitor {
 
   virtual void visit(const LocalMergeNode& node, PlanNodeVisitorContext& ctx)
       const = 0;
+
+  virtual void visit(
+      const OrderedConcatNode& node,
+      PlanNodeVisitorContext& ctx) const = 0;
 
   virtual void visit(
       const LocalPartitionNode& node,

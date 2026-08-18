@@ -2998,12 +2998,25 @@ PlanNodePtr TopNRowNumberNode::create(
 
 void LocalMergeNode::addDetails(std::stringstream& stream) const {
   addSortingKeys(sortingKeys_, sortingOrders_, stream);
+  if (rangePartitionSpec_.has_value()) {
+    stream << " partitions:" << rangePartitionSpec_->numPartitions;
+  }
 }
 
 folly::dynamic LocalMergeNode::serialize() const {
   auto obj = PlanNode::serialize();
   obj["sortingKeys"] = ISerializable::serialize(sortingKeys_);
   obj["sortingOrders"] = serializeSortingOrders(sortingOrders_);
+  if (rangePartitionSpec_.has_value()) {
+    folly::dynamic spec = folly::dynamic::object;
+    spec["numPartitions"] = rangePartitionSpec_->numPartitions;
+    folly::dynamic boundaries = folly::dynamic::array;
+    for (const auto& boundary : rangePartitionSpec_->boundaries) {
+      boundaries.push_back(boundary.serialize());
+    }
+    spec["boundaries"] = std::move(boundaries);
+    obj["rangePartitionSpec"] = std::move(spec);
+  }
   return obj;
 }
 
@@ -3018,12 +3031,45 @@ PlanNodePtr LocalMergeNode::create(const folly::dynamic& obj, void* context) {
   auto sources = deserializeSources(obj, context);
   auto sortingKeys = deserializeFields(obj["sortingKeys"], context);
   auto sortingOrders = deserializeSortingOrders(obj["sortingOrders"]);
+  std::optional<RangePartitionSpec> rangePartitionSpec;
+  if (obj.count("rangePartitionSpec") != 0) {
+    RangePartitionSpec spec;
+    spec.numPartitions = obj["rangePartitionSpec"]["numPartitions"].asInt();
+    for (const auto& boundary : obj["rangePartitionSpec"]["boundaries"]) {
+      spec.boundaries.push_back(
+          facebook::velox::variant::create(boundary));
+    }
+    rangePartitionSpec = std::move(spec);
+  }
 
   return std::make_shared<LocalMergeNode>(
       deserializePlanNodeId(obj),
       std::move(sortingKeys),
       std::move(sortingOrders),
-      std::move(sources));
+      std::move(sources),
+      std::move(rangePartitionSpec));
+}
+
+void OrderedConcatNode::addDetails(std::stringstream& stream) const {
+  stream << " sources:" << sources_.size();
+}
+
+folly::dynamic OrderedConcatNode::serialize() const {
+  auto obj = PlanNode::serialize();
+  return obj;
+}
+
+void OrderedConcatNode::accept(
+    const PlanNodeVisitor& visitor,
+    PlanNodeVisitorContext& context) const {
+  visitor.visit(*this, context);
+}
+
+// static
+PlanNodePtr OrderedConcatNode::create(const folly::dynamic& obj, void* context) {
+  auto sources = deserializeSources(obj, context);
+  return std::make_shared<OrderedConcatNode>(
+      deserializePlanNodeId(obj), std::move(sources));
 }
 
 namespace {
@@ -4066,6 +4112,7 @@ void PlanNode::registerSerDe() {
   registry.Register("NestedLoopJoinNode", NestedLoopJoinNode::create);
   registry.Register("LimitNode", LimitNode::create);
   registry.Register("LocalMergeNode", LocalMergeNode::create);
+  registry.Register("OrderedConcatNode", OrderedConcatNode::create);
   registry.Register("LocalPartitionNode", LocalPartitionNode::create);
   registry.Register("MarkDistinctNode", MarkDistinctNode::create);
   registry.Register("MarkSortedNode", MarkSortedNode::create);

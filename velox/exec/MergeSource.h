@@ -48,8 +48,18 @@ class MergeSource {
 
   virtual void close() = 0;
 
+  /// The partition this source belongs to (0 for plain single-source merges).
+  /// Used by range-partitioned merges: the sink routes each row to the merge
+  /// source of its range bucket, and each merge driver consumes only the
+  /// sources of its own partition.
+  virtual int32_t partitionId() const {
+    return 0;
+  }
+
   // Factory methods to create MergeSources.
-  static std::shared_ptr<MergeSource> createLocalMergeSource(int queueSize);
+  static std::shared_ptr<MergeSource> createLocalMergeSource(
+      int queueSize,
+      int32_t partitionId = 0);
 
   static std::shared_ptr<MergeSource> createMergeExchangeSource(
       MergeExchange* mergeExchange,

@@ -88,6 +88,11 @@ bool mustStartNewPipeline(
     return true;
   }
 
+  if (std::dynamic_pointer_cast<const core::OrderedConcatNode>(planNode)) {
+    // OrderedConcat's source runs on its own pipeline.
+    return true;
+  }
+
   if (std::dynamic_pointer_cast<const core::MixedUnionNode>(planNode)) {
     // MixedUnion's sources run on their own pipelines.
     return true;
@@ -129,8 +134,43 @@ OperatorSupplier makeOperatorSupplier(ConsumerSupplier consumerSupplier) {
 
 OperatorSupplier makeOperatorSupplier(
     const std::shared_ptr<const core::PlanNode>& planNode) {
+  if (auto orderedConcat =
+          std::dynamic_pointer_cast<const core::OrderedConcatNode>(planNode)) {
+    // The source pipeline (a range-partitioned merge) runs one driver per
+    // bucket; each driver's sink enqueues its sorted bucket stream into a
+    // merge source tagged with the bucket's partition id, which OrderedConcat
+    // drains in partition order.
+    return [orderedConcat](int32_t operatorId, DriverCtx* ctx) {
+      auto mergeSource = ctx->task->addLocalMergeSource(
+          ctx->splitGroupId,
+          orderedConcat->id(),
+          orderedConcat->outputType(),
+          ctx->queryConfig().localMergeSourceQueueSize(),
+          ctx->partitionId);
+      auto consumerCb =
+          [mergeSource](
+              RowVectorPtr input, bool drained, ContinueFuture* future) {
+            VELOX_CHECK(!drained);
+            return mergeSource->enqueue(std::move(input), future);
+          };
+      auto startCb = [mergeSource](ContinueFuture* future) {
+        return mergeSource->started(future);
+      };
+      return std::make_unique<CallbackSink>(
+          operatorId, ctx, std::move(consumerCb), std::move(startCb));
+    };
+  }
+
   if (auto localMerge =
           std::dynamic_pointer_cast<const core::LocalMergeNode>(planNode)) {
+    if (localMerge->rangePartitionSpec().has_value()) {
+      // Range-partitioned merge: the source pipeline's sink routes every row
+      // by the first sort key into the range-bucket merge sources.
+      return [localMerge](int32_t operatorId, DriverCtx* ctx) {
+        return std::make_unique<RangePartitionedMergeSink>(
+            operatorId, ctx, localMerge);
+      };
+    }
     return [localMerge](int32_t operatorId, DriverCtx* ctx) {
       auto mergeSource = ctx->task->addLocalMergeSource(
           ctx->splitGroupId,
@@ -309,6 +349,16 @@ uint32_t maxDrivers(
       if (localExchange->type() ==
           core::LocalPartitionNode::Type::kRepartition) {
         count = std::min(queryConfig.maxLocalExchangePartitionCount(), count);
+      }
+    } else if (
+        auto localMerge =
+            std::dynamic_pointer_cast<const core::LocalMergeNode>(node)) {
+      // A range-partitioned merge runs one driver per range bucket.
+      if (localMerge->rangePartitionSpec().has_value()) {
+        count = std::min(
+            count,
+            static_cast<uint32_t>(
+                localMerge->rangePartitionSpec()->numPartitions));
       }
     } else if (
         auto tableWrite =
@@ -654,6 +704,12 @@ std::shared_ptr<Driver> DriverFactory::createDriver(
       auto localMergeOp =
           std::make_unique<LocalMerge>(id, ctx.get(), localMerge);
       operators.push_back(std::move(localMergeOp));
+    } else if (
+        auto orderedConcat =
+            std::dynamic_pointer_cast<const core::OrderedConcatNode>(
+                planNode)) {
+      operators.push_back(
+          std::make_unique<OrderedConcat>(id, ctx.get(), orderedConcat));
     } else if (
         auto mixedUnion =
             std::dynamic_pointer_cast<const core::MixedUnionNode>(planNode)) {

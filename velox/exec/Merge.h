@@ -370,6 +370,99 @@ class LocalMerge : public Merge {
 
  protected:
   BlockingReason addMergeSources(ContinueFuture* future) override;
+
+ private:
+  // For a range-partitioned merge, this driver merges only the sources of its
+  // own partition (one bucket per driver).
+  const int32_t partitionId_{0};
+  const bool rangePartitioned_{false};
+};
+
+/// Routes the rows of a sorted run into range-bucket merge sources: the sink
+/// of the source pipeline of a range-partitioned LocalMergeNode. Each row is
+/// assigned to the bucket of its first sort key using the partition
+/// boundaries; within a bucket the rows of every sorted run stay sorted, so
+/// each bucket's merge driver re-merges a set of sorted slices.
+class RangePartitionedMergeSink : public Operator {
+ public:
+  RangePartitionedMergeSink(
+      int32_t operatorId,
+      DriverCtx* driverCtx,
+      const std::shared_ptr<const core::LocalMergeNode>& localMergeNode);
+
+  void addInput(RowVectorPtr input) override;
+
+  RowVectorPtr getOutput() override {
+    return nullptr;
+  }
+
+  bool needsInput() const override {
+    return true;
+  }
+
+  void noMoreInput() override;
+
+  BlockingReason isBlocked(ContinueFuture* future) override;
+
+  bool isFinished() override {
+    return finished_;
+  }
+
+  bool canAddDynamicFilter() const override {
+    return false;
+  }
+
+ private:
+  void enqueueRowVector(int32_t partition, RowVectorPtr vector);
+
+  const int32_t numPartitions_;
+  // Ascending partition boundaries; rows with key < boundaries[j] go to
+  // bucket j (nulls go to the nullsFirst bucket).
+  const std::vector<facebook::velox::variant> boundaries_;
+  const bool nullsFirst_;
+  const column_index_t keyChannel_;
+  std::vector<std::shared_ptr<MergeSource>> sources_;
+  std::vector<ContinueFuture> blockingFutures_;
+  // Buckets this sink has already signaled end-of-data to. The sink's routing
+  // is monotone (a sorted run's rows advance through the ascending range
+  // buckets), so once the current batch's lowest bucket moves past a bucket,
+  // no more rows will ever be routed to it: signal atEnd early so the bucket's
+  // merge does not wait for this sink to fully finish.
+  std::vector<bool> partitionEnded_;
+  bool started_{false};
+  bool finished_{false};
+};
+
+/// Concatenates its merge sources in partition order. Used as the final stage
+/// of a range-partitioned merge: the bucket outputs are disjoint ordered
+/// ranges, so draining them in order yields the globally sorted stream without
+/// any comparisons.
+class OrderedConcat : public SourceOperator {
+ public:
+  OrderedConcat(
+      int32_t operatorId,
+      DriverCtx* driverCtx,
+      const std::shared_ptr<const core::OrderedConcatNode>& concatNode);
+
+  BlockingReason isBlocked(ContinueFuture* future) override;
+
+  bool isFinished() override;
+
+  RowVectorPtr getOutput() override;
+
+  void close() override;
+
+ private:
+  bool addMergeSources(ContinueFuture* future);
+
+  void startNextSource(ContinueFuture* future);
+
+  // Merge sources sorted by partition id.
+  std::vector<std::shared_ptr<MergeSource>> sources_;
+  size_t currentSource_{0};
+  bool allSourcesAdded_{false};
+  std::optional<ContinueFuture> blockedFuture_;
+  bool finished_{false};
 };
 
 // MergeExchange merges its sources' outputs into a single stream of

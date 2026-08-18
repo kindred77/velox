@@ -136,6 +136,11 @@ class Checker : public PlanNodeVisitor {
     visitSources(&node, ctx);
   }
 
+  void visit(const OrderedConcatNode& node, PlanNodeVisitorContext& ctx)
+      const override {
+    visitSources(&node, ctx);
+  }
+
   void visit(const LocalPartitionNode& node, PlanNodeVisitorContext& ctx)
       const override {
     visitSources(&node, ctx);

@@ -67,8 +67,12 @@ void deferNotify(
 
 class LocalMergeSource : public MergeSource {
  public:
-  explicit LocalMergeSource(int queueSize)
-      : queue_(LocalMergeSourceQueue(queueSize)) {}
+  LocalMergeSource(int queueSize, int32_t partitionId)
+      : queue_(LocalMergeSourceQueue(queueSize)), partitionId_(partitionId) {}
+
+  int32_t partitionId() const override {
+    return partitionId_;
+  }
 
   void start() override {
     TestValue::adjust("facebook::velox::exec::LocalMergeSource::start", this);
@@ -80,13 +84,13 @@ class LocalMergeSource : public MergeSource {
     return queue_.withWLock([&](auto& queue) { return queue.started(future); });
   }
 
-  BlockingReason next(RowVectorPtr& data, ContinueFuture* future, bool& drained)
-      override {
-    drained = false;
-    ScopedPromiseNotification notification(1);
-    return queue_.withWLock([&](auto& queue) {
-      return queue.next(data, future, drained, notification);
-    });
+    BlockingReason next(RowVectorPtr& data, ContinueFuture* future, bool& drained)
+        override {
+      drained = false;
+      ScopedPromiseNotification notification(1);
+      return queue_.withWLock([&](auto& queue) {
+        return queue.next(data, future, drained, notification);
+      });
   }
 
   BlockingReason
@@ -208,6 +212,7 @@ class LocalMergeSource : public MergeSource {
   };
 
   folly::Synchronized<LocalMergeSourceQueue> queue_;
+  const int32_t partitionId_;
 };
 
 class MergeExchangeSource : public MergeSource {
@@ -319,8 +324,9 @@ class MergeExchangeSource : public MergeSource {
 } // namespace
 
 std::shared_ptr<MergeSource> MergeSource::createLocalMergeSource(
-    int queueSize) {
-  return std::make_shared<LocalMergeSource>(queueSize);
+    int queueSize,
+    int32_t partitionId) {
+  return std::make_shared<LocalMergeSource>(queueSize, partitionId);
 }
 
 std::shared_ptr<MergeSource> MergeSource::createMergeExchangeSource(

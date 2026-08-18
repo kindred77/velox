@@ -15,12 +15,14 @@
  */
 
 #include "velox/exec/Merge.h"
+#include <algorithm>
 #include <folly/Traits.h>
 #include <exception>
 #include "velox/common/testutil/TestValue.h"
 #include "velox/exec/OperatorType.h"
 #include "velox/exec/OperatorUtils.h"
 #include "velox/exec/Task.h"
+#include "velox/vector/DecodedVector.h"
 
 using facebook::velox::common::testutil::TestValue;
 
@@ -97,8 +99,13 @@ BlockingReason Merge::isBlocked(ContinueFuture* future) {
     return BlockingReason::kNotBlocked;
   }
 
-  *future = std::move(sourceBlockingFutures_.back());
-  sourceBlockingFutures_.pop_back();
+  // Wait for any source to become available instead of one specific source:
+  // with range-partitioned sources a source can stay empty until its producer
+  // finishes, and blocking on it would stall the merge even when other
+  // sources already have data (the producer is then blocked on the merge's
+  // backpressure, a cycle). Waiting on any source keeps progress.
+  *future = folly::collectAny(sourceBlockingFutures_).unit();
+  sourceBlockingFutures_.clear();
   return BlockingReason::kWaitForProducer;
 }
 
@@ -745,11 +752,15 @@ LocalMerge::LocalMerge(
               ? driverCtx->makeSpillConfig(
                     operatorId,
                     OperatorType::kLocalMerge)
-              : std::nullopt) {
-  VELOX_CHECK_EQ(
-      operatorCtx_->driverCtx()->driverId,
-      0,
-      "LocalMerge needs to run single-threaded");
+              : std::nullopt),
+      partitionId_(driverCtx->partitionId),
+      rangePartitioned_(localMergeNode->rangePartitionSpec().has_value()) {
+  if (!rangePartitioned_) {
+    VELOX_CHECK_EQ(
+        operatorCtx_->driverCtx()->driverId,
+        0,
+        "LocalMerge needs to run single-threaded");
+  }
   // Enable local merge spill iff spill is enabled and the spill executor is
   // provided.
   if (spillConfig_.has_value() && spillConfig_->executor != nullptr) {
@@ -762,8 +773,18 @@ LocalMerge::LocalMerge(
 
 BlockingReason LocalMerge::addMergeSources(ContinueFuture* /* future */) {
   if (sources_.empty()) {
-    sources_ = operatorCtx_->task()->getLocalMergeSources(
+    auto allSources = operatorCtx_->task()->getLocalMergeSources(
         operatorCtx_->driverCtx()->splitGroupId, planNodeId());
+    if (rangePartitioned_) {
+      // Each driver merges only the merge sources of its own range bucket.
+      for (const auto& source : allSources) {
+        if (source->partitionId() == partitionId_) {
+          sources_.push_back(source);
+        }
+      }
+    } else {
+      sources_ = std::move(allSources);
+    }
   }
   return BlockingReason::kNotBlocked;
 }
@@ -869,5 +890,281 @@ void MergeExchange::close() {
         Operator::kShuffleCompressionKind,
         RuntimeCounter(static_cast<int64_t>(serdeOptions_->compressionKind)));
   }
+}
+
+RangePartitionedMergeSink::RangePartitionedMergeSink(
+    int32_t operatorId,
+    DriverCtx* driverCtx,
+    const std::shared_ptr<const core::LocalMergeNode>& localMergeNode)
+    : Operator(
+          driverCtx,
+          localMergeNode->outputType(),
+          operatorId,
+          localMergeNode->id(),
+          OperatorType::kRangePartitionedMerge),
+      numPartitions_(localMergeNode->rangePartitionSpec()->numPartitions),
+      boundaries_(localMergeNode->rangePartitionSpec()->boundaries),
+      nullsFirst_(localMergeNode->sortingOrders()[0].isNullsFirst()),
+      keyChannel_(
+          exprToChannel(
+              localMergeNode->sortingKeys()[0].get(),
+              localMergeNode->outputType())),
+      partitionEnded_(numPartitions_, false) {
+  VELOX_CHECK_GT(numPartitions_, 1);
+  VELOX_CHECK_EQ(boundaries_.size(), numPartitions_ - 1);
+  for (auto i = 0; i < numPartitions_; ++i) {
+    sources_.push_back(operatorCtx_->task()->addLocalMergeSource(
+        operatorCtx_->driverCtx()->splitGroupId,
+        planNodeId(),
+        localMergeNode->outputType(),
+        operatorCtx_->driverCtx()->queryConfig().localMergeSourceQueueSize(),
+        i));
+  }
+}
+
+namespace {
+
+// The bucket of 'value' under the ascending boundaries: rows with
+// key < boundaries[j] belong to bucket j.
+template <typename T>
+int32_t bucketForValue(
+    const std::vector<facebook::velox::variant>& boundaries,
+    T value) {
+  int32_t lo = 0;
+  int32_t hi = boundaries.size();
+  while (lo < hi) {
+    const int32_t mid = (lo + hi) / 2;
+    if (value < boundaries[mid].value<T>()) {
+      hi = mid;
+    } else {
+      lo = mid + 1;
+    }
+  }
+  return lo;
+}
+
+} // namespace
+
+void RangePartitionedMergeSink::addInput(RowVectorPtr input) {
+  if (input->size() == 0) {
+    return;
+  }
+
+  auto keyVector = input->childAt(keyChannel_);
+  keyVector->loadedVector();
+  DecodedVector decoded(*keyVector);
+  const TypeKind keyKind = keyVector->typeKind();
+
+  std::vector<vector_size_t> counts(numPartitions_, 0);
+  std::vector<vector_size_t> partitions(input->size());
+  for (auto row = 0; row < input->size(); ++row) {
+    int32_t partition;
+    if (decoded.isNullAt(row)) {
+      partition = nullsFirst_ ? 0 : numPartitions_ - 1;
+    } else {
+      switch (keyKind) {
+        case TypeKind::BIGINT:
+          partition = bucketForValue(
+              boundaries_, decoded.valueAt<int64_t>(row));
+          break;
+        case TypeKind::INTEGER:
+          partition = bucketForValue(
+              boundaries_, decoded.valueAt<int32_t>(row));
+          break;
+        case TypeKind::SMALLINT:
+          partition = bucketForValue(
+              boundaries_, decoded.valueAt<int16_t>(row));
+          break;
+        case TypeKind::VARCHAR:
+          partition = bucketForValue(
+              boundaries_,
+              std::string(decoded.valueAt<StringView>(row)));
+          break;
+        default:
+          VELOX_UNSUPPORTED(
+              "RangePartitionedMergeSink does not support key type {}",
+              TypeKindName::toName(keyKind));
+      }
+    }
+    VELOX_DCHECK_GE(partition, 0);
+    VELOX_DCHECK_LT(partition, numPartitions_);
+    partitions[row] = partition;
+    ++counts[partition];
+  }
+
+  // Signal end-of-data to buckets that this sorted run has moved past: the
+  // row partitions are non-decreasing, so once the current batch's lowest
+  // bucket is above a bucket, no later row will ever be routed to it. Doing
+  // this early lets the bucket's merge produce without waiting for this sink
+  // to fully finish (which could otherwise be blocked on the merge's
+  // backpressure, a cycle).
+  int32_t minPartition = numPartitions_;
+  for (auto row = 0; row < input->size(); ++row) {
+    minPartition = std::min(minPartition, partitions[row]);
+  }
+  for (auto partition = 0; partition < minPartition; ++partition) {
+    if (!partitionEnded_[partition]) {
+      ContinueFuture future;
+      const auto reason = sources_[partition]->enqueue(nullptr, &future);
+      VELOX_CHECK_EQ(reason, BlockingReason::kNotBlocked);
+      partitionEnded_[partition] = true;
+    }
+  }
+
+  std::vector<std::vector<vector_size_t>> indices(numPartitions_);
+  for (auto partition = 0; partition < numPartitions_; ++partition) {
+    indices[partition].reserve(counts[partition]);
+  }
+  for (auto row = 0; row < input->size(); ++row) {
+    indices[partitions[row]].push_back(row);
+  }
+
+  for (auto partition = 0; partition < numPartitions_; ++partition) {
+    if (indices[partition].empty()) {
+      continue;
+    }
+    auto mapping = allocateIndices(indices[partition].size(), pool());
+    auto* rawMapping = mapping->asMutable<vector_size_t>();
+    memcpy(
+        rawMapping,
+        indices[partition].data(),
+        indices[partition].size() * sizeof(vector_size_t));
+    auto partitionData = exec::wrap(
+        indices[partition].size(), mapping, input);
+    enqueueRowVector(partition, std::move(partitionData));
+  }
+}
+
+void RangePartitionedMergeSink::enqueueRowVector(
+    int32_t partition,
+    RowVectorPtr vector) {
+  ContinueFuture future;
+  auto reason = sources_[partition]->enqueue(std::move(vector), &future);
+  if (reason != BlockingReason::kNotBlocked) {
+    blockingFutures_.push_back(std::move(future));
+  }
+}
+
+void RangePartitionedMergeSink::noMoreInput() {
+  Operator::noMoreInput();
+  for (auto partition = 0; partition < numPartitions_; ++partition) {
+    if (partitionEnded_[partition]) {
+      continue;
+    }
+    ContinueFuture future;
+    const auto reason = sources_[partition]->enqueue(nullptr, &future);
+    VELOX_CHECK_EQ(reason, BlockingReason::kNotBlocked);
+    partitionEnded_[partition] = true;
+  }
+  finished_ = true;
+}
+
+BlockingReason RangePartitionedMergeSink::isBlocked(ContinueFuture* future) {
+  if (!started_) {
+    // Wait until every bucket's merge driver has started consuming, otherwise
+    // enqueue() would fail its started check.
+    for (auto& source : sources_) {
+      if (const auto reason = source->started(future);
+          reason != BlockingReason::kNotBlocked) {
+        return reason;
+      }
+    }
+    started_ = true;
+  }
+  if (!blockingFutures_.empty()) {
+    *future =
+        folly::collectAll(blockingFutures_.begin(), blockingFutures_.end())
+            .unit();
+    blockingFutures_.clear();
+    return BlockingReason::kWaitForConsumer;
+  }
+  return BlockingReason::kNotBlocked;
+}
+
+OrderedConcat::OrderedConcat(
+    int32_t operatorId,
+    DriverCtx* driverCtx,
+    const std::shared_ptr<const core::OrderedConcatNode>& concatNode)
+    : SourceOperator(
+          driverCtx,
+          concatNode->outputType(),
+          operatorId,
+          concatNode->id(),
+          OperatorType::kOrderedConcat) {}
+
+bool OrderedConcat::addMergeSources(ContinueFuture* future) {
+  if (allSourcesAdded_) {
+    return true;
+  }
+  allSourcesAdded_ = true;
+  auto allSources = operatorCtx_->task()->getLocalMergeSources(
+      operatorCtx_->driverCtx()->splitGroupId, planNodeId());
+  for (const auto& source : allSources) {
+    sources_.push_back(source);
+  }
+  // Drain the buckets in partition order: the buckets are disjoint ordered
+  // ranges, so the concatenation is the globally sorted stream.
+  std::sort(
+      sources_.begin(),
+      sources_.end(),
+      [](const auto& a, const auto& b) {
+        return a->partitionId() < b->partitionId();
+      });
+  // Start all bucket sources eagerly: each bucket's merge driver is unblocked
+  // by its sink's start signal and can then start its own input sources. A
+  // lazy per-bucket start would deadlock, because the range-partitioned
+  // merge's input sinks wait for every bucket's sources to be started.
+  for (auto& source : sources_) {
+    source->start();
+  }
+  return true;
+}
+
+BlockingReason OrderedConcat::isBlocked(ContinueFuture* future) {
+  addMergeSources(future);
+  if (sources_.empty()) {
+    finished_ = true;
+    return BlockingReason::kNotBlocked;
+  }
+  if (blockedFuture_.has_value()) {
+    *future = std::move(blockedFuture_.value());
+    blockedFuture_.reset();
+    return BlockingReason::kWaitForProducer;
+  }
+  return BlockingReason::kNotBlocked;
+}
+
+RowVectorPtr OrderedConcat::getOutput() {
+  addMergeSources(nullptr);
+  while (currentSource_ < sources_.size()) {
+    auto& source = sources_[currentSource_];
+    ContinueFuture future;
+    RowVectorPtr output;
+    bool drained = false;
+    const auto reason = source->next(output, &future, drained);
+    if (reason != BlockingReason::kNotBlocked) {
+      blockedFuture_ = std::move(future);
+      return nullptr;
+    }
+    if (output != nullptr) {
+      return output;
+    }
+    // The source is exhausted (or drained under a barrier); move on to the
+    // next bucket.
+    ++currentSource_;
+  }
+  finished_ = true;
+  return nullptr;
+}
+
+bool OrderedConcat::isFinished() {
+  return finished_;
+}
+
+void OrderedConcat::close() {
+  for (auto& source : sources_) {
+    source->close();
+  }
+  SourceOperator::close();
 }
 } // namespace facebook::velox::exec
