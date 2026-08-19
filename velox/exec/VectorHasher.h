@@ -127,7 +127,8 @@ struct UniqueValueComparer {
 
 class VectorHasher {
  public:
-  static constexpr uint64_t kUnmappable = ~0UL;
+  static constexpr uint64_t kUnmappable =
+      std::numeric_limits<uint64_t>::max();
   // Largest range that can be a part of a normalized key. 59 bits,
   // corresponds to 7 byte strings represented as numbers (56 bits of
   // data and 3 of length).
