@@ -112,7 +112,18 @@ BlockingReason MixedUnion::isBlocked(ContinueFuture* future) {
     // every active source in round-robin order. This ensures deterministic
     // interleaving. Finished and drained sources are skipped above and
     // never contribute a future, so collectAll will not hang.
-    *future = folly::collectAll(std::move(blockingFutures)).unit();
+    // Emit a producer that became ready in this poll before waiting. Waiting
+    // for every source can deadlock a mixed/serial append when one producer
+    // cannot progress until the ready producer is drained.
+    for (const auto& data : pendingData_) {
+      if (data) {
+        return BlockingReason::kNotBlocked;
+      }
+    }
+
+    // A union needs only one producer to make progress. Poll the remaining
+    // sources again after the future resolves.
+    *future = folly::collectAny(std::move(blockingFutures)).unit();
     return BlockingReason::kWaitForProducer;
   }
 
