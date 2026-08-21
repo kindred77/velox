@@ -70,6 +70,8 @@ class HiveConnectorSerDeTest : public exec::test::HiveConnectorTestBase {
     }
 
     ASSERT_EQ(split.tableBucketNumber, clone->tableBucketNumber);
+    ASSERT_EQ(split.earlyStopRows, clone->earlyStopRows);
+    ASSERT_EQ(split.reverseRowGroups, clone->reverseRowGroups);
     if (split.bucketConversion.has_value()) {
       ASSERT_TRUE(clone->bucketConversion.has_value());
       ASSERT_EQ(
@@ -313,10 +315,18 @@ TEST_F(HiveConnectorSerDeTest, hiveConnectorSplit) {
   testSerde(split2);
 
   auto split3 = HiveConnectorSplit(connectorId, filePath, fileFormat);
+  split3.earlyStopRows = 123;
+  split3.reverseRowGroups = true;
   std::vector<std::shared_ptr<HiveColumnHandle>> handles;
   handles.push_back(makeColumnHandle("c0", INTEGER(), {}));
   split3.bucketConversion = {16, 2, std::move(handles)};
   testSerde(split3);
+
+  auto legacyObj = split3.serialize();
+  legacyObj.erase("reverseRowGroups");
+  const auto legacyClone =
+      ISerializable::deserialize<HiveConnectorSplit>(legacyObj);
+  EXPECT_FALSE(legacyClone->reverseRowGroups);
 }
 
 } // namespace

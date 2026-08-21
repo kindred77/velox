@@ -16,6 +16,8 @@
 
 #include "velox/dwio/parquet/reader/ParquetReader.h"
 
+#include <algorithm>
+
 #include <thrift/lib/cpp2/FieldRef.h>
 
 #include "velox/common/Casts.h"
@@ -1536,6 +1538,11 @@ class ParquetRowReader::Impl {
       // remainder is released by ~ReaderBase.
       readerBase_->releaseThriftBytes(freedThriftSize);
     }
+
+    if (options_.reverseRowGroups()) {
+      std::reverse(rowGroupIds_.begin(), rowGroupIds_.end());
+      std::reverse(firstRowOfRowGroup_.begin(), firstRowOfRowGroup_.end());
+    }
   }
 
   int64_t nextRowNumber() {
@@ -1600,7 +1607,7 @@ class ParquetRowReader::Impl {
 
   void updateRuntimeStats(dwio::common::RuntimeStatistics& stats) const {
     stats.skippedStrides += skippedStrides_;
-    stats.processedStrides += rowGroupIds_.size();
+    stats.processedStrides += processedStrides_;
     stats.parquetFooterEstimatedBytes += readerBase_->initialThriftSize();
     stats.columnReaderStats.pageLoadTimeNs.merge(
         columnReaderStats_.pageLoadTimeNs);
@@ -1646,18 +1653,16 @@ class ParquetRowReader::Impl {
     std::vector<uint64_t> newFirstRow;
     newRowGroupIds.reserve(rowGroupIds_.size());
     newFirstRow.reserve(rowGroupIds_.size());
-    uint64_t rowNumber = 0;
     for (auto i = 0; i < rowGroupIds_.size(); ++i) {
       const auto id = rowGroupIds_[i];
       const bool keep = i < nextRowGroupIdsIdx_ ||
           !bits::isBitSet(res.filterResult.data(), id);
       if (keep) {
         newRowGroupIds.push_back(id);
-        newFirstRow.push_back(rowNumber);
+        newFirstRow.push_back(firstRowOfRowGroup_[i]);
       } else {
         ++skippedStrides_;
       }
-      rowNumber += *rowGroups_[id].num_rows();
     }
     rowGroupIds_ = std::move(newRowGroupIds);
     firstRowOfRowGroup_ = std::move(newFirstRow);
@@ -1673,9 +1678,9 @@ class ParquetRowReader::Impl {
       return false;
     }
     // Early termination: the completed row-group prefix already produced
-    // enough rows passing the filters. Row groups are processed in file order,
-    // so no later row group can contribute to an ordered top-N beyond the
-    // first `earlyStopRows` matching rows.
+    // enough rows passing the filters. The caller-authorized schedule follows
+    // the query's sort direction, so no later row group can contribute to an
+    // ordered top-N beyond the first `earlyStopRows` matching rows.
     if (options_.earlyStopRows().has_value() &&
         rowsOutput_ >= *options_.earlyStopRows()) {
       return false;
@@ -1691,6 +1696,7 @@ class ParquetRowReader::Impl {
     currentRowInGroup_ = 0;
     nextRowGroupIdsIdx_++;
     columnReader_->seekToRowGroup(nextRowGroupIndex);
+    ++processedStrides_;
     return true;
   }
 
@@ -1705,6 +1711,7 @@ class ParquetRowReader::Impl {
   std::vector<uint32_t> rowGroupIds_;
   std::vector<uint64_t> firstRowOfRowGroup_;
   uint32_t nextRowGroupIdsIdx_;
+  int64_t processedStrides_{0};
   const thrift::RowGroup* currentRowGroupPtr_{nullptr};
   uint64_t rowsInCurrentRowGroup_;
   uint64_t currentRowInGroup_;

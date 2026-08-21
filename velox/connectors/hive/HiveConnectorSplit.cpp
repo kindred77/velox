@@ -109,6 +109,7 @@ folly::dynamic HiveConnectorSplit::serialize() const {
   obj["earlyStopRows"] = earlyStopRows.has_value()
       ? folly::dynamic(earlyStopRows.value())
       : nullptr;
+  obj["reverseRowGroups"] = reverseRowGroups;
 
   return obj;
 }
@@ -215,6 +216,8 @@ std::shared_ptr<HiveConnectorSplit> HiveConnectorSplit::create(
   if (earlyStopObj != nullptr) {
     split->earlyStopRows = earlyStopObj.asInt();
   }
+  split->reverseRowGroups =
+      obj.getDefault("reverseRowGroups", false).asBool();
   return split;
 }
 

@@ -193,6 +193,7 @@ void configureRowReaderOptions(
     if (hiveSplit->earlyStopRows.has_value()) {
       rowReaderOptions.setEarlyStopRows(*hiveSplit->earlyStopRows);
     }
+    rowReaderOptions.setReverseRowGroups(hiveSplit->reverseRowGroups);
   }
   if (fileConfig && sessionProperties) {
     rowReaderOptions.setTimestampPrecision(

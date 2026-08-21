@@ -58,9 +58,13 @@ struct HiveConnectorSplit : public FileConnectorSplit {
 
   /// Ordered-scan early termination: stop reading after the row group whose
   /// cumulative output (post-filter) row count reaches this value. Requires a
-  /// single split covering the whole file so row groups are processed in file
-  /// order. See dwio::common::RowReaderOptions::setEarlyStopRows.
+  /// single split covering the whole file so row groups follow one ordered
+  /// schedule. See dwio::common::RowReaderOptions::setEarlyStopRows.
   std::optional<int64_t> earlyStopRows;
+
+  /// Process row groups within this split in reverse physical order. This is
+  /// useful for ordered scans of clustered data from the file tail.
+  bool reverseRowGroups{false};
 
   HiveConnectorSplit(
       const std::string& connectorId,
@@ -212,6 +216,11 @@ class HiveConnectorSplitBuilder {
     return *this;
   }
 
+  HiveConnectorSplitBuilder& reverseRowGroups(bool reverse = true) {
+    reverseRowGroups_ = reverse;
+    return *this;
+  }
+
   std::shared_ptr<connector::hive::HiveConnectorSplit> build() const {
     auto split = std::make_shared<connector::hive::HiveConnectorSplit>(
         connectorId_,
@@ -232,6 +241,7 @@ class HiveConnectorSplitBuilder {
         bucketConversion_);
     split->batchSizeHint = batchSizeHint_;
     split->earlyStopRows = earlyStopRows_;
+    split->reverseRowGroups = reverseRowGroups_;
     return split;
   }
 
@@ -254,6 +264,7 @@ class HiveConnectorSplitBuilder {
   std::optional<RowIdProperties> rowIdProperties_ = std::nullopt;
   int32_t batchSizeHint_{0};
   std::optional<int64_t> earlyStopRows_{std::nullopt};
+  bool reverseRowGroups_{false};
 };
 
 } // namespace facebook::velox::connector::hive

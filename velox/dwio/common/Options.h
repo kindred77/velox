@@ -274,9 +274,9 @@ class RowReaderOptions {
 
   /// When set, the reader stops after the row group whose cumulative output
   /// (post-filter) row count reaches this value. The caller must ensure row
-  /// groups are processed in file order (single split) and that the reader's
-  /// filters are exactly the query's filter; used for ordered-scan early
-  /// termination of top-N queries.
+  /// groups follow the query's sort direction in one split and that the
+  /// reader's filters are exactly the query's filter; used for ordered-scan
+  /// early termination of top-N queries.
   RowReaderOptions& setEarlyStopRows(int64_t rows) {
     earlyStopRows_ = rows;
     return *this;
@@ -285,6 +285,16 @@ class RowReaderOptions {
   /// Cumulative output-row limit after which no further row groups are read.
   std::optional<int64_t> earlyStopRows() const {
     return earlyStopRows_;
+  }
+
+  /// Process selected row groups in reverse physical order.
+  RowReaderOptions& setReverseRowGroups(bool reverse) {
+    reverseRowGroups_ = reverse;
+    return *this;
+  }
+
+  bool reverseRowGroups() const {
+    return reverseRowGroups_;
   }
 
   /// Gets the list of selected field or type ids to read.
@@ -617,6 +627,7 @@ class RowReaderOptions {
   uint64_t dataStart_;
   uint64_t dataLength_;
   std::optional<int64_t> earlyStopRows_{std::nullopt};
+  bool reverseRowGroups_{false};
   bool preloadStripe_;
   bool projectSelectedType_;
   bool returnFlatVector_ = false;

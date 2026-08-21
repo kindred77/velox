@@ -110,6 +110,60 @@ TEST_F(ParquetReaderTest, parseSample) {
       sampleSchema(), *readerBundle.rowReader, expected, *leafPool_);
 }
 
+TEST_F(ParquetReaderTest, reverseRowGroupsEarlyStopAndRefilter) {
+  auto makeReverseReader = [&](std::shared_ptr<ScanSpec> scanSpec,
+                               std::optional<int64_t> earlyStopRows) {
+    auto reader = createReader("sample.parquet");
+    auto options = makeRowReaderOpts(sampleSchema());
+    options.setScanSpec(std::move(scanSpec));
+    options.setReverseRowGroups(true);
+    if (earlyStopRows.has_value()) {
+      options.setEarlyStopRows(*earlyStopRows);
+    }
+    auto rowReader = reader->createRowReader(options);
+    return std::pair{std::move(reader), std::move(rowReader)};
+  };
+
+  {
+    auto scanSpec = makeScanSpec(sampleSchema());
+    auto [reader, rowReader] = makeReverseReader(scanSpec, 5);
+    EXPECT_EQ(rowReader->nextRowNumber(), 10);
+
+    VectorPtr result = BaseVector::create(sampleSchema(), 20, leafPool_.get());
+    EXPECT_EQ(rowReader->next(20, result), 10);
+    auto values = result->as<RowVector>()->childAt(0)->asFlatVector<int64_t>();
+    ASSERT_EQ(result->size(), 10);
+    EXPECT_EQ(values->valueAt(0), 11);
+    EXPECT_EQ(values->valueAt(9), 20);
+    EXPECT_EQ(rowReader->next(20, result), 0);
+
+    RuntimeStatistics stats;
+    rowReader->updateRuntimeStats(stats);
+    EXPECT_EQ(stats.processedStrides, 1);
+  }
+
+  {
+    auto scanSpec = makeScanSpec(sampleSchema());
+    auto [reader, rowReader] = makeReverseReader(scanSpec, std::nullopt);
+    VectorPtr result = BaseVector::create(sampleSchema(), 20, leafPool_.get());
+    EXPECT_EQ(rowReader->next(20, result), 10);
+
+    scanSpec->getOrCreateChild(Subfield("a"))->setFilter(exec::between(1, 5));
+    rowReader->resetFilterCaches();
+    rowReader->reFilterRowGroups();
+    EXPECT_EQ(rowReader->nextRowNumber(), 0);
+    EXPECT_EQ(rowReader->next(20, result), 10);
+    ASSERT_EQ(result->size(), 5);
+    auto values = result->as<RowVector>()->childAt(0)->asFlatVector<int64_t>();
+    EXPECT_EQ(values->valueAt(0), 1);
+    EXPECT_EQ(values->valueAt(4), 5);
+
+    RuntimeStatistics stats;
+    rowReader->updateRuntimeStats(stats);
+    EXPECT_EQ(stats.processedStrides, 2);
+  }
+}
+
 TEST_F(ParquetReaderTest, parquetFieldIdColumnMappingNotImplemented) {
   auto readerOptions = makeDefaultReaderOptions();
   readerOptions.setColumnMappingMode(ColumnMappingMode::kParquetFieldId);
