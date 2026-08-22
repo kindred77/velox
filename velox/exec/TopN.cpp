@@ -15,6 +15,7 @@
  */
 #include <folly/container/F14Map.h>
 
+#include "velox/common/base/BitUtil.h"
 #include "velox/exec/ContainerRowSerde.h"
 #include "velox/exec/OperatorType.h"
 #include "velox/exec/TopN.h"
@@ -99,6 +100,39 @@ int compareRawToDecoded(
       readCompactValue<Kind>(raw), decoded.valueAt<CompactValue<Kind>>(row));
 }
 
+// Leading-key fast discard: returns true when the input row sorts strictly
+// after the cached k-th best value on the leading key alone, i.e. the row can
+// never enter the top-N.  Mirrors RowContainer's null semantics (nullsFirst
+// applies to the final output order in both directions): a null input row is
+// worse than a non-null bound only when nulls sort last, and a non-null input
+// row is worse than a null bound only when nulls sort first.  Rows equal to
+// the bound on the leading key are kept for the full comparator.
+template <TypeKind Kind>
+bool leadingKeyDiscardsImpl(
+    const DecodedVector& decoded,
+    vector_size_t row,
+    const char* boundRaw,
+    bool boundNull,
+    bool ascending,
+    bool nullsFirst) {
+  using T = typename KindToFlatVector<Kind>::HashRowType;
+  const bool rowNull = decoded.isNullAt(row);
+  if (rowNull) {
+    return !boundNull && !nullsFirst;
+  }
+  if (boundNull) {
+    return nullsFirst;
+  }
+  T rowValue = decoded.valueAt<T>(row);
+  T boundValue;
+  memcpy(&boundValue, boundRaw, sizeof(T));
+  const int result = SimpleVector<T>::comparePrimitiveAsc(rowValue, boundValue);
+  if (result == 0) {
+    return false;
+  }
+  return ascending ? result > 0 : result < 0;
+}
+
 // Fills a temporary flat vector of 'type' from compact slots. Used only when
 // materializing the ring back into the RowContainer through store(), which
 // keeps column stats (null counts) consistent.
@@ -158,6 +192,63 @@ TopN::TopN(
       if (!isSortingKey[i]) {
         nonKeyColumns_.emplace_back(i);
       }
+    }
+  }
+
+  // Leading-key fast discard is generic for fixed-width primitive keys: the
+  // k-th best value is cached and compared with the decoded input value, so a
+  // full RowContainer comparison only happens for rows that can actually
+  // enter the top-N (or tie with the bound on the leading key).
+  if (count_ > 0 && !sortingKeyColumns_.empty() &&
+      isCompactSupportedKind(
+          outputType_->childAt(sortingKeyColumns_[0])->kind())) {
+    leadingKeyFast_ = true;
+    leadingKeyColumn_ = sortingKeyColumns_[0];
+    leadingKeyKind_ = outputType_->childAt(leadingKeyColumn_)->kind();
+    leadingAscending_ = sortingOrders_[0].isAscending();
+    leadingNullsFirst_ = sortingOrders_[0].isNullsFirst();
+    leadingBoundValue_.resize(
+        outputType_->childAt(leadingKeyColumn_)->cppSizeInBytes());
+    switch (leadingKeyKind_) {
+      case TypeKind::BOOLEAN:
+        leadingKeyDiscardFn_ =
+            &TopN::leadingKeyDiscardByKind<TypeKind::BOOLEAN>;
+        break;
+      case TypeKind::TINYINT:
+        leadingKeyDiscardFn_ =
+            &TopN::leadingKeyDiscardByKind<TypeKind::TINYINT>;
+        break;
+      case TypeKind::SMALLINT:
+        leadingKeyDiscardFn_ =
+            &TopN::leadingKeyDiscardByKind<TypeKind::SMALLINT>;
+        break;
+      case TypeKind::INTEGER:
+        leadingKeyDiscardFn_ =
+            &TopN::leadingKeyDiscardByKind<TypeKind::INTEGER>;
+        break;
+      case TypeKind::BIGINT:
+        leadingKeyDiscardFn_ =
+            &TopN::leadingKeyDiscardByKind<TypeKind::BIGINT>;
+        break;
+      case TypeKind::REAL:
+        leadingKeyDiscardFn_ =
+            &TopN::leadingKeyDiscardByKind<TypeKind::REAL>;
+        break;
+      case TypeKind::DOUBLE:
+        leadingKeyDiscardFn_ =
+            &TopN::leadingKeyDiscardByKind<TypeKind::DOUBLE>;
+        break;
+      case TypeKind::HUGEINT:
+        leadingKeyDiscardFn_ =
+            &TopN::leadingKeyDiscardByKind<TypeKind::HUGEINT>;
+        break;
+      default:
+        leadingKeyFast_ = false;
+        leadingKeyDiscardFn_ = nullptr;
+        break;
+    }
+    if (leadingKeyDiscardFn_ == nullptr) {
+      leadingKeyFast_ = false;
     }
   }
 
@@ -330,11 +421,110 @@ void TopN::rebuildHeapFromRing() {
   ringHead_ = 0;
   lastSeenRow_ = nullptr;
   monotonic_ = false;
+  if (leadingKeyFast_ && topRows_.size() == count_) {
+    updateLeadingBound();
+  }
+}
+
+bool TopN::leadingKeyDiscards(
+    const DecodedVector& decoded,
+    vector_size_t row) const {
+  return leadingKeyDiscardFn_(*this, decoded, row);
+}
+
+template <TypeKind Kind>
+bool TopN::leadingKeyDiscardByKind(
+    const TopN& op,
+    const DecodedVector& decoded,
+    vector_size_t row) {
+  return leadingKeyDiscardsImpl<Kind>(
+      decoded,
+      row,
+      op.leadingBoundValue_.data(),
+      op.leadingBoundNull_,
+      op.leadingAscending_,
+      op.leadingNullsFirst_);
+}
+
+template <TypeKind Kind>
+void TopN::fillLeadingKeyDiscardBitmap(
+    TopN& op,
+    DecodedVector& decoded,
+    vector_size_t size) {
+  using T = typename KindToFlatVector<Kind>::HashRowType;
+  const uint64_t* nulls = decoded.nulls();
+  const bool boundNull = op.leadingBoundNull_;
+  const bool ascending = op.leadingAscending_;
+  const bool nullsFirst = op.leadingNullsFirst_;
+  const T bound = *reinterpret_cast<const T*>(op.leadingBoundValue_.data());
+  uint64_t* bitmap = op.discardBitmap_.data();
+  if constexpr (Kind == TypeKind::BOOLEAN) {
+    // Boolean values are bit-packed, not a byte-per-value array.
+    const uint64_t* data = reinterpret_cast<const uint64_t*>(decoded.data<T>());
+    for (vector_size_t row = 0; row < size; ++row) {
+      bool discard;
+      if (nulls != nullptr && bits::isBitNull(nulls, row)) {
+        discard = !boundNull && !nullsFirst;
+      } else if (boundNull) {
+        discard = nullsFirst;
+      } else {
+        const int cmp = SimpleVector<bool>::comparePrimitiveAsc(
+            bits::isBitSet(data, row), bound);
+        discard = (cmp != 0) && (ascending ? cmp > 0 : cmp < 0);
+      }
+      bits::setBit(bitmap, row, discard);
+    }
+  } else {
+    const T* data = decoded.data<T>();
+    for (vector_size_t row = 0; row < size; ++row) {
+      bool discard;
+      if (nulls != nullptr && bits::isBitNull(nulls, row)) {
+        discard = !boundNull && !nullsFirst;
+      } else if (boundNull) {
+        discard = nullsFirst;
+      } else {
+        const int cmp = SimpleVector<T>::comparePrimitiveAsc(data[row], bound);
+        discard = (cmp != 0) && (ascending ? cmp > 0 : cmp < 0);
+      }
+      bits::setBit(bitmap, row, discard);
+    }
+  }
+}
+
+void TopN::updateLeadingBound() {
+  const char* top = topRows_.top();
+  const auto column = data_->columnAt(leadingKeyColumn_);
+  leadingBoundNull_ =
+      RowContainer::isNullAt(top, column.nullByte(), column.nullMask());
+  if (!leadingBoundNull_) {
+    memcpy(
+        leadingBoundValue_.data(),
+        top + column.offset(),
+        leadingBoundValue_.size());
+  }
+  leadingBoundValid_ = true;
 }
 
 void TopN::addInput(RowVectorPtr input) {
   for (const auto col : sortingKeyColumns_) {
     decodedVectors_[col].decode(*input->childAt(col));
+  }
+  // Per-batch flat sweep: a row whose leading key is strictly worse than the
+  // current bound can never enter the top-N, and the bound only tightens, so
+  // the sweep against the batch-start bound is safe for the whole batch. The
+  // main loop then skips marked rows with a single bitmap test instead of a
+  // per-row comparison. Non-flat encodings fall back to the per-row path.
+  const bool leadingKeySweep =
+      !monotonic_ && leadingKeyFast_ && leadingBoundValid_ &&
+      input->childAt(leadingKeyColumn_)->isFlatEncoding();
+  if (leadingKeySweep) {
+    discardBitmap_.resize(bits::nwords(input->size()));
+    VELOX_DYNAMIC_TYPE_DISPATCH(
+        fillLeadingKeyDiscardBitmap,
+        leadingKeyKind_,
+        *this,
+        decodedVectors_[leadingKeyColumn_],
+        input->size());
   }
   if (monotonic_ && !compactRing_) {
     maybeEnableCompactRing();
@@ -473,6 +663,20 @@ void TopN::addInput(RowVectorPtr input) {
     } else {
       char* topRow = topRows_.top();
 
+      // Skip rows that cannot enter the top-N based on the leading sort key
+      // alone. The bound only tightens as better rows arrive, so a row
+      // rejected against the current bound can never become eligible later.
+      if (leadingKeyFast_ && leadingBoundValid_) {
+        if (leadingKeySweep) {
+          if (bits::isBitSet(discardBitmap_.data(), row)) {
+            continue;
+          }
+        } else if (leadingKeyDiscards(
+                       decodedVectors_[leadingKeyColumn_], row)) {
+          continue;
+        }
+      }
+
       if (!comparator_(decodedVectors_, row, topRow)) {
         continue;
       }
@@ -487,6 +691,9 @@ void TopN::addInput(RowVectorPtr input) {
     }
 
     topRows_.push(newRow);
+    if (leadingKeyFast_ && topRows_.size() == count_) {
+      updateLeadingBound();
+    }
     if (hasNonKeyColumn) {
       passedRows[newRow] = row;
     }

@@ -146,6 +146,55 @@ class TopN : public Operator {
   // fast path (used when the stream stops being monotonic).
   void rebuildHeapFromRing();
 
+  // Leading-key fast discard for the incremental heap path: once the heap is
+  // full, a row whose leading sort key is strictly worse than the current
+  // k-th best can never enter the top-N (the leading key dominates the tuple
+  // order), so it is skipped without the per-key RowContainer comparison.
+  // Generic for any fixed-width primitive leading key; only strictly-worse
+  // rows are dropped, so the result is unaffected.
+  bool leadingKeyFast_{false};
+  column_index_t leadingKeyColumn_{0};
+  TypeKind leadingKeyKind_{TypeKind::INVALID};
+  bool leadingAscending_{true};
+  bool leadingNullsFirst_{false};
+  bool leadingBoundValid_{false};
+  bool leadingBoundNull_{false};
+  std::vector<char> leadingBoundValue_;
+
+  // Resolved once per instance so the per-row discard is a direct call
+  // instead of a per-row TypeKind dispatch.
+  using LeadingKeyDiscardFn = bool (*)(
+      const TopN&, const DecodedVector&, vector_size_t);
+  LeadingKeyDiscardFn leadingKeyDiscardFn_{nullptr};
+
+  template <TypeKind Kind>
+  static bool leadingKeyDiscardByKind(
+      const TopN& op,
+      const DecodedVector& decoded,
+      vector_size_t row);
+
+  // Per-batch flat-vector fast discard: fills discardBitmap_ for rows whose
+  // leading key is strictly worse than the cached bound, using raw vector
+  // pointers instead of the per-row DecodedVector indirection. Only called
+  // when the leading-key input vector decodes flat.
+  template <TypeKind Kind>
+  static void fillLeadingKeyDiscardBitmap(
+      TopN& op,
+      DecodedVector& decoded,
+      vector_size_t size);
+
+  // Reusable per-batch discard bitmap for the flat-vector fast path.
+  std::vector<uint64_t> discardBitmap_;
+
+  // Returns true when the input row cannot enter the top-N based on the
+  // leading sort key alone (requires leadingKeyFast_ and a valid bound).
+  bool leadingKeyDiscards(
+      const DecodedVector& decoded,
+      vector_size_t row) const;
+
+  // Caches the current k-th best leading-key value from the heap top.
+  void updateLeadingBound();
+
   // Enables the compact ring if the output columns are all fixed-width and the
   // ring allocation is bounded.
   void maybeEnableCompactRing();
