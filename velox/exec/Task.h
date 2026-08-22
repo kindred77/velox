@@ -39,6 +39,7 @@ class IndexLookupJoinBridge;
 class NestedLoopJoinBridge;
 class SpatialJoinBridge;
 class SplitListener;
+struct MergeSkipState;
 
 class Task : public std::enable_shared_from_this<Task> {
  public:
@@ -513,6 +514,14 @@ class Task : public std::enable_shared_from_this<Task> {
   const std::vector<std::shared_ptr<MergeSource>>& getLocalMergeSources(
       uint32_t splitGroupId,
       const core::PlanNodeId& planNodeId);
+
+  /// Returns the offset-skip coordination state for a range-partitioned
+  /// merge, creating it on first access. Both the LocalMerge drivers and the
+  /// OrderedConcat above them address the state by the LocalMerge's plan node
+  /// id.
+  std::shared_ptr<MergeSkipState> getMergeSkipState(
+      const core::PlanNodeId& localMergeId,
+      int64_t offset);
 
   void createMergeJoinSource(
       uint32_t splitGroupId,
@@ -1470,6 +1479,12 @@ class Task : public std::enable_shared_from_this<Task> {
   // Stores inter-operator state (exchange, bridges) per split group. During
   // ungrouped execution we use the [0] entry in this vector.
   std::unordered_map<uint32_t, SplitGroupState> splitGroupStates_;
+  // Guards mergeSkipStates_. A dedicated mutex because operators are created
+  // while the task mutex_ is held, and getMergeSkipState runs in operator
+  // constructors.
+  std::mutex mergeSkipStateMutex_;
+  std::unordered_map<core::PlanNodeId, std::shared_ptr<MergeSkipState>>
+      mergeSkipStates_;
 
   std::weak_ptr<OutputBufferManager> bufferManager_;
 

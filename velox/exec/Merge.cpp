@@ -37,7 +37,8 @@ Merge::Merge(
     const std::vector<core::SortOrder>& sortingOrders,
     const std::string& planNodeId,
     std::string_view operatorType,
-    const std::optional<common::SpillConfig>& spillConfig)
+    const std::optional<common::SpillConfig>& spillConfig,
+    std::shared_ptr<MergeSkipState> skipState)
     : SourceOperator(
           driverCtx,
           std::move(outputType),
@@ -45,6 +46,7 @@ Merge::Merge(
           planNodeId,
           operatorType,
           spillConfig),
+      skipState_(std::move(skipState)),
       maxOutputBatchRows_{outputBatchRows()},
       maxOutputBatchBytes_{
           driverCtx->queryConfig().preferredOutputBatchBytes()},
@@ -86,10 +88,23 @@ BlockingReason Merge::isBlocked(ContinueFuture* future) {
   // happens, we shall simply mark the merge operator as finished.
   if (sources_.empty()) {
     finished_ = true;
+    publishSkippedRows(0);
     return BlockingReason::kNotBlocked;
   }
 
-  maybeStartNextMergeSourceGroup();
+  // Start the next merge group's sources before waiting for the skip budget:
+  // the range-partitioned sink above waits for every bucket's merge driver to
+  // start consuming, and the budget for later buckets is only granted by the
+  // ordered concat after the earlier buckets drained. Waiting for the budget
+  // first would deadlock: the sink would never enqueue, the first bucket would
+  // never produce, and the concat would never reach the later buckets.
+  startNextMergeSourceGroup();
+
+  if (!waitForSkipBudget(future)) {
+    return BlockingReason::kWaitForProducer;
+  }
+
+  createSourceMerger();
 
   if (sourceMerger_ != nullptr) {
     sourceMerger_->isBlocked(sourceBlockingFutures_);
@@ -111,6 +126,14 @@ BlockingReason Merge::isBlocked(ContinueFuture* future) {
 
 bool Merge::isFinished() {
   return finished_;
+}
+
+void Merge::publishSkippedRows(int64_t rows) {
+  if (skipState_ == nullptr) {
+    return;
+  }
+  std::lock_guard<std::mutex> l(skipState_->mutex);
+  skipState_->skipped[skipPartitionId_] = rows;
 }
 
 void Merge::maybeSetupOutputSpiller() {
@@ -186,11 +209,12 @@ void Merge::setupSpillMerger() {
       operatorCtx_->driverCtx()->queryConfig().localMergeSourceQueueSize(),
       &spillConfig_.value(),
       spillStats_,
-      pool());
+      pool(),
+      mergeSkipRows_);
   spillMerger_->start();
 }
 
-void Merge::maybeStartNextMergeSourceGroup() {
+void Merge::startNextMergeSourceGroup() {
   if (sourceMerger_ != nullptr || numStartedSources_ >= sources_.size()) {
     return;
   }
@@ -203,29 +227,33 @@ void Merge::maybeStartNextMergeSourceGroup() {
     sources.push_back(sources_[i].get());
   }
 
-  // Initializes the source merger.
-  std::vector<std::unique_ptr<SourceStream>> cursors;
-  cursors.reserve(sources.size());
-  for (auto* source : sources) {
-    cursors.push_back(
-        std::make_unique<SourceStream>(
-            source, sortingKeys_, maxOutputBatchRows_));
-  }
-
-  // TODO: consider to provide a config other than the regular operator batch
-  // size to tune the batch size of the streaming source merge output as the
-  // merge operator is single threaded.
-  sourceMerger_ = std::make_unique<SourceMerger>(
-      outputType_,
-      std::move(cursors),
-      maxOutputBatchRows_,
-      maxOutputBatchBytes_,
-      pool());
   // Start sources.
   for (const auto& source : sources) {
     source->start();
   }
   numStartedSources_ += sources.size();
+  pendingGroupSources_ = std::move(sources);
+}
+
+void Merge::createSourceMerger() {
+  if (pendingGroupSources_.empty()) {
+    return;
+  }
+  std::vector<std::unique_ptr<SourceStream>> cursors;
+  cursors.reserve(pendingGroupSources_.size());
+  for (auto* source : pendingGroupSources_) {
+    cursors.push_back(
+        std::make_unique<SourceStream>(
+            source, sortingKeys_, maxOutputBatchRows_));
+  }
+  pendingGroupSources_.clear();
+  sourceMerger_ = std::make_unique<SourceMerger>(
+      outputType_,
+      std::move(cursors),
+      maxOutputBatchRows_,
+      maxOutputBatchBytes_,
+      pool(),
+      mergeSkipRows_);
 }
 
 RowVectorPtr Merge::getOutputFromSpill() {
@@ -257,6 +285,10 @@ RowVectorPtr Merge::getOutputFromSource() {
     return std::move(output_);
   }
 
+  // Capture the skipped count before 'finishMergeSourceGroup' releases the
+  // source merger.
+  const int64_t rowsSkipped =
+      sourceMerger_ != nullptr ? sourceMerger_->rowsSkipped() : 0;
   finishMergeSourceGroup();
   if (numStartedSources_ < sources_.size()) {
     VELOX_CHECK_NULL(output_);
@@ -272,6 +304,7 @@ RowVectorPtr Merge::getOutputFromSource() {
     return nullptr;
   }
 
+  publishSkippedRows(rowsSkipped);
   finished_ = true;
   return std::move(output_);
 }
@@ -333,7 +366,8 @@ SourceMerger::SourceMerger(
     std::vector<std::unique_ptr<SourceStream>> sourceStreams,
     vector_size_t maxOutputBatchRows,
     uint64_t maxOutputBatchBytes,
-    velox::memory::MemoryPool* pool)
+    velox::memory::MemoryPool* pool,
+    int64_t skipRows)
     : type_(type),
       maxOutputBatchRows_(maxOutputBatchRows),
       maxOutputBatchBytes_(maxOutputBatchBytes),
@@ -347,7 +381,8 @@ SourceMerger::SourceMerger(
       merger_(
           std::make_unique<TreeOfLosers<SourceStream>>(
               std::move(sourceStreams))),
-      pool_(pool) {}
+      pool_(pool),
+      skipRows_(skipRows) {}
 
 void SourceMerger::isBlocked(
     std::vector<ContinueFuture>& sourceBlockingFutures) const {
@@ -408,6 +443,20 @@ RowVectorPtr SourceMerger::getOutput(
       }
       output_->resize(outputRows_);
       return std::move(output_);
+    }
+
+    // Discard leading rows without materializing output while this bucket's
+    // skip budget lasts. Rows are still compared and popped in sorted order,
+    // so the skip is exact; the budget is assigned per bucket by the ordered
+    // concat, which drains buckets in partition order.
+    if (skipRows_ > 0) {
+      --skipRows_;
+      ++rowsSkipped_;
+      stream->skipCurrentRow(sourceBlockingFutures);
+      if (!sourceBlockingFutures.empty()) {
+        return nullptr;
+      }
+      continue;
     }
 
     if (stream->setOutputRow(outputRows_)) {
@@ -547,10 +596,12 @@ SpillMerger::SpillMerger(
     int mergeSourceQueueSize,
     const common::SpillConfig* spillConfig,
     const std::shared_ptr<exec::SpillStats>& spillStats,
-    velox::memory::MemoryPool* pool)
+    velox::memory::MemoryPool* pool,
+    int64_t skipRows)
     : executor_(spillConfig->executor),
       spillStats_(spillStats),
       pool_(pool->shared_from_this()),
+      skipRows_(skipRows),
       sources_(
           createMergeSources(spillReadFilesGroup.size(), mergeSourceQueueSize)),
       batchStreams_(createBatchStreams(std::move(spillReadFilesGroup))),
@@ -563,7 +614,8 @@ SpillMerger::SpillMerger(
           sources_,
           maxOutputBatchRows,
           maxOutputBatchBytes,
-          pool)) {}
+          pool,
+          skipRows_)) {}
 
 SpillMerger::~SpillMerger() {
   sourceMerger_.reset();
@@ -630,7 +682,8 @@ std::unique_ptr<SourceMerger> SpillMerger::createSourceMerger(
     const std::vector<std::shared_ptr<MergeSource>>& sources,
     vector_size_t maxOutputBatchRows,
     uint64_t maxOutputBatchBytes,
-    velox::memory::MemoryPool* pool) {
+    velox::memory::MemoryPool* pool,
+    int64_t skipRows) {
   std::vector<std::unique_ptr<SourceStream>> streams;
   streams.reserve(sources.size());
   for (const auto& source : sources) {
@@ -639,7 +692,12 @@ std::unique_ptr<SourceMerger> SpillMerger::createSourceMerger(
             source.get(), sortingKeys, maxOutputBatchRows));
   }
   return std::make_unique<SourceMerger>(
-      type, std::move(streams), maxOutputBatchRows, maxOutputBatchBytes, pool);
+      type,
+      std::move(streams),
+      maxOutputBatchRows,
+      maxOutputBatchBytes,
+      pool,
+      skipRows);
 }
 
 void SpillMerger::finishSource(size_t streamIdx) const {
@@ -748,13 +806,22 @@ LocalMerge::LocalMerge(
           localMergeNode->sortingOrders(),
           localMergeNode->id(),
           OperatorType::kLocalMerge,
-          localMergeNode->canSpill(driverCtx->queryConfig())
+          localMergeNode->canSpill(driverCtx->queryConfig()) &&
+                  localMergeNode->skipRows() == 0
               ? driverCtx->makeSpillConfig(
                     operatorId,
                     OperatorType::kLocalMerge)
-              : std::nullopt),
+              : std::nullopt,
+          localMergeNode->skipRows() > 0
+              ? driverCtx->task->getMergeSkipState(
+                    localMergeNode->id(), localMergeNode->skipRows())
+              : nullptr),
       partitionId_(driverCtx->partitionId),
       rangePartitioned_(localMergeNode->rangePartitionSpec().has_value()) {
+  // MSVC rejects initializing the base class's protected member in the
+  // initializer list (C2614); the value is only read after this constructor
+  // completes, so assigning it here is equivalent.
+  skipPartitionId_ = driverCtx->partitionId;
   if (!rangePartitioned_) {
     VELOX_CHECK_EQ(
         operatorCtx_->driverCtx()->driverId,
@@ -762,13 +829,42 @@ LocalMerge::LocalMerge(
         "LocalMerge needs to run single-threaded");
   }
   // Enable local merge spill iff spill is enabled and the spill executor is
-  // provided.
-  if (spillConfig_.has_value() && spillConfig_->executor != nullptr) {
+  // provided. Offset skip requires a single merge group per bucket: the skip
+  // budget is per bucket, so partial merge groups would need shared state.
+  // Merge spill is disabled entirely for the skip path: the spill merger
+  // would re-apply the skip budget and break the row accounting.
+  if (skipState_ == nullptr && spillConfig_.has_value() &&
+      spillConfig_->executor != nullptr) {
     maxNumMergeSources_ = operatorCtx_->task()
                               ->queryCtx()
                               ->queryConfig()
                               .localMergeMaxNumMergeSources();
   }
+}
+
+bool LocalMerge::waitForSkipBudget(ContinueFuture* future) {
+  if (skipState_ == nullptr) {
+    return true;
+  }
+  std::lock_guard<std::mutex> l(skipState_->mutex);
+  if (skipState_->closed) {
+    return true;
+  }
+  auto it = skipState_->skip.find(partitionId_);
+  if (it != skipState_->skip.end()) {
+    mergeSkipRows_ = it->second;
+    return true;
+  }
+  auto promiseIt = skipState_->promises.find(partitionId_);
+  if (promiseIt == skipState_->promises.end()) {
+    promiseIt = skipState_->promises
+                    .emplace(
+                        partitionId_,
+                        folly::SharedPromise<folly::Unit>())
+                    .first;
+  }
+  *future = promiseIt->second.getSemiFuture();
+  return false;
 }
 
 BlockingReason LocalMerge::addMergeSources(ContinueFuture* /* future */) {
@@ -1090,7 +1186,18 @@ OrderedConcat::OrderedConcat(
           concatNode->outputType(),
           operatorId,
           concatNode->id(),
-          OperatorType::kOrderedConcat) {}
+          OperatorType::kOrderedConcat) {
+  // GPORCA-authorized offset skip: coordinate the range-partitioned merge
+  // below by assigning each bucket's skip budget in drain order.
+  if (concatNode->sources().size() == 1) {
+    if (auto mergeNode = std::dynamic_pointer_cast<const core::LocalMergeNode>(
+            concatNode->sources()[0]);
+        mergeNode != nullptr && mergeNode->skipRows() > 0) {
+      skipState_ = operatorCtx_->task()->getMergeSkipState(
+          mergeNode->id(), mergeNode->skipRows());
+    }
+  }
+}
 
 bool OrderedConcat::addMergeSources(ContinueFuture* future) {
   if (allSourcesAdded_) {
@@ -1137,6 +1244,30 @@ BlockingReason OrderedConcat::isBlocked(ContinueFuture* future) {
 RowVectorPtr OrderedConcat::getOutput() {
   addMergeSources(nullptr);
   while (currentSource_ < sources_.size()) {
+    // Assign this bucket's skip budget before pulling it: the bucket's merge
+    // driver waits for the budget, and buckets drain in partition order, so
+    // the budget is exact (offset minus the rows of already-drained buckets).
+    int64_t assignedSkip = 0;
+    const auto partitionId = sources_[currentSource_]->partitionId();
+    if (skipState_ != nullptr) {
+      std::lock_guard<std::mutex> l(skipState_->mutex);
+      auto it = skipState_->skip.find(partitionId);
+      if (it == skipState_->skip.end()) {
+        assignedSkip = std::max<int64_t>(
+            0, skipState_->offset - skipState_->drained);
+        skipState_->skip[partitionId] = assignedSkip;
+        auto promiseIt = skipState_->promises.find(partitionId);
+        if (promiseIt != skipState_->promises.end()) {
+          promiseIt->second.setValue();
+          // The budget is granted; erase the promise so a later close() does
+          // not set the same SharedPromise twice, and a re-wait after this
+          // point finds the granted budget instead.
+          skipState_->promises.erase(promiseIt);
+        }
+      } else {
+        assignedSkip = it->second;
+      }
+    }
     auto& source = sources_[currentSource_];
     ContinueFuture future;
     RowVectorPtr output;
@@ -1147,7 +1278,25 @@ RowVectorPtr OrderedConcat::getOutput() {
       return nullptr;
     }
     if (output != nullptr) {
+      if (skipState_ != nullptr) {
+        std::lock_guard<std::mutex> l(skipState_->mutex);
+        skipState_->drained += output->size();
+      }
       return output;
+    }
+    if (skipState_ != nullptr) {
+      // Account for the rows this bucket actually skipped once it is fully
+      // drained. The bucket's merge driver published the count before
+      // signaling the end of the bucket; the assigned budget alone may
+      // over-count because a bucket can hold fewer rows than its budget.
+      std::lock_guard<std::mutex> l(skipState_->mutex);
+      const auto skippedIt = skipState_->skipped.find(partitionId);
+      VELOX_CHECK(
+          skippedIt != skipState_->skipped.end(),
+          "OrderedConcat: bucket {} ended without publishing its skipped row "
+          "count",
+          partitionId);
+      skipState_->drained += skippedIt->second;
     }
     // The source is exhausted (or drained under a barrier); move on to the
     // next bucket.
@@ -1162,6 +1311,16 @@ bool OrderedConcat::isFinished() {
 }
 
 void OrderedConcat::close() {
+  // The concat is the only grantor of skip budgets; resolve any outstanding
+  // budget waits so blocked bucket drivers do not hang task termination.
+  if (skipState_ != nullptr) {
+    std::lock_guard<std::mutex> l(skipState_->mutex);
+    skipState_->closed = true;
+    for (auto& [partitionId, promise] : skipState_->promises) {
+      promise.setValue();
+    }
+    skipState_->promises.clear();
+  }
   for (auto& source : sources_) {
     source->close();
   }

@@ -2389,12 +2389,14 @@ class LocalMergeNode : public PlanNode {
       std::vector<FieldAccessTypedExprPtr> sortingKeys,
       std::vector<SortOrder> sortingOrders,
       std::vector<PlanNodePtr> sources,
-      std::optional<RangePartitionSpec> rangePartitionSpec = std::nullopt)
+      std::optional<RangePartitionSpec> rangePartitionSpec = std::nullopt,
+      int64_t skipRows = 0)
       : PlanNode(id),
         sources_{std::move(sources)},
         sortingKeys_{std::move(sortingKeys)},
         sortingOrders_{std::move(sortingOrders)},
-        rangePartitionSpec_{std::move(rangePartitionSpec)} {}
+        rangePartitionSpec_{std::move(rangePartitionSpec)},
+        skipRows_(skipRows) {}
 
   class Builder {
    public:
@@ -2406,6 +2408,7 @@ class LocalMergeNode : public PlanNode {
       sortingOrders_ = other.sortingOrders();
       sources_ = other.sources();
       rangePartitionSpec_ = other.rangePartitionSpec();
+      skipRows_ = other.skipRows();
     }
 
     Builder& id(PlanNodeId id) {
@@ -2434,6 +2437,11 @@ class LocalMergeNode : public PlanNode {
       return *this;
     }
 
+    Builder& skipRows(int64_t skipRows) {
+      skipRows_ = skipRows;
+      return *this;
+    }
+
     std::shared_ptr<LocalMergeNode> build() const {
       VELOX_USER_CHECK(id_.has_value(), "LocalMergeNode id is not set");
       VELOX_USER_CHECK(
@@ -2449,7 +2457,8 @@ class LocalMergeNode : public PlanNode {
           sortingKeys_.value(),
           sortingOrders_.value(),
           sources_.value(),
-          rangePartitionSpec_);
+          rangePartitionSpec_,
+          skipRows_.value_or(0));
     }
 
    private:
@@ -2458,6 +2467,7 @@ class LocalMergeNode : public PlanNode {
     std::optional<std::vector<SortOrder>> sortingOrders_;
     std::optional<std::vector<PlanNodePtr>> sources_;
     std::optional<RangePartitionSpec> rangePartitionSpec_;
+    std::optional<int64_t> skipRows_;
   };
 
   const RowTypePtr& outputType() const override {
@@ -2492,6 +2502,12 @@ class LocalMergeNode : public PlanNode {
     return rangePartitionSpec_;
   }
 
+  /// Number of leading rows the merge chain must discard before materializing
+  /// output. Zero when no skip is requested.
+  int64_t skipRows() const {
+    return skipRows_;
+  }
+
   std::string_view name() const override {
     return "LocalMerge";
   }
@@ -2507,6 +2523,7 @@ class LocalMergeNode : public PlanNode {
   const std::vector<FieldAccessTypedExprPtr> sortingKeys_;
   const std::vector<SortOrder> sortingOrders_;
   const std::optional<RangePartitionSpec> rangePartitionSpec_;
+  const int64_t skipRows_;
 };
 
 /// Concatenates its sources in a fixed order. Used to reassemble the ordered

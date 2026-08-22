@@ -31,6 +31,7 @@
 #include "velox/exec/HashJoinBridge.h"
 #include "velox/exec/IndexLookupJoinBridge.h"
 #include "velox/exec/LocalPlanner.h"
+#include "velox/exec/Merge.h"
 #include "velox/exec/MemoryReclaimer.h"
 #include "velox/exec/NestedLoopJoinBuild.h"
 #include "velox/exec/OperatorTraceCtx.h"
@@ -3294,6 +3295,19 @@ const std::vector<std::shared_ptr<MergeSource>>& Task::getLocalMergeSources(
     uint32_t splitGroupId,
     const core::PlanNodeId& planNodeId) {
   return splitGroupStates_[splitGroupId].localMergeSources[planNodeId];
+}
+
+std::shared_ptr<MergeSkipState> Task::getMergeSkipState(
+    const core::PlanNodeId& localMergeId,
+    int64_t offset) {
+  std::lock_guard<std::mutex> l(mergeSkipStateMutex_);
+  auto it = mergeSkipStates_.find(localMergeId);
+  if (it != mergeSkipStates_.end()) {
+    return it->second;
+  }
+  auto state = std::make_shared<MergeSkipState>(offset);
+  mergeSkipStates_[localMergeId] = state;
+  return state;
 }
 
 void Task::createMergeJoinSource(

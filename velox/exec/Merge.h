@@ -16,6 +16,7 @@
 #pragma once
 
 #include "velox/common/base/TreeOfLosers.h"
+#include "velox/common/future/VeloxPromise.h"
 #include "velox/exec/Exchange.h"
 #include "velox/exec/MergeSource.h"
 #include "velox/exec/Spill.h"
@@ -26,6 +27,35 @@ namespace facebook::velox::exec {
 class SourceStream;
 class SourceMerger;
 class SpillMerger;
+
+/// Coordination state for a range-partitioned merge with offset skip: the
+/// ordered concat drains the buckets in partition order and assigns each
+/// bucket's skip budget just before draining it; the bucket merge drivers
+/// wait for their budget before producing. Budgets are exact because a sorted
+/// run's rows reach the buckets in ascending range order, so every bucket's
+/// data is routed before any later bucket can fill and block its producer.
+struct MergeSkipState {
+  explicit MergeSkipState(int64_t offset) : offset(offset) {}
+
+  std::mutex mutex;
+  // Offset rows still to be discarded before the first materialized row.
+  const int64_t offset;
+  // Rows of already-drained buckets (skipped prefixes plus materialized rows).
+  int64_t drained = 0;
+  // Per-bucket skip budget; -1 until assigned by the ordered concat.
+  std::unordered_map<int32_t, int64_t> skip;
+  // Actual rows skipped per bucket, published by the bucket's merge driver
+  // before it signals the end of the bucket. The ordered concat uses these
+  // values for 'drained' accounting: a bucket may hold fewer rows than its
+  // assigned budget, so the budget alone would over-count.
+  std::unordered_map<int32_t, int64_t> skipped;
+  // Bucket drivers wait on these; SharedPromise allows repeated waits before
+  // the budget is assigned.
+  std::unordered_map<int32_t, folly::SharedPromise<folly::Unit>> promises;
+  // Set by the ordered concat on close: no more budgets will be granted, so
+  // waiting drivers must not re-block.
+  bool closed = false;
+};
 
 // Merge operator Implementation: This implementation uses priority queue
 // to perform a k-way merge of its inputs. It stops merging if any one of
@@ -41,9 +71,17 @@ class Merge : public SourceOperator {
       const std::vector<core::SortOrder>& sortingOrders,
       const std::string& planNodeId,
       std::string_view operatorType,
-      const std::optional<common::SpillConfig>& spillConfig = std::nullopt);
+      const std::optional<common::SpillConfig>& spillConfig = std::nullopt,
+      std::shared_ptr<MergeSkipState> skipState = nullptr);
 
   void initialize() override;
+
+  /// Returns true when the merge may start producing. For a range-partitioned
+  /// merge with offset skip this waits until the ordered concat assigned this
+  /// bucket's skip budget; otherwise it is a no-op.
+  virtual bool waitForSkipBudget(ContinueFuture* future) {
+    return true;
+  }
 
   BlockingReason isBlocked(ContinueFuture* future) override;
 
@@ -77,6 +115,20 @@ class Merge : public SourceOperator {
   /// Maximum number of merge sources per run.
   uint32_t maxNumMergeSources_{std::numeric_limits<uint32_t>::max()};
 
+  /// Merge offset-skip coordination (null when disabled).
+  std::shared_ptr<MergeSkipState> skipState_;
+  /// This bucket's assigned skip budget, applied to every row this merge
+  /// emits (valid only after waitForSkipBudget returned true).
+  int64_t mergeSkipRows_{0};
+  /// Partition id this merge belongs to; used to publish the actual skipped
+  /// row count to the shared skip state.
+  int32_t skipPartitionId_{0};
+
+  /// Publishes the number of rows this merge actually discarded to the shared
+  /// skip state. No-op when offset skip is disabled. Must be called before the
+  /// bucket end becomes visible to the ordered concat.
+  void publishSkippedRows(int64_t rows);
+
  private:
   // Tracks the internal execution stats for a merge operator.
   struct Stats {
@@ -93,9 +145,17 @@ class Merge : public SourceOperator {
   };
   void recordMergeStats();
 
-  // Start sources for this merge run, it may start either all the sources at
-  // once or a portion of the sources at a time to cap the memory usage.
-  void maybeStartNextMergeSourceGroup();
+  // Starts the sources of the next partial merge run so upstream sinks can
+  // make progress, without creating the source merger. The merger creation is
+  // deferred to 'createSourceMerger' because the offset-skip budget must be
+  // known first; the budget is assigned by the ordered concat only after the
+  // preceding buckets drained, and waiting for the budget before starting the
+  // sources would deadlock the upstream range-partitioned sink.
+  void startNextMergeSourceGroup();
+
+  // Creates the source merger for the group started by
+  // 'startNextMergeSourceGroup', using the now-known skip budget.
+  void createSourceMerger();
 
   // Returns true if needs to spill the merged source output if all sources can
   // not be merged at once.
@@ -137,6 +197,9 @@ class Merge : public SourceOperator {
   std::vector<ContinueFuture> sourceBlockingFutures_;
 
   std::unique_ptr<SourceMerger> sourceMerger_;
+  // Sources of the next merge group started by 'startNextMergeSourceGroup',
+  // awaiting 'createSourceMerger'.
+  std::vector<MergeSource*> pendingGroupSources_;
   std::shared_ptr<SpillMerger> spillMerger_;
   std::unique_ptr<MergeSpiller> mergeOutputSpiller_;
   // Number of total spilled rows, it must be equal to the input rows.
@@ -156,13 +219,21 @@ class SourceMerger {
       std::vector<std::unique_ptr<SourceStream>> sourceStreams,
       vector_size_t maxOutputBatchRows,
       uint64_t maxOutputBatchBytes,
-      velox::memory::MemoryPool* pool);
+      velox::memory::MemoryPool* pool,
+      int64_t skipRows = 0);
 
   void isBlocked(std::vector<ContinueFuture>& sourceBlockingFutures) const;
 
   RowVectorPtr getOutput(
       std::vector<ContinueFuture>& sourceBlockingFutures,
       bool& atEnd);
+
+  /// Number of leading rows this merger actually discarded. Valid while the
+  /// merger is live; used by the owning merge operator to report the exact
+  /// skipped count to the offset-skip coordination state.
+  int64_t rowsSkipped() const {
+    return rowsSkipped_;
+  }
 
  private:
   void setOutputBatchSize();
@@ -177,6 +248,10 @@ class SourceMerger {
   const std::vector<SourceStream*> streams_;
   const std::unique_ptr<TreeOfLosers<SourceStream>> merger_;
   velox::memory::MemoryPool* const pool_;
+  // Leading rows to discard without materializing output.
+  int64_t skipRows_;
+  // Rows actually discarded by this merger.
+  int64_t rowsSkipped_{0};
 
   // The max number of rows in an output vector which is determined by
   // 'setOutputBatchSize'. The calculation is based on the actual estimated row
@@ -250,6 +325,23 @@ class SourceStream final : public MergeStream {
     return currentSourceRow_ == data_->size() - 1;
   }
 
+  /// Discards the current row without copying it out. Advances the copy
+  /// position so a later 'copyToOutput' does not re-copy the discarded rows.
+  /// Returns true and appends a future to 'futures' if runs out of rows in
+  /// the current batch and needs to wait for the source to produce the next
+  /// batch, mirroring 'pop'.
+  bool skipCurrentRow(std::vector<ContinueFuture>& futures) {
+    ++currentSourceRow_;
+    ++firstSourceRow_;
+    if (currentSourceRow_ == data_->size()) {
+      VELOX_CHECK(!outputRows_.hasSelections());
+      // The whole batch was discarded; the next batch starts from row zero.
+      firstSourceRow_ = 0;
+      return fetchMoreData(futures);
+    }
+    return false;
+  }
+
   /// Called if either current row is the last row in the current batch or the
   /// caller accumulated enough output rows across all sources to produce an
   /// output batch.
@@ -303,7 +395,8 @@ class SpillMerger : public std::enable_shared_from_this<SpillMerger> {
       int mergeSourceQueueSize,
       const common::SpillConfig* spillConfig,
       const std::shared_ptr<exec::SpillStats>& spillStats,
-      velox::memory::MemoryPool* pool);
+      velox::memory::MemoryPool* pool,
+      int64_t skipRows = 0);
 
   ~SpillMerger();
 
@@ -328,7 +421,8 @@ class SpillMerger : public std::enable_shared_from_this<SpillMerger> {
       const std::vector<std::shared_ptr<MergeSource>>& sources,
       vector_size_t maxOutputBatchRows,
       uint64_t maxOutputBatchBytes,
-      velox::memory::MemoryPool* pool);
+      velox::memory::MemoryPool* pool,
+      int64_t skipRows);
 
   void finishSource(size_t streamIdx) const;
 
@@ -350,6 +444,7 @@ class SpillMerger : public std::enable_shared_from_this<SpillMerger> {
   folly::Executor* const executor_;
   const std::shared_ptr<exec::SpillStats> spillStats_;
   const std::shared_ptr<memory::MemoryPool> pool_;
+  const int64_t skipRows_;
 
   std::vector<std::shared_ptr<MergeSource>> sources_;
   std::vector<std::unique_ptr<BatchStream>> batchStreams_;
@@ -370,6 +465,8 @@ class LocalMerge : public Merge {
 
  protected:
   BlockingReason addMergeSources(ContinueFuture* future) override;
+
+  bool waitForSkipBudget(ContinueFuture* future) override;
 
  private:
   // For a range-partitioned merge, this driver merges only the sources of its
@@ -463,6 +560,9 @@ class OrderedConcat : public SourceOperator {
   bool allSourcesAdded_{false};
   std::optional<ContinueFuture> blockedFuture_;
   bool finished_{false};
+  // Offset-skip coordination for the range-partitioned merge below (null
+  // when disabled).
+  std::shared_ptr<MergeSkipState> skipState_;
 };
 
 // MergeExchange merges its sources' outputs into a single stream of
