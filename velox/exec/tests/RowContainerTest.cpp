@@ -1028,6 +1028,14 @@ TEST_P(RowContainerTest, extractWithNullsAndTargetOffset) {
       ASSERT_EQ(
           resultColVector->isNullAt(row + kNumRows),
           batch2ColVector->isNullAt(row));
+      if (!resultColVector->isNullAt(row)) {
+        ASSERT_TRUE(resultColVector->equalValueAt(
+            batch1ColVector.get(), row, row));
+      }
+      if (!resultColVector->isNullAt(row + kNumRows)) {
+        ASSERT_TRUE(resultColVector->equalValueAt(
+            batch2ColVector.get(), row + kNumRows, row));
+      }
     }
   }
 }
