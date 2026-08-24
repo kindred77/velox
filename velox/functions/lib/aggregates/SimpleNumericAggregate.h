@@ -21,6 +21,8 @@
 #include "velox/vector/FlatVector.h"
 #include "velox/vector/LazyVector.h"
 
+#include <vector>
+
 namespace facebook::velox::functions::aggregate {
 
 template <typename TInput, typename TAccumulator, typename TResult>
@@ -165,9 +167,35 @@ class SimpleNumericAggregate : public exec::Aggregate {
       const VectorPtr& arg,
       UpdateSingle updateSingleValue,
       UpdateDuplicate updateDuplicateValues,
-      bool /*mayPushdown*/,
+      bool mayPushdown,
       TData initialValue) {
-    DecodedVector decoded(*arg, rows);
+    DecodedVector decoded(*arg, rows, !mayPushdown);
+    if constexpr (kMayPushdown<TData>) {
+      if (mayPushdown &&
+          decoded.base()->encoding() == VectorEncoding::Simple::LAZY &&
+          !arg->type()->isDecimal()) {
+        auto* lazy = decoded.base()->asChecked<const LazyVector>();
+        if (lazy->supportsHook()) {
+          // Single-group (scalar) aggregation: every row maps to the one
+          // group.  Mirroring updateGroups, let the LazyVector accumulate
+          // directly during decode instead of materializing the column; a
+          // per-row group array pointing at the single group is safe for any
+          // row numbering (my_gporca scalar-aggregate pushdown, 2026-08-24).
+          std::vector<char*> groups(arg->size(), group);
+          velox::aggregate::SimpleCallableHook<TData, UpdateSingle> hook(
+              exec::Aggregate::offset_,
+              exec::Aggregate::nullByte_,
+              exec::Aggregate::nullMask_,
+              groups.data(),
+              &this->exec::Aggregate::numNulls_,
+              updateSingleValue);
+          auto indices = decoded.indices();
+          lazy->load(RowSet(indices, arg->size()), &hook);
+          return;
+        }
+        decoded.decode(*arg, rows);
+      }
+    }
 
     // Do row by row if not all rows are selected.
     if (decoded.isConstantMapping()) {
