@@ -1057,7 +1057,11 @@ std::optional<int64_t> RowContainer::estimateRowSize() const {
   int64_t usedSize = rows_.allocatedBytes() - freeBytes +
       stringAllocator_->retainedSize() - stringAllocator_->freeSpace() -
       rowPointers_.capacity() * sizeof(char*);
-  int64_t rowSize = usedSize / numRows_;
+  // 'numRows_' is unsigned; a negative 'usedSize' (Windows allocation
+  // accounting, see below) must not wrap into a huge positive quotient via
+  // unsigned division, or the <=0 fallback below never fires and callers
+  // collapse their output batch size to 1 row.
+  int64_t rowSize = usedSize / static_cast<int64_t>(numRows_);
   // On Windows, allocation overhead accounting may differ from Linux causing
   // usedSize to be zero or negative for small row counts. Fall back to the
   // fixed row size which is always a valid lower bound.
