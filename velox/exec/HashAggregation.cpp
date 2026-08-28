@@ -52,6 +52,9 @@ HashAggregation::HashAggregation(
       isDistinct_(!isGlobal_ && aggregationNode->aggregates().empty()),
       isRawInput_(isRawInput(aggregationNode->step())),
       hasGlobalGroupingSets_(!aggregationNode->globalGroupingSets().empty()),
+      bufferPartialDistinctOutput_(
+          isDistinct_ && isPartialOutput_ &&
+          aggregationNode->preGroupedKeys().empty() && !hasGlobalGroupingSets_),
       memoryCompactionEnabled_(
           driverCtx->queryConfig().aggregationMemoryCompactionReclaimEnabled()),
       maxExtendedPartialAggregationMemoryUsage_(
@@ -214,7 +217,11 @@ void HashAggregation::addInput(RowVectorPtr input) {
     partialFull_ = true;
   }
 
-  if (isDistinct_) {
+  // A partial distinct aggregation already retains all group keys in its hash
+  // table. Let the regular partial-output path drain these keys in full-sized
+  // batches instead of emitting one dictionary vector per input vector. Other
+  // distinct paths keep streaming to preserve their state machines and latency.
+  if (isDistinct_ && !bufferPartialDistinctOutput_) {
     newDistincts_ = !groupingSet_->hasSpilled() &&
         !groupingSet_->hashLookup().newGroups.empty();
 
@@ -383,7 +390,7 @@ RowVectorPtr HashAggregation::getOutput() {
     return nullptr;
   }
 
-  if (isDistinct_) {
+  if (isDistinct_ && !bufferPartialDistinctOutput_) {
     auto distinctOutput = getDistinctOutput();
     if (distinctOutput == nullptr) {
       finishDrain();
@@ -397,11 +404,17 @@ RowVectorPtr HashAggregation::getOutput() {
   // Reuse output vectors if possible.
   prepareOutput(maxOutputRows);
 
-  const bool hasData = groupingSet_->getOutput(
-      maxOutputRows,
-      queryConfig.preferredOutputBatchBytes(),
-      resultIterator_,
-      output_);
+  const bool hasData = bufferPartialDistinctOutput_
+      ? groupingSet_->getDistinctOutput(
+            maxOutputRows,
+            queryConfig.preferredOutputBatchBytes(),
+            resultIterator_,
+            output_)
+      : groupingSet_->getOutput(
+            maxOutputRows,
+            queryConfig.preferredOutputBatchBytes(),
+            resultIterator_,
+            output_);
   if (!hasData) {
     resultIterator_.reset();
     resetPartialOutputIfNeed();
@@ -470,7 +483,7 @@ RowVectorPtr HashAggregation::getDistinctOutput() {
   const auto& queryConfig = operatorCtx_->driverCtx()->queryConfig();
   const auto maxOutputRows = outputBatchRows(estimatedOutputRowSize_);
   prepareOutput(maxOutputRows);
-  if (!groupingSet_->getOutput(
+  if (!groupingSet_->getDistinctOutput(
           maxOutputRows,
           queryConfig.preferredOutputBatchBytes(),
           resultIterator_,

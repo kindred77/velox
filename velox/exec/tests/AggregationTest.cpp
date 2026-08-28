@@ -958,6 +958,32 @@ TEST_F(AggregationTest, partialAggregationMemoryLimit) {
           .customStats.count("flushRowCount"));
 }
 
+TEST_F(AggregationTest, partialDistinctBatchesOutput) {
+  std::vector<RowVectorPtr> vectors;
+  vectors.reserve(100);
+  for (auto batch = 0; batch < 100; ++batch) {
+    vectors.push_back(makeRowVector({makeFlatVector<int32_t>(
+        1'000, [batch](auto row) { return batch * 1'000 + row; })}));
+  }
+
+  createDuckDbTable(vectors);
+
+  core::PlanNodeId partialNodeId;
+  auto task = AssertQueryBuilder(duckDbQueryRunner_)
+                  .plan(
+                      PlanBuilder()
+                          .values(vectors)
+                          .partialAggregation({"c0"}, {})
+                          .capturePlanNodeId(partialNodeId)
+                          .finalAggregation()
+                          .planNode())
+                  .assertResults("SELECT distinct c0 FROM tmp");
+
+  const auto& partialStats = toPlanStats(task->taskStats()).at(partialNodeId);
+  EXPECT_EQ(partialStats.outputRows, 100'000);
+  EXPECT_LT(partialStats.outputVectors * 4, partialStats.inputVectors);
+}
+
 TEST_F(AggregationTest, partialDistinctWithAbandon) {
   auto vectors = {
       // 1st batch will produce 100 distinct groups from 10 rows.

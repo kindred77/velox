@@ -89,6 +89,15 @@ class GroupingSet {
       RowContainerIterator& iterator,
       RowVectorPtr& result);
 
+  /// Produces buffered output for a pure distinct aggregation. Unlike the
+  /// streaming new-groups path, this walks the retained hash table and is used
+  /// when a partial distinct aggregation drains a full table.
+  bool getDistinctOutput(
+      int32_t maxOutputRows,
+      int32_t maxOutputBytes,
+      RowContainerIterator& iterator,
+      RowVectorPtr& result);
+
   uint64_t allocatedBytes() const;
 
   /// Resets the hash table inside the grouping set when partial aggregation
@@ -202,6 +211,11 @@ class GroupingSet {
   std::optional<int64_t> estimateOutputRowSize() const;
 
  private:
+  bool getOutputInternal(
+      int32_t maxOutputRows,
+      int32_t maxOutputBytes,
+      RowContainerIterator& iterator,
+      RowVectorPtr& result);
   bool isDistinct() const {
     return aggregates_.empty();
   }

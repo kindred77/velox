@@ -812,6 +812,24 @@ bool GroupingSet::getOutput(
     int32_t maxOutputBytes,
     RowContainerIterator& iterator,
     RowVectorPtr& result) {
+  VELOX_CHECK(!isDistinct());
+  return getOutputInternal(maxOutputRows, maxOutputBytes, iterator, result);
+}
+
+bool GroupingSet::getDistinctOutput(
+    int32_t maxOutputRows,
+    int32_t maxOutputBytes,
+    RowContainerIterator& iterator,
+    RowVectorPtr& result) {
+  VELOX_CHECK(isDistinct());
+  return getOutputInternal(maxOutputRows, maxOutputBytes, iterator, result);
+}
+
+bool GroupingSet::getOutputInternal(
+    int32_t maxOutputRows,
+    int32_t maxOutputBytes,
+    RowContainerIterator& iterator,
+    RowVectorPtr& result) {
   TestValue::adjust("facebook::velox::exec::GroupingSet::getOutput", this);
 
   if (isGlobal_) {
@@ -821,8 +839,6 @@ bool GroupingSet::getOutput(
   if (hasSpilled()) {
     return getOutputWithSpill(maxOutputRows, maxOutputBytes, result);
   }
-  VELOX_CHECK(!isDistinct());
-
   // @lint-ignore CLANGTIDY
   std::vector<char*> groups(maxOutputRows);
   const int32_t numGroups = table_

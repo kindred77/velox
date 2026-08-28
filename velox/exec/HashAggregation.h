@@ -128,6 +128,9 @@ class HashAggregation : public Operator {
   // True when the aggregation has a global grouping set: the empty () set that
   // yields one grand-total row over all input.
   const bool hasGlobalGroupingSets_;
+  // True when partial distinct output can drain the whole hash table without
+  // interacting with pre-grouped auto-drain or global grouping-set state.
+  const bool bufferPartialDistinctOutput_;
   const bool memoryCompactionEnabled_;
   const int64_t maxExtendedPartialAggregationMemoryUsage_;
   // Minimum number of rows to see before deciding to give up on partial
