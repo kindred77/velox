@@ -224,6 +224,11 @@ class ParquetData : public dwio::common::FormatData {
   // ahead of first use, not at construction.
   std::vector<std::unique_ptr<dwio::common::SeekableInputStream>> streams_;
 
+  // Reuses the large transient page buffers across row groups of this column
+  // split (see PageReader::BufferCache): one allocation per split instead of
+  // one per page avoids page-fault storms and VA-teardown lock contention.
+  PageReader::BufferCache bufferCache_;
+
   const uint32_t maxDefine_;
   const uint32_t maxRepeat_;
   int64_t rowsInRowGroup_;

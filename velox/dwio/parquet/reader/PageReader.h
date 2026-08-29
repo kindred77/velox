@@ -36,6 +36,17 @@ namespace facebook::velox::parquet {
 /// continuous stream accessible via readWithVisitor().
 class PageReader {
  public:
+  // Transient page buffers reused across row groups of one column split.
+  // Allocating and freeing these per page causes page-fault storms and
+  // kernel VA-teardown spinlock contention (see dev_tasks performance doc,
+  // 2026-08-29); ParquetData owns one cache and hands it to every PageReader
+  // it creates so buffers are allocated once per split instead of per page.
+  struct BufferCache {
+    BufferPtr pageBuffer;
+    BufferPtr decompressedData;
+    std::unique_ptr<folly::IOBuf> thriftBuffer;
+  };
+
   /// Trailing readable bytes past readBytes()'s returned size. Sized
   /// for bits::detail::loadBits<uint64_t>, which touches bytes
   /// [offset, offset + 9) when the bit field straddles the 8-byte word
@@ -50,7 +61,8 @@ class PageReader {
       common::CompressionKind codec,
       int64_t chunkSize,
       dwio::common::ColumnReaderStatistics& stats,
-      const tz::TimeZone* sessionTimezone)
+      const tz::TimeZone* sessionTimezone,
+      BufferCache* bufferCache = nullptr)
       : pool_(pool),
         inputStream_(std::move(stream)),
         type_(std::move(fileType)),
@@ -61,8 +73,10 @@ class PageReader {
         chunkSize_(chunkSize),
         nullConcatenation_(pool_),
         stats_(stats),
-        sessionTimezone_(sessionTimezone) {
+        sessionTimezone_(sessionTimezone),
+        bufferCache_(bufferCache) {
     type_->makeLevelInfo(leafInfo_);
+    takeBuffersFromCache();
   }
 
   // This PageReader constructor is for unit test only.
@@ -74,7 +88,8 @@ class PageReader {
       dwio::common::ColumnReaderStatistics& stats,
       const tz::TimeZone* sessionTimezone = nullptr,
       int32_t maxRepeat = 0,
-      int32_t maxDefine = 1)
+      int32_t maxDefine = 1,
+      BufferCache* bufferCache = nullptr)
       : pool_(pool),
         inputStream_(std::move(stream)),
         maxRepeat_(maxRepeat),
@@ -84,7 +99,14 @@ class PageReader {
         chunkSize_(chunkSize),
         nullConcatenation_(pool_),
         stats_(stats),
-        sessionTimezone_(sessionTimezone) {}
+        sessionTimezone_(sessionTimezone),
+        bufferCache_(bufferCache) {
+    takeBuffersFromCache();
+  }
+
+  ~PageReader() {
+    returnBuffersToCache();
+  }
 
   /// Advances 'numRows' top level rows.
   void skip(int64_t numRows);
@@ -404,7 +426,26 @@ class PageReader {
     return reader.numValues();
   }
 
+  void takeBuffersFromCache() {
+    if (bufferCache_ == nullptr) {
+      return;
+    }
+    pageBuffer_ = std::move(bufferCache_->pageBuffer);
+    decompressedData_ = std::move(bufferCache_->decompressedData);
+    thriftBuffer_ = std::move(bufferCache_->thriftBuffer);
+  }
+
+  void returnBuffersToCache() {
+    if (bufferCache_ == nullptr) {
+      return;
+    }
+    bufferCache_->pageBuffer = std::move(pageBuffer_);
+    bufferCache_->decompressedData = std::move(decompressedData_);
+    bufferCache_->thriftBuffer = std::move(thriftBuffer_);
+  }
+
   memory::MemoryPool& pool_;
+  BufferCache* bufferCache_{nullptr};
 
   std::unique_ptr<dwio::common::SeekableInputStream> inputStream_;
   ParquetTypeWithIdPtr type_;

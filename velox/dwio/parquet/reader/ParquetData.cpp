@@ -137,7 +137,8 @@ dwio::common::PositionProvider ParquetData::seekToRowGroup(int64_t index) {
       metadata.compression(),
       metadata.totalCompressedSize(),
       stats_,
-      sessionTimezone_);
+      sessionTimezone_,
+      &bufferCache_);
   return dwio::common::PositionProvider(empty);
 }
 
