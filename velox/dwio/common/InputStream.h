@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <exception>
 #include <functional>
@@ -151,7 +152,17 @@ class ReadFileInputStream final : public InputStream {
   ~ReadFileInputStream() override = default;
 
   uint64_t getLength() const final override {
-    return readFile_->size();
+    // Cache the file size: InputStream::logRead() queries it on every read,
+    // and on Windows ReadFile::size() issues a CRT file-length syscall pair
+    // under a lock per call. The size is stable for the lifetime of a read
+    // stream, so compute it once. '+1' keeps 0 free as the "not computed"
+    // sentinel so an empty file (size 0) is cached correctly.
+    auto cached = cachedLengthPlusOne_.load(std::memory_order_relaxed);
+    if (cached == 0) {
+      cached = readFile_->size() + 1;
+      cachedLengthPlusOne_.store(cached, std::memory_order_relaxed);
+    }
+    return cached - 1;
   }
 
   uint64_t getNaturalReadSize() const final override {
@@ -188,6 +199,7 @@ class ReadFileInputStream final : public InputStream {
  private:
   FileIoContext fileIoContext_;
   std::shared_ptr<velox::ReadFile> readFile_;
+  mutable std::atomic<uint64_t> cachedLengthPlusOne_{0};
 };
 
 } // namespace facebook::velox::dwio::common

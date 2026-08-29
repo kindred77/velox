@@ -389,7 +389,12 @@ uint64_t LocalReadFile::preadv(
   for (const auto& range : buffers) {
     totalSize += range.size();
   }
-  if (totalSize == 0 || offset > size() || totalSize > size() - offset) {
+  // Bounds check against the open-time size (like the non-MSVC path). size()
+  // would query the live file length via a CRT syscall pair on every read;
+  // scan workloads read a stable file, and out-of-range requests still fall
+  // back to the clamped ReadFile::preadv below.
+  const uint64_t fileSize = static_cast<uint64_t>(size_);
+  if (totalSize == 0 || offset > fileSize || totalSize > fileSize - offset) {
     // Out-of-file-range requests must be clamped per buffer; keep the base
     // behavior for that edge case.
     return ReadFile::preadv(offset, buffers, context);
