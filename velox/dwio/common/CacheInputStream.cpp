@@ -351,9 +351,44 @@ void CacheInputStream::loadPosition() {
     }
 
     const auto nextLoadRegion = nextQuantizedLoadRegion(position_);
-    // There is no need to update the metric in the loadData method because
-    // loadSync is always executed regardless and updates the metric.
-    loadSync(nextLoadRegion);
+    // E0-A: the coalesced load (when present) just populated the entry that
+    // covers the current position. Serve it directly instead of unconditionally
+    // re-entering loadSync, which would do a second findOrCreate round trip and
+    // could read the same region from storage again when the entry was evicted
+    // between the load and the lookup. Only fall back to loadSync when the
+    // entry is missing, smaller than the requested quantum, or still exclusive
+    // (another thread is filling it). See
+    // dev_tasks/performance_tuning_20260829.md 9.3.1.
+    if (load != nullptr) {
+      auto found =
+          cache_->find(cache::RawFileCacheKey{fileNum_, nextLoadRegion.offset});
+      if (found.has_value() && !found->empty() &&
+          found->checkedEntry()->size() >= nextLoadRegion.length) {
+        pin_ = std::move(*found);
+        // Mirror loadSync's hit-path accounting: raw bytes touched, prefetch
+        // state reset, and first-use handling (an entry filled by the
+        // coalesced load is a miss, not a RAM hit).
+        int64_t hitSize = nextLoadRegion.length;
+        if (window_.has_value()) {
+          const int64_t regionEnd =
+              nextLoadRegion.offset + nextLoadRegion.length;
+          const int64_t windowStart = region_.offset + window_.value().offset;
+          const int64_t windowEnd = windowStart + window_.value().length;
+          hitSize = std::min(windowEnd, regionEnd) -
+              std::max<int64_t>(windowStart, nextLoadRegion.offset);
+        }
+        ioStats_->incRawBytesRead(hitSize);
+        prefetchStarted_ = false;
+        if (!pin_.checkedEntry()->getAndClearFirstUseFlag()) {
+          ioStats_->ramHit().increment(hitSize);
+        }
+      } else {
+        loadSync(nextLoadRegion);
+      }
+    } else {
+      // No coalesced load for this stream; load the quantum directly.
+      loadSync(nextLoadRegion);
+    }
   }
 
   auto* entry = pin_.checkedEntry();
