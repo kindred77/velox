@@ -3401,7 +3401,8 @@ class HashJoinNode : public AbstractJoinNode {
       RowTypePtr outputType,
       bool useHashTableCache = false,
       bool nullAsValue = false,
-      std::optional<std::string> cacheKey = std::nullopt)
+      std::optional<std::string> cacheKey = std::nullopt,
+      TypedExprPtr postJoinFilter = nullptr)
       : AbstractJoinNode(
             id,
             joinType,
@@ -3414,7 +3415,8 @@ class HashJoinNode : public AbstractJoinNode {
         nullAware_{nullAware},
         nullAsValue_{nullAsValue},
         useHashTableCache_{useHashTableCache},
-        cacheKey_{std::move(cacheKey)} {
+        cacheKey_{std::move(cacheKey)},
+        postJoinFilter_{std::move(postJoinFilter)} {
     validate();
 
     VELOX_USER_CHECK(
@@ -3458,6 +3460,7 @@ class HashJoinNode : public AbstractJoinNode {
       nullAsValue_ = other.isNullAsValue();
       useHashTableCache_ = other.useHashTableCache();
       cacheKey_ = other.cacheKey();
+      postJoinFilter_ = other.postJoinFilter();
     }
 
     Builder& nullAware(bool value) {
@@ -3477,6 +3480,11 @@ class HashJoinNode : public AbstractJoinNode {
 
     Builder& cacheKey(std::optional<std::string> value) {
       cacheKey_ = std::move(value);
+      return *this;
+    }
+
+    Builder& postJoinFilter(TypedExprPtr value) {
+      postJoinFilter_ = std::move(value);
       return *this;
     }
 
@@ -3509,7 +3517,8 @@ class HashJoinNode : public AbstractJoinNode {
           outputType_.value(),
           useHashTableCache_.value_or(false),
           nullAsValue_.value_or(false),
-          cacheKey_);
+          cacheKey_,
+          postJoinFilter_.value_or(nullptr));
     }
 
    private:
@@ -3517,6 +3526,7 @@ class HashJoinNode : public AbstractJoinNode {
     std::optional<bool> nullAsValue_;
     std::optional<bool> useHashTableCache_;
     std::optional<std::string> cacheKey_;
+    std::optional<TypedExprPtr> postJoinFilter_;
   };
 
   std::string_view name() const override {
@@ -3560,6 +3570,15 @@ class HashJoinNode : public AbstractJoinNode {
     return cacheKey_;
   }
 
+  /// Optional post-join filter evaluated on matched rows only. Rows failing it
+  /// are dropped from the join output; preserved (unmatched) rows of outer
+  /// joins bypass it. The caller guarantees the filter is true on preserved
+  /// rows, so this is equivalent to a Filter above the join while avoiding the
+  /// materialization of rows that would be filtered out.
+  const TypedExprPtr& postJoinFilter() const {
+    return postJoinFilter_;
+  }
+
   folly::dynamic serialize() const override;
 
   static PlanNodePtr create(const folly::dynamic& obj, void* context);
@@ -3571,6 +3590,7 @@ class HashJoinNode : public AbstractJoinNode {
   const bool nullAsValue_;
   const bool useHashTableCache_;
   const std::optional<std::string> cacheKey_;
+  const TypedExprPtr postJoinFilter_;
 };
 
 using HashJoinNodePtr = std::shared_ptr<const HashJoinNode>;

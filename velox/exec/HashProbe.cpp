@@ -192,6 +192,10 @@ void HashProbe::initialize() {
   if (nullAware_) {
     filterTableResult_.resize(1);
   }
+
+  if (joinNode_->postJoinFilter()) {
+    initializePostFilter();
+  }
 }
 
 void HashProbe::initializeFilter(
@@ -1270,6 +1274,18 @@ RowVectorPtr HashProbe::getOutputInternal(bool toSpillOutput) {
 
     numOut = evalFilter(numOut);
 
+    if (needLastProbe()) {
+      // Mark build-side rows that have a match on the join condition. This
+      // must run before the post-join filter drops rows: a build row whose
+      // matches all fail the post filter is still a match for the join
+      // condition and must not be re-emitted as a preserved row.
+      table_->rows()->setProbedFlag(outputTableRows, numOut);
+    }
+
+    // Drop matched rows failing the post-join filter; preserved rows bypass
+    // it (the caller guarantees the filter is true on them).
+    numOut = evalPostFilter(numOut);
+
     if (numOut == 0) {
       // The hash probe might get stuck in the output loop if the filter is
       // highly selective. This does not apply if the call is made during
@@ -1279,11 +1295,6 @@ RowVectorPtr HashProbe::getOutputInternal(bool toSpillOutput) {
         return nullptr;
       }
       continue;
-    }
-
-    if (needLastProbe()) {
-      // Mark build-side rows that have a match on the join condition.
-      table_->rows()->setProbedFlag(outputTableRows, numOut);
     }
 
     // Right semi join only returns the build side output when the probe side
@@ -1350,6 +1361,131 @@ RowVectorPtr HashProbe::createFilterInput(vector_size_t size) {
 
   return std::make_shared<RowVector>(
       pool(), filterInputType_, nullptr, size, std::move(filterColumns));
+}
+
+void HashProbe::initializePostFilter() {
+  VELOX_CHECK(!postFilter_);
+  postFilter_ = std::make_unique<ExprSet>(
+      std::vector<core::TypedExprPtr>{joinNode_->postJoinFilter()},
+      operatorCtx_->execCtx());
+  postFilterInputType_ = joinNode_->outputType();
+  for (auto& field : postFilter_->expr(0)->distinctFields()) {
+    const auto& name = field->field();
+    const auto outChannel = postFilterInputType_->getChildIdxIfExists(name);
+    VELOX_CHECK(
+        outChannel.has_value(),
+        "Post-join filter field {} not in join output",
+        name);
+
+    bool found = false;
+    for (const auto& [probeChannel, outputChannel] : projectedInputColumns_) {
+      if (outputChannel == *outChannel) {
+        postFilterProbeProjections_.emplace_back(probeChannel, *outChannel);
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      for (const auto& projection : tableOutputProjections_) {
+        if (projection.outputChannel == *outChannel) {
+          postFilterTableProjections_.emplace_back(
+              projection.inputChannel, *outChannel);
+          found = true;
+          break;
+        }
+      }
+    }
+    VELOX_CHECK(
+        found,
+        "Post-join filter field {} not from probe or build input",
+        name);
+  }
+}
+
+RowVectorPtr HashProbe::createPostFilterInput(vector_size_t size) {
+  std::vector<VectorPtr> filterColumns(postFilterInputType_->size());
+  for (const auto& projection : postFilterProbeProjections_) {
+    if (projectedInputColumns_.find(projection.inputChannel) !=
+        projectedInputColumns_.end()) {
+      ensureLoaded(projection.inputChannel);
+    } else {
+      ensureLoadedIfNotAtEnd(projection.inputChannel);
+    }
+    filterColumns[projection.outputChannel] = wrapChild(
+        size, outputRowMapping_, input_->childAt(projection.inputChannel));
+  }
+  extractColumns(
+      table_.get(),
+      folly::Range<char* const*>(outputTableRows_->as<char*>(), size),
+      postFilterTableProjections_,
+      pool(),
+      postFilterInputType_->children(),
+      filterColumns);
+  // Fill unreferenced channels with null constants: the flat fast path of the
+  // expression evaluation requires a non-null child for every channel.
+  for (auto i = 0; i < filterColumns.size(); ++i) {
+    if (filterColumns[i] == nullptr) {
+      filterColumns[i] = BaseVector::createNullConstant(
+          postFilterInputType_->childAt(i), size, pool());
+    }
+  }
+  // Flatten the wrapped probe columns: evaluating a filter on dictionary
+  // vectors over the row mapping is significantly slower than on flat data,
+  // and this is on the join's hot path for every probe batch.
+  for (auto& child : filterColumns) {
+    if (!child->isFlatEncoding()) {
+      auto flat = BaseVector::create(child->type(), size, pool());
+      flat->copy(child.get(), 0, 0, size);
+      child = std::move(flat);
+    }
+  }
+  return std::make_shared<RowVector>(
+      pool(), postFilterInputType_, nullptr, size, std::move(filterColumns));
+}
+
+vector_size_t HashProbe::evalPostFilter(vector_size_t numRows) {
+  if (!postFilter_) {
+    return numRows;
+  }
+
+  auto* rawOutputProbeRowMapping =
+      outputRowMapping_->asMutable<vector_size_t>();
+  auto* outputTableRows = outputTableRows_->asMutable<char*>();
+
+  postFilterInputRows_.resizeFill(numRows);
+  // Do not evaluate the post filter on preserved rows (no match): the caller
+  // guarantees the filter is true on them, so they pass unconditionally.
+  // This applies to every join type: listJoinResults() may carry null table
+  // rows for left/full joins, and the empty-build path fills the whole batch
+  // with null table rows regardless of join type.
+  for (auto i = 0; i < numRows; ++i) {
+    if (outputTableRows[i] == nullptr) {
+      postFilterInputRows_.setValid(i, false);
+    }
+  }
+  postFilterInputRows_.updateBounds();
+
+  if (FOLLY_LIKELY(postFilterInputRows_.hasSelections())) {
+    RowVectorPtr filterInput = createPostFilterInput(numRows);
+    EvalCtx evalCtx(
+        operatorCtx_->execCtx(), postFilter_.get(), filterInput.get());
+    postFilter_->eval(
+        0, 1, true, postFilterInputRows_, evalCtx, postFilterResult_);
+    decodedPostFilterResult_.decode(
+        *postFilterResult_[0], postFilterInputRows_);
+  }
+
+  int32_t numPassed = 0;
+  for (auto i = 0; i < numRows; ++i) {
+    const bool pass = !postFilterInputRows_.isValid(i) ||
+        (!decodedPostFilterResult_.isNullAt(i) &&
+         decodedPostFilterResult_.valueAt<bool>(i));
+    if (pass) {
+      outputTableRows[numPassed] = outputTableRows[i];
+      rawOutputProbeRowMapping[numPassed++] = rawOutputProbeRowMapping[i];
+    }
+  }
+  return numPassed;
 }
 
 void HashProbe::prepareFilterRowsForNullAwareJoin(
@@ -1995,6 +2131,18 @@ void HashProbe::ensureLazyInputLoaded() {
   }
   if (filter_) {
     for (const auto& projection : filterInputProjections_) {
+      if (atEnd &&
+          projectedInputColumns_.find(projection.inputChannel) ==
+              projectedInputColumns_.end()) {
+        continue;
+      }
+      if (isLazyNotLoaded(*input_->childAt(projection.inputChannel))) {
+        lazyChannels.push_back(projection.inputChannel);
+      }
+    }
+  }
+  if (postFilter_) {
+    for (const auto& projection : postFilterProbeProjections_) {
       if (atEnd &&
           projectedInputColumns_.find(projection.inputChannel) ==
               projectedInputColumns_.end()) {

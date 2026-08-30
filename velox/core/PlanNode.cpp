@@ -1686,6 +1686,9 @@ void HashJoinNode::addDetails(std::stringstream& stream) const {
   if (nullAsValue_) {
     stream << ", null as value";
   }
+  if (postJoinFilter_) {
+    stream << ", postJoinFilter: " << postJoinFilter_->toString();
+  }
 }
 
 folly::dynamic HashJoinNode::serialize() const {
@@ -1695,6 +1698,9 @@ folly::dynamic HashJoinNode::serialize() const {
   obj["useHashTableCache"] = useHashTableCache_;
   if (cacheKey_.has_value()) {
     obj["cacheKey"] = cacheKey_.value();
+  }
+  if (postJoinFilter_) {
+    obj["postJoinFilter"] = postJoinFilter_->serialize();
   }
   return obj;
 }
@@ -1725,6 +1731,12 @@ PlanNodePtr HashJoinNode::create(const folly::dynamic& obj, void* context) {
     filter = ISerializable::deserialize<ITypedExpr>(obj["filter"], context);
   }
 
+  TypedExprPtr postJoinFilter;
+  if (obj.count("postJoinFilter")) {
+    postJoinFilter =
+        ISerializable::deserialize<ITypedExpr>(obj["postJoinFilter"], context);
+  }
+
   auto outputType = deserializeRowType(obj["outputType"]);
 
   return std::make_shared<HashJoinNode>(
@@ -1739,7 +1751,8 @@ PlanNodePtr HashJoinNode::create(const folly::dynamic& obj, void* context) {
       outputType,
       useHashTableCache,
       nullAsValue,
-      std::move(cacheKey));
+      std::move(cacheKey),
+      std::move(postJoinFilter));
 }
 
 MergeJoinNode::MergeJoinNode(

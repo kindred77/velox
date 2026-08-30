@@ -184,6 +184,19 @@ class HashProbe : public Operator {
   // Returns the number of passing rows.
   vector_size_t evalFilter(vector_size_t numRows);
 
+  // Sets up the post-join filter (matched rows only). See
+  // HashJoinNode::postJoinFilter().
+  void initializePostFilter();
+
+  // Applies the post-join filter to matched rows and updates
+  // 'outputTableRows_'/'outputRowMapping_'. Preserved (non-matched) rows of
+  // outer joins bypass the filter. Returns the number of remaining rows.
+  vector_size_t evalPostFilter(vector_size_t numRows);
+
+  // Create a temporary input vector over the join output columns for the
+  // post-join filter.
+  RowVectorPtr createPostFilterInput(vector_size_t size);
+
   inline bool filterPassed(vector_size_t row) {
     return filterInputRows_.isValid(row) &&
         !decodedFilterResult_.isNullAt(row) &&
@@ -496,6 +509,18 @@ class HashProbe : public Operator {
 
   // Maps from column index in hash table to channel in 'filterInputType_'.
   std::vector<IdentityProjection> filterTableProjections_;
+
+  // Post-join filter (matched rows only; HashJoinNode::postJoinFilter()).
+  std::unique_ptr<ExprSet> postFilter_;
+  std::vector<VectorPtr> postFilterResult_;
+  DecodedVector decodedPostFilterResult_;
+  SelectivityVector postFilterInputRows_;
+  // Type of the RowVector for post filter inputs (the join output type).
+  RowTypePtr postFilterInputType_;
+  // Maps probe input channel / hash table column to the join output channel
+  // for the columns the post filter references.
+  std::vector<IdentityProjection> postFilterProbeProjections_;
+  std::vector<IdentityProjection> postFilterTableProjections_;
 
   // The following six fields are used in null-aware anti join filter
   // processing.
