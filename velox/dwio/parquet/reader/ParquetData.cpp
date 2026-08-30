@@ -16,9 +16,6 @@
 
 #include "velox/dwio/parquet/reader/ParquetData.h"
 
-#include <charconv>
-#include <cstdlib>
-
 #include "velox/common/time/Timer.h"
 #include "velox/dwio/common/BufferedInput.h"
 #include "velox/dwio/common/SeekableInputStream.h"
@@ -28,23 +25,10 @@ namespace facebook::velox::parquet {
 
 namespace {
 
-// E0-B temporary diagnostic gate: maximum chunk size (bytes) eligible for the
-// direct single-use read path; 0 disables it and falls back to the cached
-// stream path for every chunk. Remove together with the A/B closure.
-uint64_t directChunkMaxBytes() {
-  const char* value = std::getenv("MYGORCA_PARQUET_DIRECT_CHUNK_MAX");
-  constexpr uint64_t kDefaultMax = 8ULL << 20; // 8MB = default load quantum.
-  if (value == nullptr) {
-    return kDefaultMax;
-  }
-  uint64_t bytes = 0;
-  const char* end = value + std::char_traits<char>::length(value);
-  const auto [ptr, error] = std::from_chars(value, end, bytes);
-  if (error != std::errc{} || ptr != end) {
-    return kDefaultMax;
-  }
-  return bytes;
-}
+// E0-B: chunks up to this size are read directly into a reused buffer,
+// bypassing AsyncDataCache. Larger chunks fall back to the cached stream
+// path (8MB = default load quantum; current datasets never exceed 2MB).
+constexpr uint64_t kDirectChunkMaxBytes = 8ULL << 20;
 
 } // namespace
 
@@ -149,7 +133,7 @@ void ParquetData::enqueueRowGroup(
       ? chunk.totalUncompressedSize()
       : chunk.totalCompressedSize();
 
-  if (readSize > 0 && readSize <= directChunkMaxBytes()) {
+  if (readSize > 0 && readSize <= kDirectChunkMaxBytes) {
     // E0-B: skip the cache enqueue; the chunk is read directly into a reused
     // buffer on seekToRowGroup(). Keeps the chunk metadata in the footer (T3
     // byte cache) and only bypasses AsyncDataCache for single-use page data.
