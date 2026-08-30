@@ -16,10 +16,37 @@
 
 #include "velox/dwio/parquet/reader/ParquetData.h"
 
+#include <charconv>
+#include <cstdlib>
+
+#include "velox/common/time/Timer.h"
 #include "velox/dwio/common/BufferedInput.h"
+#include "velox/dwio/common/SeekableInputStream.h"
 #include "velox/dwio/parquet/reader/ParquetStatsContext.h"
 
 namespace facebook::velox::parquet {
+
+namespace {
+
+// E0-B temporary diagnostic gate: maximum chunk size (bytes) eligible for the
+// direct single-use read path; 0 disables it and falls back to the cached
+// stream path for every chunk. Remove together with the A/B closure.
+uint64_t directChunkMaxBytes() {
+  const char* value = std::getenv("MYGORCA_PARQUET_DIRECT_CHUNK_MAX");
+  constexpr uint64_t kDefaultMax = 8ULL << 20; // 8MB = default load quantum.
+  if (value == nullptr) {
+    return kDefaultMax;
+  }
+  uint64_t bytes = 0;
+  const char* end = value + std::char_traits<char>::length(value);
+  const auto [ptr, error] = std::from_chars(value, end, bytes);
+  if (error != std::errc{} || ptr != end) {
+    return kDefaultMax;
+  }
+  return bytes;
+}
+
+} // namespace
 
 std::unique_ptr<dwio::common::FormatData> ParquetParams::toFormatData(
     const std::shared_ptr<const dwio::common::TypeWithId>& type,
@@ -104,6 +131,7 @@ void ParquetData::enqueueRowGroup(
     dwio::common::BufferedInput& input) {
   auto chunk = fileMetaDataPtr_.rowGroup(index).columnChunk(type_->column());
   streams_.resize(fileMetaDataPtr_.numRowGroups());
+  directChunks_.resize(fileMetaDataPtr_.numRowGroups());
   VELOX_CHECK(
       chunk.hasMetadata(),
       "ColumnMetaData does not exist for schema Id ",
@@ -121,6 +149,15 @@ void ParquetData::enqueueRowGroup(
       ? chunk.totalUncompressedSize()
       : chunk.totalCompressedSize();
 
+  if (readSize > 0 && readSize <= directChunkMaxBytes()) {
+    // E0-B: skip the cache enqueue; the chunk is read directly into a reused
+    // buffer on seekToRowGroup(). Keeps the chunk metadata in the footer (T3
+    // byte cache) and only bypasses AsyncDataCache for single-use page data.
+    directInput_ = input.getInputStream();
+    directChunks_[index] = std::make_pair(chunkReadOffset, readSize);
+    return;
+  }
+
   auto id = dwio::common::StreamIdentifier(type_->column());
   streams_[index] = input.enqueue({chunkReadOffset, readSize}, &id);
 }
@@ -128,6 +165,47 @@ void ParquetData::enqueueRowGroup(
 dwio::common::PositionProvider ParquetData::seekToRowGroup(int64_t index) {
   static std::vector<uint64_t> empty;
   VELOX_CHECK_LT(index, streams_.size());
+  if (directChunks_[index].has_value()) {
+    // E0-B: read the whole chunk with one pread into the reused buffer and
+    // serve the pages from memory. The old reader is destroyed first so its
+    // shared buffers are returned to bufferCache_ before reuse.
+    reader_.reset();
+    const auto [chunkOffset, chunkSize] = *directChunks_[index];
+    dwio::common::ensureCapacity<char>(directChunkBuffer_, chunkSize, &pool_);
+    directChunkBuffer_->setSize(chunkSize);
+    std::vector<folly::Range<char*>> ranges = {folly::Range<char*>(
+        directChunkBuffer_->asMutable<char>(), chunkSize)};
+    uint64_t readUs{0};
+    {
+      MicrosecondWallTimer timer(&readUs);
+      directInput_->read(ranges, chunkOffset, dwio::common::LogType::FILE);
+    }
+    // Keep the DWIO-level IO metrics in sync (ReadFileInputStream only
+    // updates the ReadFile-layer IoStats): storageReadBytes, read latency and
+    // raw bytes touched, mirroring DirectInputStream::loadSync.
+    if (auto* ioStats = directInput_->getStats()) {
+      ioStats->read().increment(chunkSize);
+      ioStats->incRawBytesRead(chunkSize);
+      ioStats->queryThreadIoLatencyUs().increment(readUs);
+      ioStats->storageReadLatencyUs().increment(readUs);
+      ioStats->incTotalScanTimeNs(readUs * 1'000);
+    }
+    stats_.pageLoadTimeNs.increment(readUs * 1'000);
+    auto metadata =
+        fileMetaDataPtr_.rowGroup(index).columnChunk(type_->column());
+    auto stream = std::make_unique<dwio::common::SeekableArrayInputStream>(
+        directChunkBuffer_->as<char>(), chunkSize);
+    reader_ = std::make_unique<PageReader>(
+        std::move(stream),
+        pool_,
+        type_,
+        metadata.compression(),
+        metadata.totalCompressedSize(),
+        stats_,
+        sessionTimezone_,
+        &bufferCache_);
+    return dwio::common::PositionProvider(empty);
+  }
   VELOX_CHECK(streams_[index], "Stream not enqueued for column");
   auto metadata = fileMetaDataPtr_.rowGroup(index).columnChunk(type_->column());
   reader_ = std::make_unique<PageReader>(

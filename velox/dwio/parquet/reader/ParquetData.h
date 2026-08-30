@@ -16,7 +16,11 @@
 
 #pragma once
 
+#include <optional>
+#include <utility>
+
 #include "velox/dwio/common/BufferUtil.h"
+#include "velox/dwio/common/InputStream.h"
 #include "velox/dwio/parquet/reader/Metadata.h"
 #include "velox/dwio/parquet/reader/PageReader.h"
 
@@ -223,6 +227,19 @@ class ParquetData : public dwio::common::FormatData {
   // Streams for this column in each of 'rowGroups_'. Will be created on or
   // ahead of first use, not at construction.
   std::vector<std::unique_ptr<dwio::common::SeekableInputStream>> streams_;
+
+  // E0-B: single-use page chunks are read directly into a reused buffer,
+  // bypassing AsyncDataCache (one pread per chunk, no cache-entry churn and no
+  // per-row-group allocation). directChunks_[i] holds the <offset, size> of
+  // row group i's chunk when it is direct-read; cached chunks keep the stream
+  // path above.
+  std::vector<std::optional<std::pair<uint64_t, uint64_t>>> directChunks_;
+  // Reused target buffer for direct chunk reads (one allocation per column
+  // split, grown to the largest chunk seen).
+  BufferPtr directChunkBuffer_;
+  // Shared file stream used for the direct reads so IO metrics (read count,
+  // storageReadBytes, latency) keep flowing into the task stats.
+  std::shared_ptr<dwio::common::ReadFileInputStream> directInput_;
 
   // Reuses the large transient page buffers across row groups of this column
   // split (see PageReader::BufferCache): one allocation per split instead of
