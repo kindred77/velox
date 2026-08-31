@@ -16,6 +16,8 @@
 
 #include "velox/exec/RowContainer.h"
 
+#include <atomic>
+
 #include "velox/common/memory/RawVector.h"
 #include "velox/exec/Aggregate.h"
 #include "velox/exec/ContainerRowSerde.h"
@@ -1006,10 +1008,18 @@ void RowContainer::clear() {
 }
 
 void RowContainer::setProbedFlag(char** rows, int32_t numRows) {
+  const auto byteOffset = probedFlagOffset_ / 8;
+  const auto mask = static_cast<uint8_t>(1U << (probedFlagOffset_ % 8));
   for (auto i = 0; i < numRows; i++) {
     // Row may be null in case of a FULL join.
     if (rows[i]) {
-      setBit(rows[i], probedFlagOffset_);
+      auto* flagByte = reinterpret_cast<uint8_t*>(rows[i]) + byteOffset;
+      // Probe keys can be highly repetitive. Avoid repeatedly dirtying the
+      // same build-row cache line after its idempotent flag is already set.
+      std::atomic_ref<uint8_t> flag(*flagByte);
+      if ((flag.load(std::memory_order_relaxed) & mask) == 0) {
+        flag.fetch_or(mask, std::memory_order_relaxed);
+      }
     }
   }
 }

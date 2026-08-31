@@ -701,14 +701,9 @@ class RowContainer {
   /// condition. 'rows' may contain duplicate entries for the cases
   /// where single probe row matched multiple build rows. In case of
   /// the full join, 'rows' may include null entries that correspond
-  /// to probe rows with no match. No tsan because any thread can set
-  /// this without synchronization. There is a barrier between setting
-  /// and reading.
-#if defined(__has_feature)
-#if __has_feature(thread_sanitizer)
-  __attribute__((__no_sanitize__("thread")))
-#endif
-#endif
+  /// to probe rows with no match. Updates are relaxed atomic because probe
+  /// drivers may mark the same row concurrently. A barrier separates marking
+  /// from reading the final flag state.
   void setProbedFlag(char** rows, int32_t numRows);
 
   /// Compares the value at 'column' in 'row' with the value at 'index' in
