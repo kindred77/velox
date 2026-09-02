@@ -1180,6 +1180,21 @@ RowVectorPtr HashProbe::getOutputInternal(bool toSpillOutput) {
   auto outputBatchSize = (isLeftSemiOrAntiJoinNoFilter || emptyBuildSide)
       ? inputSize
       : outputBatchSize_;
+  // Post-join filters are applied after matches are enumerated and can drop
+  // most of a fixed-size chunk (e.g. 2048 matched rows -> ~2048 * selectivity
+  // output rows). Enumerate the whole probe input batch at once instead so
+  // each output batch holds the passing rows of a full input batch, spreading
+  // the per-batch filter/output costs over more rows without keeping state
+  // across input batches. The input batch is bounded by maxOutputBatchRows,
+  // so the emitted batch stays within it. Null-aware joins evaluate their
+  // join filter on fixed-size staging (kBatchSize), so keep their chunking.
+  if (postFilter_ && !nullAware_ && !isLeftSemiOrAntiJoinNoFilter &&
+      !emptyBuildSide) {
+    outputBatchSize = std::min(
+        inputSize,
+        static_cast<vector_size_t>(
+            operatorCtx_->driverCtx()->queryConfig().maxOutputBatchRows()));
+  }
   outputTableRowsCapacity_ = outputBatchSize;
   if (filter_ &&
       (isLeftJoin(joinType_) || isFullJoin(joinType_) ||
