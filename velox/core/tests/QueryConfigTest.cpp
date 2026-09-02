@@ -48,6 +48,19 @@ TEST_F(QueryConfigTest, setConfig) {
   EXPECT_EQ(config.requestDataSizesMaxWaitSec(), 12);
 }
 
+TEST_F(QueryConfigTest, postJoinFilterOutputBatchRows) {
+  EXPECT_EQ(QueryConfig{{}}.postJoinFilterOutputBatchRows(), 2'048);
+
+  QueryConfig customConfig{
+      {{QueryConfig::kPostJoinFilterOutputBatchRows, "4096"}}};
+  EXPECT_EQ(customConfig.postJoinFilterOutputBatchRows(), 4'096);
+
+  QueryConfig zeroConfig{
+      {{QueryConfig::kPostJoinFilterOutputBatchRows, "0"}}};
+  VELOX_ASSERT_USER_THROW(
+      zeroConfig.postJoinFilterOutputBatchRows(), "batchRows > 0");
+}
+
 TEST_F(QueryConfigTest, invalidConfig) {
   std::unordered_map<std::string, std::string> configData(
       {{QueryConfig::kSessionTimezone, "invalid"}});

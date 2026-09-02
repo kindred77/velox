@@ -401,7 +401,10 @@ class HashProbe : public Operator {
   // of an invalidated table as we always spill the entire table.
   std::optional<RowColumn::Stats> columnStats(int32_t columnIndex) const;
 
-  // TODO: Define batch size as bytes based on RowContainer row sizes.
+  // Uses the query's preferred row count for regular joins. Post-join filters
+  // use their own row target to amortize per-batch filtering costs. The query's
+  // max row count remains a hard bound; preferred bytes may stop normal join
+  // result listing earlier.
   const vector_size_t outputBatchSize_;
 
   const std::shared_ptr<const core::HashJoinNode> joinNode_;

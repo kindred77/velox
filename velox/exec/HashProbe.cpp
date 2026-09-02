@@ -33,6 +33,23 @@ namespace {
 
 // Batch size used when iterating the row container.
 constexpr int kBatchSize = 1024;
+
+vector_size_t hashProbeOutputBatchRows(
+    DriverCtx* driverCtx,
+    const core::HashJoinNode& joinNode) {
+  const auto& queryConfig = driverCtx->queryConfig();
+  const auto preferredRows = queryConfig.preferredOutputBatchRows();
+  if (!joinNode.postJoinFilter()) {
+    return preferredRows;
+  }
+
+  // Post-join filters pay fixed vector construction and expression setup costs
+  // before compacting each batch. Use an independent row target so explicitly
+  // tuning the general preferred batch size retains its original semantics.
+  return std::min(
+      queryConfig.postJoinFilterOutputBatchRows(),
+      queryConfig.maxOutputBatchRows());
+}
 } // namespace
 
 // static
@@ -124,7 +141,7 @@ HashProbe::HashProbe(
           joinNode->canSpill(driverCtx->queryConfig())
               ? driverCtx->makeSpillConfig(operatorId, OperatorType::kHashProbe)
               : std::nullopt),
-      outputBatchSize_{outputBatchRows()},
+      outputBatchSize_{hashProbeOutputBatchRows(driverCtx, *joinNode)},
       joinNode_(std::move(joinNode)),
       joinType_{joinNode_->joinType()},
       nullAware_{joinNode_->isNullAware()},

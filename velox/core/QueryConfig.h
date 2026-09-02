@@ -501,6 +501,16 @@ class QueryConfig {
       10000,
       "Maximum number of rows in output batches.")
 
+  /// Preferred number of rows in hash join batches that require a post-join
+  /// filter. Kept separate from preferred_output_batch_rows so callers can
+  /// tune post-filter amortization without changing other operators.
+  VELOX_QUERY_CONFIG_PROPERTY(
+      kPostJoinFilterOutputBatchRows,
+      "post_join_filter_output_batch_rows",
+      uint32_t,
+      2048,
+      "Preferred number of rows in hash join post-filter batches.")
+
   /// Initial output batch size in rows for MergeJoin operator.
   VELOX_QUERY_CONFIG_PROPERTY(
       kMergeJoinOutputBatchStartSize,
@@ -1442,6 +1452,14 @@ class QueryConfig {
     VELOX_USER_CHECK_LE(
         maxBatchRows, std::numeric_limits<vector_size_t>::max());
     return maxBatchRows;
+  }
+
+  vector_size_t postJoinFilterOutputBatchRows() const {
+    const uint32_t batchRows =
+        get<uint32_t>(kPostJoinFilterOutputBatchRows, 2'048);
+    VELOX_USER_CHECK_GT(batchRows, 0);
+    VELOX_USER_CHECK_LE(batchRows, std::numeric_limits<vector_size_t>::max());
+    return batchRows;
   }
 
   vector_size_t mergeJoinOutputBatchStartSize() const {
