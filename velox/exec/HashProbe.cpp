@@ -925,8 +925,15 @@ RowVectorPtr HashProbe::getBuildSideOutput() {
     return nullptr;
   }
 
+  // Build-side rows (right/full join preserved rows and right semi rows) are
+  // emitted after probing ends. Do not reuse outputTableRowsCapacity_: it
+  // reflects the last probe input batch size, which postJoinFilter probe
+  // output packing sets to the input batch size; a trailing single-row probe
+  // batch would fragment this phase into one-row batches. Use the operator's
+  // own output batch size instead.
+  const auto buildSideOutputBatchSize = outputBatchSize_;
   char** outputTableRows =
-      initBuffer<char*>(outputTableRows_, outputTableRowsCapacity_, pool());
+      initBuffer<char*>(outputTableRows_, buildSideOutputBatchSize, pool());
   int32_t numOut{0};
   while (numOut == 0 &&
          buildSideOutputRowContainerId_ < table_->numRowContainers()) {
@@ -934,14 +941,14 @@ RowVectorPtr HashProbe::getBuildSideOutput() {
       numOut = table_->listProbedRows(
           lastProbeIterator_,
           buildSideOutputRowContainerId_,
-          outputTableRowsCapacity_,
+          buildSideOutputBatchSize,
           RowContainer::kUnlimited,
           outputTableRows);
     } else if (isRightSemiProjectJoin(joinType_)) {
       numOut = table_->listAllRows(
           lastProbeIterator_,
           buildSideOutputRowContainerId_,
-          outputTableRowsCapacity_,
+          buildSideOutputBatchSize,
           RowContainer::kUnlimited,
           outputTableRows);
 
@@ -950,7 +957,7 @@ RowVectorPtr HashProbe::getBuildSideOutput() {
       numOut = table_->listNotProbedRows(
           lastProbeIterator_,
           buildSideOutputRowContainerId_,
-          outputTableRowsCapacity_,
+          buildSideOutputBatchSize,
           RowContainer::kUnlimited,
           outputTableRows);
     }
