@@ -524,7 +524,7 @@ PSNIP_SAFE_DEFINE_LARGER_UNSIGNED_OPS(Psnip_uint64_t, uint64)
 #define PSNIP_SAFE_DEFINE_PROMOTED_SIGNED_BINARY_OP(T, name, opName, min, max) \
   PSNIP_SAFE__FUNCTION psnipSafeBool psnipSafe_##name##_##opName(              \
       T* res, T a, T b) {                                                      \
-    const psnipSafe_##name##Larger r =                                         \
+    const psnipSafe##name##Larger r =                                           \
         psnipSafeLarger_##name##_##opName(a, b);                               \
     *res = (T)r;                                                               \
     return (r >= min) && (r <= max);                                           \
@@ -533,7 +533,7 @@ PSNIP_SAFE_DEFINE_LARGER_UNSIGNED_OPS(Psnip_uint64_t, uint64)
 #define PSNIP_SAFE_DEFINE_PROMOTED_UNSIGNED_BINARY_OP(T, name, opName, max) \
   PSNIP_SAFE__FUNCTION psnipSafeBool psnipSafe_##name##_##opName(           \
       T* res, T a, T b) {                                                   \
-    const psnipSafe_##name##Larger r =                                      \
+    const psnipSafe##name##Larger r =                                        \
         psnipSafeLarger_##name##_##opName(a, b);                            \
     *res = (T)r;                                                            \
     return (r <= max);                                                      \
