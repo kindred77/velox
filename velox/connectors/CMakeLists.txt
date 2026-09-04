@@ -15,6 +15,17 @@ velox_add_library(velox_connector Connector.cpp HEADERS Connector.h ConnectorReg
 
 velox_link_libraries(velox_connector velox_common_config velox_exec_spill_stats velox_vector)
 
+# Presto-compatible merge action expansion is shared by connectors that opt
+# into DELETE_ROW_AND_INSERT_ROW. Keep it out of the foundational SPI target.
+velox_add_library(
+  velox_connector_merge
+  MergeRowChangeProcessor.cpp
+  HEADERS
+  MergeRowChangeProcessor.h
+)
+
+velox_link_libraries(velox_connector_merge velox_vector)
+
 velox_add_library(velox_connector_registry ConnectorRegistry.cpp HEADERS ConnectorRegistry.h)
 
 velox_link_libraries(velox_connector_registry velox_connector velox_scoped_registry velox_core)
