@@ -52,6 +52,13 @@ FetchContent_Declare(
 
 set(protobuf_BUILD_TESTS OFF)
 set(protobuf_ABSL_PROVIDER "package")
+# The bundled 3.21.7 protobuf calls find_package(ZLIB) and then puts
+# ZLIB_INCLUDE_DIRECTORIES ahead of its own src/ in the directory include
+# list. With vcpkg that path is the installed include root, so
+# google/protobuf/*.h resolves to vcpkg protobuf 29.x headers while compiling
+# the bundled sources (C++11 vs vcpkg absl's C++14+ requirement). Protobuf
+# only uses zlib for gzip streams, which this engine does not need.
+set(protobuf_WITH_ZLIB OFF CACHE BOOL "Build bundled protobuf without zlib" FORCE)
 FetchContent_MakeAvailable(protobuf)
 set(Protobuf_INCLUDE_DIRS ${protobuf_SOURCE_DIR}/src)
 
