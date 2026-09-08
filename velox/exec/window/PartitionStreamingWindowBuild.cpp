@@ -18,12 +18,53 @@
 
 namespace facebook::velox::exec::window {
 
+namespace {
+
+// Maps the reordered partition-key descriptors to original input channels.
+std::vector<column_index_t> extractPartitionChannels(
+    const std::vector<std::pair<column_index_t, core::SortOrder>>&
+        partitionKeyInfo,
+    const std::vector<column_index_t>& inputChannels) {
+  std::vector<column_index_t> channels;
+  channels.reserve(partitionKeyInfo.size());
+  for (const auto& key : partitionKeyInfo) {
+    channels.push_back(inputChannels[key.first]);
+  }
+  return channels;
+}
+
+// Returns true if 'row' starts a new partition relative to the previous input
+// row (same vector) or to the captured key values of the previous vector.
+bool isNewPartition(
+    const RowVectorPtr& input,
+    vector_size_t row,
+    const SingleRowValues& previousPartitionKeyValues,
+    const std::vector<column_index_t>& partitionKeyChannels) {
+  if (row == 0) {
+    return previousPartitionKeyValues.hasValue() &&
+        !previousPartitionKeyValues.equals(input, row);
+  }
+  for (const auto channel : partitionKeyChannels) {
+    if (!input->childAt(channel)->equalValueAt(
+            input->childAt(channel).get(), row - 1, row)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+} // namespace
+
 PartitionStreamingWindowBuild::PartitionStreamingWindowBuild(
     const std::shared_ptr<const core::WindowNode>& windowNode,
     velox::memory::MemoryPool* pool,
     const common::SpillConfig* spillConfig,
     tsan_atomic<bool>* nonReclaimableSection)
-    : WindowBuild(windowNode, pool, spillConfig, nonReclaimableSection) {
+    : WindowBuild(windowNode, pool, spillConfig, nonReclaimableSection),
+      previousPartitionKeyValues_(
+          extractPartitionChannels(partitionKeyInfo_, inputChannels_), pool),
+      partitionKeyChannels_(
+          extractPartitionChannels(partitionKeyInfo_, inputChannels_)) {
   initializeRowContainer(pool);
   initializeDecodedInputVectors();
 }
@@ -35,29 +76,38 @@ void PartitionStreamingWindowBuild::buildNextPartition() {
 }
 
 void PartitionStreamingWindowBuild::addInput(RowVectorPtr input) {
+  for (const auto channel : partitionKeyChannels_) {
+    input->childAt(channel)->loadedVector();
+  }
   for (auto i = 0; i < inputChannels_.size(); ++i) {
     decodedInputVectors_[i].decode(*input->childAt(inputChannels_[i]));
   }
 
   for (auto row = 0; row < input->size(); ++row) {
+    if (isNewPartition(
+            input,
+            row,
+            previousPartitionKeyValues_,
+            partitionKeyChannels_)) {
+      buildNextPartition();
+    }
+
     char* newRow = data_->newRow();
 
     for (auto col = 0; col < input->childrenSize(); ++col) {
       data_->store(decodedInputVectors_[col], row, newRow, col);
     }
 
-    if (previousRow_ != nullptr &&
-        compareRowsWithKeys(previousRow_, newRow, partitionKeyInfo_)) {
-      buildNextPartition();
-    }
-
     inputRows_.push_back(newRow);
-    previousRow_ = newRow;
+  }
+  if (input->size() > 0) {
+    previousPartitionKeyValues_.capture(input, input->size() - 1);
   }
 }
 
 void PartitionStreamingWindowBuild::noMoreInput() {
   buildNextPartition();
+  previousPartitionKeyValues_.reset();
 
   // Help for last partition related calculations.
   partitionStartRows_.push_back(sortedRows_.size());

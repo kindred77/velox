@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "velox/exec/window/SingleRowValues.h"
 #include "velox/exec/window/WindowBuild.h"
 
 namespace facebook::velox::exec::window {
@@ -71,8 +72,16 @@ class PartitionStreamingWindowBuild : public WindowBuild {
   // partitions.
   std::vector<vector_size_t> partitionStartRows_;
 
-  // Used to compare rows based on partitionKeys.
-  char* previousRow_ = nullptr;
+  // Partition-key values of the last row of the most recent input vector.
+  // We intentionally do not keep a RowContainer row pointer for this: Window
+  // can erase completed partitions (nextPartition()) while more input is still
+  // arriving, and the previous row may then be freed before the next
+  // addInput() compares against it.
+  SingleRowValues previousPartitionKeyValues_;
+
+  // Input channels of the partition keys, used for cross-vector boundary
+  // checks.
+  std::vector<column_index_t> partitionKeyChannels_;
 
   // Current partition being output. Used to construct WindowPartitions
   // during resetPartition.
