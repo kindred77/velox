@@ -229,6 +229,10 @@ class VectorWindowPartition::VectorAccessor {
     return partition_.previousRow_.hasValue();
   }
 
+  bool noOrderByKeys() const {
+    return partition_.sortKeyInfo().empty();
+  }
+
   bool previousRowEquals(vector_size_t row) const {
     const auto rowRef = rowAt(row);
     return partition_.previousRow_.equals(rowRef.input, rowRef.row);

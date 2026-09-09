@@ -45,6 +45,10 @@ concept WindowPartitionAccessor = requires(
   /// startRow() for cross-batch peer comparison.
   { rows.hasPreviousRow() } -> std::same_as<bool>;
 
+  /// Returns true if the window has no ORDER BY keys, in which case every row
+  /// in a partition belongs to the same peer group.
+  { rows.noOrderByKeys() } -> std::same_as<bool>;
+
   /// Compares the retained previous row with 'row' using ORDER BY keys.
   { rows.previousRowEquals(row) } -> std::same_as<bool>;
 

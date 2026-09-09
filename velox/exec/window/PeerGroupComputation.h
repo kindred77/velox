@@ -58,7 +58,13 @@ class PeerGroupComputation {
       const auto samePeer = rows.previousRowEquals(start);
       previousRowConsumed = true;
       if (samePeer) {
-        peerEnd = findEnd(rows, start, rows.partitionEnd());
+        // Without ORDER BY every row in the partition is a peer, so the group
+        // reaches the currently retained partition end. Avoid rescanning the
+        // remaining partition from every output block after earlier rows were
+        // released (the previous-row comparison above is vacuously true).
+        peerEnd = rows.noOrderByKeys()
+            ? rows.partitionEnd()
+            : findEnd(rows, start, rows.partitionEnd());
         for (; next < std::min(end, peerEnd); ++next, ++index) {
           rawPeerStarts[index] = peerStart;
           rawPeerEnds[index] = peerEnd - 1;

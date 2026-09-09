@@ -229,6 +229,10 @@ class WindowPartition::RowContainerAccessor {
     return partition_.previousRow_ != nullptr;
   }
 
+  bool noOrderByKeys() const {
+    return partition_.sortKeyInfo_.empty();
+  }
+
   bool previousRowEquals(vector_size_t row) const {
     return !partition_.compareRowsWithSortKeys(
         partition_.previousRow_, rowAt(row));
