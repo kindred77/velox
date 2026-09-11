@@ -23,6 +23,8 @@
 #include "velox/functions/lib/aggregates/SingleValueAccumulator.h"
 #include "velox/type/FloatingPointUtil.h"
 #include "velox/vector/AggregationHook.h"
+#include "velox/vector/BaseVector.h"
+#include "velox/vector/SimpleVector.h"
 
 namespace facebook::velox::functions::aggregate {
 
@@ -492,6 +494,81 @@ class MinMaxAggregateBase : public exec::Aggregate {
     });
   }
 
+  /// Fast path for global (single-group) MIN/MAX over flat scalar inputs:
+  /// compares a whole batch with typed values and touches the accumulator at
+  /// most once per batch, avoiding the per-row generic comparison chain
+  /// (type-erased serde stream + type switch + std::function indirect call).
+  /// Nested types keep the generic path, which implements nested-null
+  /// handling. Returns false if the input is not a flat scalar.
+  bool updateSingleGroupFlat(
+      char* group,
+      const SelectivityVector& rows,
+      const VectorPtr& arg,
+      bool isMin) {
+    const auto kind = arg->type()->kind();
+    switch (kind) {
+      case TypeKind::BOOLEAN:
+      case TypeKind::TINYINT:
+      case TypeKind::SMALLINT:
+      case TypeKind::INTEGER:
+      case TypeKind::BIGINT:
+      case TypeKind::REAL:
+      case TypeKind::DOUBLE:
+      case TypeKind::VARCHAR:
+      case TypeKind::VARBINARY:
+      case TypeKind::TIMESTAMP:
+      case TypeKind::HUGEINT:
+        break;
+      default:
+        // Complex types (including nested null semantics) keep the generic
+        // per-row path.
+        return false;
+    }
+    VELOX_DYNAMIC_SCALAR_TYPE_DISPATCH(
+        updateSingleGroupFlatTyped, kind, group, rows, arg, isMin);
+    return true;
+  }
+
+  template <TypeKind kind>
+  void updateSingleGroupFlatTyped(
+      char* group,
+      const SelectivityVector& rows,
+      const VectorPtr& arg,
+      bool isMin) {
+    using T = typename TypeTraits<kind>::NativeType;
+
+    // Lazy inputs (e.g. columns loaded from parquet) must be loaded before
+    // reading raw values out of the decoded vector.
+    DecodedVector decoded(*arg, rows, true);
+    auto accumulator = value<SingleValueAccumulator>(group);
+
+    T best{};
+    bool hasBest = accumulator->hasValue();
+    if (hasBest) {
+      auto current = BaseVector::create(arg->type(), 1, allocator_->pool());
+      accumulator->read(current, 0);
+      best = current->asUnchecked<SimpleVector<T>>()->valueAt(0);
+    }
+
+    vector_size_t bestIndex = -1;
+    rows.applyToSelected([&](vector_size_t i) {
+      if (decoded.isNullAt(i)) {
+        return;
+      }
+      const T value = decoded.valueAt<T>(i);
+      if (!hasBest ||
+          (isMin ? SimpleVector<T>::comparePrimitiveAsc(value, best) < 0
+                 : SimpleVector<T>::comparePrimitiveAsc(best, value) < 0)) {
+        best = value;
+        bestIndex = i;
+        hasBest = true;
+      }
+    });
+    if (bestIndex >= 0) {
+      accumulator->write(decoded.base(), decoded.index(bestIndex), allocator_);
+    }
+  }
+
   void initializeNewGroupsInternal(
       char** groups,
       folly::Range<const vector_size_t*> indices) override {
@@ -543,10 +620,12 @@ class MaxAggregate : public MinMaxAggregateBase {
       const SelectivityVector& rows,
       const std::vector<VectorPtr>& args,
       bool /*mayPushdown*/) override {
-    doUpdateSingleGroup<std::function<bool(int32_t)>, nullHandlingMode>(
-        group, rows, args[0], [](int32_t compareResult) {
-          return compareResult < 0;
-        });
+    if (!updateSingleGroupFlat(group, rows, args[0], /*isMin=*/false)) {
+      doUpdateSingleGroup<std::function<bool(int32_t)>, nullHandlingMode>(
+          group, rows, args[0], [](int32_t compareResult) {
+            return compareResult < 0;
+          });
+    }
   }
 
   void addSingleGroupIntermediateResults(
@@ -588,10 +667,12 @@ class MinAggregate : public MinMaxAggregateBase {
       const SelectivityVector& rows,
       const std::vector<VectorPtr>& args,
       bool /*mayPushdown*/) override {
-    doUpdateSingleGroup<std::function<bool(int32_t)>, nullHandlingMode>(
-        group, rows, args[0], [](int32_t compareResult) {
-          return compareResult > 0;
-        });
+    if (!updateSingleGroupFlat(group, rows, args[0], /*isMin=*/true)) {
+      doUpdateSingleGroup<std::function<bool(int32_t)>, nullHandlingMode>(
+          group, rows, args[0], [](int32_t compareResult) {
+            return compareResult > 0;
+          });
+    }
   }
 
   void addSingleGroupIntermediateResults(
