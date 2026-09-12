@@ -679,6 +679,7 @@ void VectorHasher::setDistinctOverflow() {
   uniqueValues_.clear();
   uniqueValuesStorage_.clear();
   distinctStringsBytes_ = 0;
+  clearShortValueIdCache();
 }
 
 void VectorHasher::setRangeOverflow() {
@@ -892,6 +893,8 @@ void VectorHasher::copyStatsFrom(const VectorHasher& other) {
   min_ = other.min_;
   max_ = other.max_;
   uniqueValues_ = other.uniqueValues_;
+  // The copied value ids may differ from the cached ones.
+  clearShortValueIdCache();
 }
 
 void VectorHasher::merge(const VectorHasher& other, size_t maxNumDistinct) {

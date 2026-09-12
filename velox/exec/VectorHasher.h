@@ -159,6 +159,10 @@ class VectorHasher {
       hasRange_ = true;
       min_ = 0;
       max_ = 1;
+    } else if (typeKind_ == TypeKind::VARCHAR) {
+      // Strings map to value ids through a hash map lookup per row; see
+      // 'valueId<StringView>'.
+      shortValueIdCache_.resize(kShortValueIdCacheSize);
     }
   }
 
@@ -292,6 +296,7 @@ class VectorHasher {
   void resetStats() {
     uniqueValues_.clear();
     uniqueValuesStorage_.clear();
+    clearShortValueIdCache();
   }
 
   // Sets 'this' to range mode and adds 'reservePct' values to the
@@ -612,6 +617,41 @@ class VectorHasher {
   DecodedVector decoded_;
   raw_vector<uint64_t> cachedHashes_;
 
+  // Size of the short string value id cache, a power of two.
+  static constexpr uint32_t kShortValueIdCacheSize = 128;
+
+  // The cache is only consulted while the number of mapped values stays at
+  // or below this limit, so that high cardinality keys keep the plain map
+  // lookup behavior and the cache stays at most half full.
+  static constexpr uint32_t kShortValueIdCacheMaxDistinct = 64;
+
+  // Longest probe sequence tried before giving up on caching a value.
+  static constexpr uint32_t kShortValueIdCacheMaxProbes = 8;
+
+  // Value id of a string of up to 8 bytes, which 'UniqueValue' stores
+  // inline, so that comparing the inline word and the size is an exact key
+  // comparison. 'kEmptyShortValueIdCacheSize' marks an unused entry; cached
+  // strings never reach that size.
+  static constexpr uint32_t kEmptyShortValueIdCacheSize =
+      std::numeric_limits<uint32_t>::max();
+
+  struct ShortValueIdCacheEntry {
+    uint64_t word{0};
+    uint32_t id{0};
+    uint32_t size{kEmptyShortValueIdCacheSize};
+  };
+
+  std::vector<ShortValueIdCacheEntry> shortValueIdCache_;
+
+  // Cached ids are only valid as long as 'uniqueValues_' keeps assigning the
+  // same ids, so every path that clears or replaces the map must clear the
+  // cache as well.
+  void clearShortValueIdCache() {
+    for (auto& entry : shortValueIdCache_) {
+      entry.size = kEmptyShortValueIdCacheSize;
+    }
+  }
+
   // Single precomputed hash for constant partition keys.
   uint64_t precomputedHash_{0};
 
@@ -675,11 +715,48 @@ inline uint64_t VectorHasher::valueId(StringView value) {
     return number - min_ + 1;
   }
 
+  // Strings of up to 8 bytes are stored inline in 'UniqueValue', so an
+  // inline copy of the value is an exact key of the value id map. Group-by
+  // keys are frequently low cardinality codes and the per-row map lookup
+  // dominates this path, so check an open addressed cache before probing
+  // the map. Entries are never evicted, so a key that collides with others
+  // only lengthens the probe sequence instead of replacing entries of other
+  // keys. Misses, longer strings and high cardinality keys take the regular
+  // path below.
+  ShortValueIdCacheEntry* cacheEntry = nullptr;
+  uint64_t inlineWord = 0;
+  if (size <= sizeof(inlineWord) && !shortValueIdCache_.empty() &&
+      uniqueValues_.size() <= kShortValueIdCacheMaxDistinct) {
+    if (size != 0) {
+      // 'inlineWord' stays zero for the bytes past the end of the string,
+      // matching how 'UniqueValue' stores short strings.
+      memcpy(&inlineWord, data, size);
+    }
+    auto slot = simd::crc32U64(0, inlineWord) & (kShortValueIdCacheSize - 1);
+    for (uint32_t probe = 0; probe < kShortValueIdCacheMaxProbes; ++probe) {
+      auto& entry = shortValueIdCache_[(slot + probe) &
+                                       (kShortValueIdCacheSize - 1)];
+      if (entry.size == size && entry.word == inlineWord) {
+        return entry.id;
+      }
+      if (entry.size == kEmptyShortValueIdCacheSize) {
+        cacheEntry = &entry;
+        break;
+      }
+    }
+  }
+
   UniqueValue unique(data, size);
   unique.setId(uniqueValues_.size() + 1);
   auto pair = uniqueValues_.insert(unique);
   if (!pair.second) {
-    return pair.first->id();
+    const auto id = pair.first->id();
+    if (cacheEntry != nullptr) {
+      cacheEntry->word = inlineWord;
+      cacheEntry->id = id;
+      cacheEntry->size = static_cast<uint32_t>(size);
+    }
+    return id;
   }
   copyStringToLocal(&*pair.first);
   if (!rangeOverflow_) {
@@ -690,7 +767,13 @@ inline uint64_t VectorHasher::valueId(StringView value) {
     }
   }
   if (uniqueValues_.size() >= rangeSize_ || distinctOverflow_) {
+    // The value has no usable id, so do not cache it.
     return kUnmappable;
+  }
+  if (cacheEntry != nullptr) {
+    cacheEntry->word = inlineWord;
+    cacheEntry->id = unique.id();
+    cacheEntry->size = static_cast<uint32_t>(size);
   }
   return unique.id();
 }
