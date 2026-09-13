@@ -398,8 +398,16 @@ std::shared_ptr<WindowPartition> SortWindowBuild::nextPartition() {
   auto partition = folly::Range(
       sortedRows_.data() + partitionStartRows_[currentPartition_],
       partitionSize);
-  return std::make_shared<WindowPartition>(
-      data_.get(), partition, inversedInputChannels_, sortKeyInfo_);
+  // Reuse one WindowPartition across partitions: shapes with a high number
+  // of small partitions otherwise pay a heap allocation and vector copies
+  // for every partition (Q591: 8.85M partitions).
+  if (reusablePartition_ == nullptr) {
+    reusablePartition_ = std::make_shared<WindowPartition>(
+        data_.get(), partition, inversedInputChannels_, sortKeyInfo_);
+  } else {
+    reusablePartition_->resetRows(partition);
+  }
+  return reusablePartition_;
 }
 
 bool SortWindowBuild::hasNextPartition() {

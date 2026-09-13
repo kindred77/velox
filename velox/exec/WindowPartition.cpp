@@ -72,6 +72,12 @@ void WindowPartition::addRows(const std::vector<char*>& rows) {
   partition_ = folly::Range(rows_.data(), rows_.size());
 }
 
+void WindowPartition::resetRows(const folly::Range<char**>& rows) {
+  VELOX_CHECK(complete_ && !partial_);
+  VELOX_CHECK(!rows.empty());
+  partition_ = rows;
+}
+
 void WindowPartition::eraseRows(vector_size_t numRows) {
   checkPartial();
   VELOX_CHECK_GE(data_->numRows(), numRows);

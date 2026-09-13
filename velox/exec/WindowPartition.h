@@ -90,6 +90,12 @@ class WindowPartition {
     complete_ = true;
   }
 
+  /// Resets this complete partition to a new set of rows backed by the same
+  /// RowContainer. Enables reusing one WindowPartition object across
+  /// partitions instead of constructing one per partition (shapes with a high
+  /// number of small partitions).
+  void resetRows(const folly::Range<char**>& rows);
+
   /// Copies the values at 'columnIndex' into 'result' (starting at
   /// 'resultOffset') for the absolute partition row positions in the
   /// 'rowNumbers' array. Negative row positions are copied as nulls.

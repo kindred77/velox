@@ -554,24 +554,17 @@ void Window::computePeerAndFrameBuffers(
   auto* rawPeerStarts = peerStartBuffer_->asMutable<vector_size_t>();
   auto* rawPeerEnds = peerEndBuffer_->asMutable<vector_size_t>();
 
-  std::vector<vector_size_t*> rawFrameStarts;
-  std::vector<vector_size_t*> rawFrameEnds;
-  rawFrameStarts.reserve(numFuncs);
-  rawFrameEnds.reserve(numFuncs);
-  for (auto i = 0; i < numFuncs; ++i) {
-    frameStartBuffers_[i]->setSize(bufferSize);
-    frameEndBuffers_[i]->setSize(bufferSize);
-
-    auto* rawFrameStart = frameStartBuffers_[i]->asMutable<vector_size_t>();
-    auto* rawFrameEnd = frameEndBuffers_[i]->asMutable<vector_size_t>();
-    rawFrameStarts.push_back(rawFrameStart);
-    rawFrameEnds.push_back(rawFrameEnd);
-  }
-
   std::tie(peerStartRow_, peerEndRow_) = currentPartition_->computePeerBuffers(
       startRow, endRow, peerStartRow_, peerEndRow_, rawPeerStarts, rawPeerEnds);
 
   for (auto i = 0; i < numFuncs; ++i) {
+    // Frame buffer pointers are only needed within this loop; hoisting them
+    // into local vectors allocated once per partition for no benefit.
+    frameStartBuffers_[i]->setSize(bufferSize);
+    frameEndBuffers_[i]->setSize(bufferSize);
+    auto* rawFrameStart = frameStartBuffers_[i]->asMutable<vector_size_t>();
+    auto* rawFrameEnd = frameEndBuffers_[i]->asMutable<vector_size_t>();
+
     const auto& windowFrame = windowFrames_[i];
     // Default all rows to have validFrames. The invalidity of frames is only
     // computed for k rows/range frames at a later point.
@@ -583,7 +576,7 @@ void Window::computePeerAndFrameBuffers(
         numRows,
         rawPeerStarts,
         rawPeerEnds,
-        rawFrameStarts[i],
+        rawFrameStart,
         validFrames_[i]);
     updateFrameBounds(
         windowFrame,
@@ -592,7 +585,7 @@ void Window::computePeerAndFrameBuffers(
         numRows,
         rawPeerStarts,
         rawPeerEnds,
-        rawFrameEnds[i],
+        rawFrameEnd,
         validFrames_[i]);
     if (windowFrames_[i].start || windowFrames_[i].end) {
       // k preceding and k following bounds can be problematic. They can go over
@@ -604,8 +597,8 @@ void Window::computePeerAndFrameBuffers(
       computeValidFrames(
           currentPartition_->numRows() - 1,
           numRows,
-          rawFrameStarts[i],
-          rawFrameEnds[i],
+          rawFrameStart,
+          rawFrameEnd,
           validFrames_[i]);
     }
   }

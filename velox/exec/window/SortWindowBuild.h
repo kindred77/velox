@@ -126,6 +126,11 @@ class SortWindowBuild : public WindowBuild {
   // during resetPartition.
   vector_size_t currentPartition_ = -1;
 
+  // Reused WindowPartition instance for the partition currently being
+  // output. Avoids per-partition construction and allocation for shapes
+  // with many small partitions.
+  std::shared_ptr<WindowPartition> reusablePartition_;
+
   // Spiller for contents of the 'data_'.
   std::unique_ptr<SortInputSpiller> spiller_;
 
