@@ -617,26 +617,35 @@ class VectorHasher {
   DecodedVector decoded_;
   raw_vector<uint64_t> cachedHashes_;
 
-  // Size of the short string value id cache, a power of two.
-  static constexpr uint32_t kShortValueIdCacheSize = 128;
+  // Size of the short string value id cache, a power of two. Kept at twice
+  // the distinct limit so the open addressed table stays at most half full.
+  static constexpr uint32_t kShortValueIdCacheSize = 256;
 
   // The cache is only consulted while the number of mapped values stays at
   // or below this limit, so that high cardinality keys keep the plain map
-  // lookup behavior and the cache stays at most half full.
-  static constexpr uint32_t kShortValueIdCacheMaxDistinct = 64;
+  // lookup behavior.
+  static constexpr uint32_t kShortValueIdCacheMaxDistinct = 128;
 
   // Longest probe sequence tried before giving up on caching a value.
   static constexpr uint32_t kShortValueIdCacheMaxProbes = 8;
 
-  // Value id of a string of up to 8 bytes, which 'UniqueValue' stores
-  // inline, so that comparing the inline word and the size is an exact key
+  // Longest string kept in the cache. 24 bytes covers the low cardinality
+  // group-by codes this path targets (channel/region/province/category and
+  // filtered city names; the longest city name is 24 bytes) while keeping an
+  // entry at 32 bytes and the whole table at 8KB.
+  static constexpr uint32_t kShortValueIdCacheInlineBytes = 24;
+
+  // Value id of a string of up to 'kShortValueIdCacheInlineBytes', copied
+  // inline so that comparing the copied words and the size is an exact key
   // comparison. 'kEmptyShortValueIdCacheSize' marks an unused entry; cached
   // strings never reach that size.
   static constexpr uint32_t kEmptyShortValueIdCacheSize =
       std::numeric_limits<uint32_t>::max();
 
   struct ShortValueIdCacheEntry {
-    uint64_t word{0};
+    uint64_t word0{0};
+    uint64_t word1{0};
+    uint64_t word2{0};
     uint32_t id{0};
     uint32_t size{kEmptyShortValueIdCacheSize};
   };
@@ -715,28 +724,54 @@ inline uint64_t VectorHasher::valueId(StringView value) {
     return number - min_ + 1;
   }
 
-  // Strings of up to 8 bytes are stored inline in 'UniqueValue', so an
-  // inline copy of the value is an exact key of the value id map. Group-by
-  // keys are frequently low cardinality codes and the per-row map lookup
-  // dominates this path, so check an open addressed cache before probing
-  // the map. Entries are never evicted, so a key that collides with others
-  // only lengthens the probe sequence instead of replacing entries of other
-  // keys. Misses, longer strings and high cardinality keys take the regular
+  // Strings of up to 'kShortValueIdCacheInlineBytes' are copied inline, so
+  // comparing the copied words and the size is an exact key of the value id
+  // map. Group-by keys are frequently low cardinality codes and the per-row
+  // map lookup dominates this path, so check an open addressed cache before
+  // probing the map. Entries are never evicted, so a key that collides with
+  // others only lengthens the probe sequence instead of replacing entries of
+  // other keys. Longer strings and high cardinality keys take the regular
   // path below.
   ShortValueIdCacheEntry* cacheEntry = nullptr;
-  uint64_t inlineWord = 0;
-  if (size <= sizeof(inlineWord) && !shortValueIdCache_.empty() &&
+  uint64_t word0 = 0;
+  uint64_t word1 = 0;
+  uint64_t word2 = 0;
+  if (size <= kShortValueIdCacheInlineBytes && !shortValueIdCache_.empty() &&
       uniqueValues_.size() <= kShortValueIdCacheMaxDistinct) {
-    if (size != 0) {
-      // 'inlineWord' stays zero for the bytes past the end of the string,
-      // matching how 'UniqueValue' stores short strings.
-      memcpy(&inlineWord, data, size);
+    const auto sizeBytes = static_cast<size_t>(size);
+    if (sizeBytes != 0) {
+      // The words stay zero for the bytes past the end of the string, so
+      // size + words form an exact key.
+      if (sizeBytes <= sizeof(word0)) {
+        memcpy(&word0, data, sizeBytes);
+      } else {
+        memcpy(&word0, data, sizeof(word0));
+        const auto rest = sizeBytes - sizeof(word0);
+        if (rest <= sizeof(word1)) {
+          memcpy(&word1, data + sizeof(word0), rest);
+        } else {
+          memcpy(&word1, data + sizeof(word0), sizeof(word1));
+          memcpy(
+              &word2,
+              data + sizeof(word0) + sizeof(word1),
+              rest - sizeof(word1));
+        }
+      }
     }
-    auto slot = simd::crc32U64(0, inlineWord) & (kShortValueIdCacheSize - 1);
+    // Keys of at most 8 bytes hash and compare a single word, keeping the
+    // previous per-row cost for the already covered short codes; longer keys
+    // use all words.
+    const bool shortKey = sizeBytes <= sizeof(word0);
+    const auto hash = shortKey
+        ? simd::crc32U64(0, word0)
+        : simd::crc32U64(
+              simd::crc32U64(simd::crc32U64(0, word0), word1), word2);
+    auto slot = hash & (kShortValueIdCacheSize - 1);
     for (uint32_t probe = 0; probe < kShortValueIdCacheMaxProbes; ++probe) {
       auto& entry = shortValueIdCache_[(slot + probe) &
                                        (kShortValueIdCacheSize - 1)];
-      if (entry.size == size && entry.word == inlineWord) {
+      if (entry.size == size && entry.word0 == word0 &&
+          (shortKey || (entry.word1 == word1 && entry.word2 == word2))) {
         return entry.id;
       }
       if (entry.size == kEmptyShortValueIdCacheSize) {
@@ -752,7 +787,9 @@ inline uint64_t VectorHasher::valueId(StringView value) {
   if (!pair.second) {
     const auto id = pair.first->id();
     if (cacheEntry != nullptr) {
-      cacheEntry->word = inlineWord;
+      cacheEntry->word0 = word0;
+      cacheEntry->word1 = word1;
+      cacheEntry->word2 = word2;
       cacheEntry->id = id;
       cacheEntry->size = static_cast<uint32_t>(size);
     }
@@ -771,7 +808,9 @@ inline uint64_t VectorHasher::valueId(StringView value) {
     return kUnmappable;
   }
   if (cacheEntry != nullptr) {
-    cacheEntry->word = inlineWord;
+    cacheEntry->word0 = word0;
+    cacheEntry->word1 = word1;
+    cacheEntry->word2 = word2;
     cacheEntry->id = unique.id();
     cacheEntry->size = static_cast<uint32_t>(size);
   }
