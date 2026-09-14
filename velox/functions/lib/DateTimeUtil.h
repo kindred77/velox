@@ -219,6 +219,16 @@ int64_t diffDate(
   if (fromDate == toDate) {
     return 0;
   }
+  // DATE values are day counts, so the fixed-ratio units day and week need no
+  // timestamp/millisecond round trip; the conversion below dominates
+  // 'date - date' projections. Integer division truncates towards zero, which
+  // matches the 'sign * days / 7' computation in 'diffTimestamp'.
+  if (unit == DateTimeUnit::kDay) {
+    return static_cast<int64_t>(toDate) - fromDate;
+  }
+  if (unit == DateTimeUnit::kWeek) {
+    return (static_cast<int64_t>(toDate) - fromDate) / 7;
+  }
   return diffTimestamp(
       unit,
       Timestamp((int64_t)fromDate * util::kSecsPerDay, 0),
