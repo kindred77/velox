@@ -16,6 +16,8 @@
 
 #include "velox/exec/window/PartitionStreamingWindowBuild.h"
 
+#include <algorithm>
+
 namespace facebook::velox::exec::window {
 
 namespace {
@@ -70,7 +72,7 @@ PartitionStreamingWindowBuild::PartitionStreamingWindowBuild(
 }
 
 void PartitionStreamingWindowBuild::buildNextPartition() {
-  partitionStartRows_.push_back(sortedRows_.size());
+  partitionStartRows_.push_back(sortedRowsBase_ + sortedRows_.size());
   sortedRows_.insert(sortedRows_.end(), inputRows_.begin(), inputRows_.end());
   inputRows_.clear();
 }
@@ -110,7 +112,34 @@ void PartitionStreamingWindowBuild::noMoreInput() {
   previousPartitionKeyValues_.reset();
 
   // Help for last partition related calculations.
-  partitionStartRows_.push_back(sortedRows_.size());
+  partitionStartRows_.push_back(sortedRowsBase_ + sortedRows_.size());
+}
+
+void PartitionStreamingWindowBuild::compactConsumedRows(size_t numRows) {
+  VELOX_DCHECK_LE(numRows, sortedRows_.size());
+  data_->eraseRows(folly::Range<char**>(sortedRows_.data(), numRows));
+  sortedRows_.erase(sortedRows_.cbegin(), sortedRows_.cbegin() + numRows);
+  sortedRowsBase_ += numRows;
+}
+
+size_t PartitionStreamingWindowBuild::compactionRowThreshold() {
+  if (compactionRowThreshold_ != 0) {
+    return compactionRowThreshold_;
+  }
+  // Keep the rows of consumed partitions for at most ~1MB before freeing
+  // them. Erasing (and reallocating) per partition costs O(pending rows) each
+  // time, which is quadratic for the many-small-partitions shape this build
+  // exists to serve; batching keeps that bookkeeping O(1) per partition while
+  // still bounding the memory held for processed partitions. The estimate is
+  // taken on first use (not in the constructor) because it is only meaningful
+  // once rows were materialized; an empty container falls back to the fixed
+  // row size, which is always available.
+  const auto estimatedRowSize =
+      data_->estimateRowSize().value_or(data_->fixedRowSize());
+  const auto rowSize = std::max<int64_t>(1, estimatedRowSize);
+  compactionRowThreshold_ =
+      std::max<size_t>(1, (1ULL << 20) / static_cast<size_t>(rowSize));
+  return compactionRowThreshold_;
 }
 
 std::shared_ptr<WindowPartition>
@@ -124,29 +153,29 @@ PartitionStreamingWindowBuild::nextPartition() {
       partitionStartRows_.size() - 2,
       "All window partitions consumed");
 
-  // Erase previous partition.
-  if (currentPartition_ > 0) {
-    const auto numPreviousPartitionRows =
-        partitionStartRows_[currentPartition_];
-    data_->eraseRows(
-        folly::Range<char**>(sortedRows_.data(), numPreviousPartitionRows));
-    sortedRows_.erase(
-        sortedRows_.cbegin(), sortedRows_.cbegin() + numPreviousPartitionRows);
-    sortedRows_.shrink_to_fit();
-    for (int i = currentPartition_; i < partitionStartRows_.size(); ++i) {
-      partitionStartRows_[i] =
-          partitionStartRows_[i] - numPreviousPartitionRows;
-    }
+  // Rows of the partitions consumed so far are still in the RowContainer:
+  // free them once enough accumulated instead of on every partition. The
+  // index is absolute, so no bookkeeping per partition is needed.
+  const auto numConsumedRows =
+      partitionStartRows_[currentPartition_] - sortedRowsBase_;
+  if (numConsumedRows >= compactionRowThreshold()) {
+    compactConsumedRows(numConsumedRows);
   }
 
   const auto partitionSize = partitionStartRows_[currentPartition_ + 1] -
       partitionStartRows_[currentPartition_];
   const auto partition = folly::Range(
-      sortedRows_.data() + partitionStartRows_[currentPartition_],
+      sortedRows_.data() + partitionStartRows_[currentPartition_] -
+          sortedRowsBase_,
       partitionSize);
 
-  return std::make_shared<WindowPartition>(
-      data_.get(), partition, inversedInputChannels_, sortKeyInfo_);
+  if (reusablePartition_ == nullptr) {
+    reusablePartition_ = std::make_shared<WindowPartition>(
+        data_.get(), partition, inversedInputChannels_, sortKeyInfo_);
+  } else {
+    reusablePartition_->resetRows(partition);
+  }
+  return reusablePartition_;
 }
 
 bool PartitionStreamingWindowBuild::hasNextPartition() {

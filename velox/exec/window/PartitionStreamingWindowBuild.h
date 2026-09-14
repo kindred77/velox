@@ -59,17 +59,29 @@ class PartitionStreamingWindowBuild : public WindowBuild {
  private:
   void buildNextPartition();
 
+  // Frees the rows of all partitions consumed so far and drops them from
+  // 'sortedRows_'. Only invoked once a bounded amount of consumed rows
+  // accumulated, see 'compactionRowThreshold()'.
+  void compactConsumedRows(size_t numRows);
+
+  // Number of consumed rows that triggers 'compactConsumedRows'. Computed on
+  // first use because the RowContainer row size estimate is only meaningful
+  // once rows were materialized.
+  size_t compactionRowThreshold();
+
   // Vector of pointers to each input row in the data_ RowContainer.
-  // Rows are erased from data_ when they are output from the
-  // Window operator.
+  // Rows of consumed partitions are erased from data_ in batches (see
+  // 'compactConsumedRows'); 'sortedRowsBase_' is the absolute row index of
+  // 'sortedRows_.front()'.
   std::vector<char*> sortedRows_;
 
   // Holds input rows within the current partition.
   std::vector<char*> inputRows_;
 
-  // Indices of  the start row (in sortedRows_) of each partition in
-  // the RowContainer data_. This auxiliary structure helps demarcate
-  // partitions.
+  // Absolute indices of the start row of each partition in the RowContainer
+  // data_ ('sortedRowsBase_' + position in 'sortedRows_'). The last entry is
+  // the end of the last partition. Indices are never rewritten, so consuming
+  // a partition costs O(1) instead of O(pending partitions).
   std::vector<vector_size_t> partitionStartRows_;
 
   // Partition-key values of the last row of the most recent input vector.
@@ -86,6 +98,19 @@ class PartitionStreamingWindowBuild : public WindowBuild {
   // Current partition being output. Used to construct WindowPartitions
   // during resetPartition.
   vector_size_t currentPartition_ = -1;
+
+  // First row of 'sortedRows_' in absolute (partitionStartRows_) coordinates.
+  size_t sortedRowsBase_ = 0;
+
+  // Number of consumed rows that triggers freeing them from the RowContainer.
+  // Bounds the memory held for already processed partitions while keeping the
+  // per-partition bookkeeping O(1). Zero until computed on first use.
+  size_t compactionRowThreshold_ = 0;
+
+  // Reused WindowPartition instance for the partition currently being output.
+  // Avoids per-partition construction and allocation for shapes with many
+  // small partitions.
+  std::shared_ptr<WindowPartition> reusablePartition_;
 };
 
 } // namespace facebook::velox::exec::window
