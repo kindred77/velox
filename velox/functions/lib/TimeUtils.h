@@ -23,6 +23,7 @@
 #include "velox/external/date/iso_week.h"
 #include "velox/functions/Macros.h"
 #include "velox/functions/lib/DateTimeFormatter.h"
+#include "velox/type/FastDate.h"
 #include "velox/type/tz/TimeZoneMap.h"
 
 namespace facebook::velox::functions {
@@ -69,6 +70,35 @@ std::tm getDateTime(Timestamp timestamp, const tz::TimeZone* timeZone) {
 // days is the number of days since Epoch.
 FOLLY_ALWAYS_INLINE
 std::tm getDateTime(int32_t days) {
+  // DATE parts only need the calendar fields, so derive them directly from the
+  // epoch day count. The timestamp route below scales back to seconds and calls
+  // out-of-line 'Timestamp::epochToCalendarUtc' to re-derive the same fields,
+  // which dominates projections such as 'extract(year from date_col)'.
+  if (FOLLY_LIKELY(
+          days >= fast_date::kRataDieMin && days <= fast_date::kRataDieMax)) {
+    const auto ymd = daysToYmd(days);
+    // 'ymdToDays' is only exact strictly inside the boundary years, see
+    // FastDate.h; the range check below keeps the fallback for the outermost
+    // years (unreachable for practical DATE values).
+    if (FOLLY_LIKELY(
+            ymd.year > fast_date::kYearMin &&
+            ymd.year < fast_date::kYearMax)) {
+      std::tm dateTime;
+      dateTime.tm_year = ymd.year - 1900;
+      dateTime.tm_mon = static_cast<int>(ymd.month) - 1;
+      dateTime.tm_mday = static_cast<int>(ymd.day);
+      dateTime.tm_yday = days - ymdToDays(ymd.year, 1, 1);
+      dateTime.tm_wday = (4 + days) % 7;
+      if (dateTime.tm_wday < 0) {
+        dateTime.tm_wday += 7;
+      }
+      dateTime.tm_hour = 0;
+      dateTime.tm_min = 0;
+      dateTime.tm_sec = 0;
+      dateTime.tm_isdst = 0;
+      return dateTime;
+    }
+  }
   int64_t seconds = days * kSecondsInDay;
   std::tm dateTime;
   VELOX_USER_CHECK(
