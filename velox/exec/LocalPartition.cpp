@@ -27,6 +27,29 @@ void notify(std::vector<ContinuePromise>& promises) {
     promise.setValue();
   }
 }
+
+/// Local exchange batching merges the per-output-partition batches produced
+/// from a single input batch, removing the batch-count fan-out of a hash
+/// repartition. It only pays off for consumers charged per batch (hash
+/// probe/build, aggregation), which the planner marks with
+/// 'coalesceSmallBatches'; gathers pass data through a single queue and keep
+/// the upstream behaviour. Pipelines that must flush eagerly for a small limit
+/// never buffer.
+bool usePartitionBuffer(
+    const core::LocalPartitionNode& planNode,
+    size_t numPartitions,
+    bool eagerFlush,
+    const core::QueryConfig& queryConfig) {
+  if (eagerFlush) {
+    return false;
+  }
+  if (planNode.type() == core::LocalPartitionNode::Type::kRepartition &&
+      planNode.coalesceSmallBatches()) {
+    return true;
+  }
+  return numPartitions >=
+      queryConfig.minLocalExchangePartitionCountToUsePartitionBuffer();
+}
 } // namespace
 
 bool LocalExchangeMemoryManager::increaseMemoryUsage(
@@ -344,12 +367,10 @@ LocalPartition::LocalPartition(
                                     numPartitions_,
                                     /*localExchange=*/true)),
       singlePartitionBufferSize_{
-          (numPartitions_ <
-               ctx->queryConfig()
-                   .minLocalExchangePartitionCountToUsePartitionBuffer() ||
-           eagerFlush)
-              ? 0
-              : ctx->queryConfig().maxLocalExchangePartitionBufferSize()},
+          usePartitionBuffer(
+              *planNode, numPartitions_, eagerFlush, ctx->queryConfig())
+              ? ctx->queryConfig().maxLocalExchangePartitionBufferSize()
+              : 0},
       partitionBufferPreserveEncoding_{
           ctx->queryConfig().localExchangePartitionBufferPreserveEncoding()} {
   VELOX_CHECK(numPartitions_ == 1 || partitionFunction_ != nullptr);

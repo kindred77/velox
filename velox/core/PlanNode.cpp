@@ -3426,12 +3426,16 @@ void LocalPartitionNode::addDetails(std::stringstream& stream) const {
   if (scaleWriter_) {
     stream << " scaleWriter";
   }
+  if (coalesceSmallBatches_) {
+    stream << " coalesceSmallBatches";
+  }
 }
 
 folly::dynamic LocalPartitionNode::serialize() const {
   auto obj = PlanNode::serialize();
   obj["type"] = toName(type_);
   obj["scaleWriter"] = scaleWriter_;
+  obj["coalesceSmallBatches"] = coalesceSmallBatches_;
   obj["partitionFunctionSpec"] = partitionFunctionSpec_->serialize();
   return obj;
 }
@@ -3452,7 +3456,8 @@ PlanNodePtr LocalPartitionNode::create(
       obj["scaleWriter"].asBool(),
       ISerializable::deserialize<PartitionFunctionSpec>(
           obj["partitionFunctionSpec"], context),
-      deserializeSources(obj, context));
+      deserializeSources(obj, context),
+      obj.getDefault("coalesceSmallBatches", false).asBool());
 }
 
 namespace {

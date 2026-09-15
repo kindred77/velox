@@ -2643,16 +2643,24 @@ class LocalPartitionNode : public PlanNode {
 
   /// If 'scaleWriter' is true, the local partition is used to scale the table
   /// writer prcessing.
+  /// If 'coalesceSmallBatches' is true, the exchange may merge the small
+  /// per-partition batches it produces from every input batch into fewer,
+  /// larger output batches. This is an execution hint for consumers that pay a
+  /// fixed cost per input batch (hash probe/build, aggregation): it does not
+  /// change partitioning semantics, only the batching of the data handed to
+  /// the consumer. It is ignored for gathers, which pass data through.
   LocalPartitionNode(
       const PlanNodeId& id,
       Type type,
       bool scaleWriter,
       PartitionFunctionSpecPtr partitionFunctionSpec,
-      std::vector<PlanNodePtr> sources)
+      std::vector<PlanNodePtr> sources,
+      bool coalesceSmallBatches = false)
       : PlanNode(id),
         type_{type},
         scaleWriter_(scaleWriter),
         sources_{std::move(sources)},
+        coalesceSmallBatches_{coalesceSmallBatches},
         partitionFunctionSpec_{std::move(partitionFunctionSpec)} {
     VELOX_USER_CHECK_GT(
         sources_.size(),
@@ -2678,6 +2686,7 @@ class LocalPartitionNode : public PlanNode {
       id_ = other.id();
       type_ = other.type();
       scaleWriter_ = other.scaleWriter();
+      coalesceSmallBatches_ = other.coalesceSmallBatches();
       partitionFunctionSpec_ = other.partitionFunctionSpec_;
       sources_ = other.sources();
     }
@@ -2707,6 +2716,11 @@ class LocalPartitionNode : public PlanNode {
       return *this;
     }
 
+    Builder& coalesceSmallBatches(bool coalesceSmallBatches) {
+      coalesceSmallBatches_ = coalesceSmallBatches;
+      return *this;
+    }
+
     std::shared_ptr<LocalPartitionNode> build() const {
       VELOX_USER_CHECK(id_.has_value(), "LocalPartitionNode id is not set");
       VELOX_USER_CHECK(type_.has_value(), "LocalPartitionNode type is not set");
@@ -2724,13 +2738,15 @@ class LocalPartitionNode : public PlanNode {
           type_.value(),
           scaleWriter_.value(),
           partitionFunctionSpec_.value(),
-          sources_.value());
+          sources_.value(),
+          coalesceSmallBatches_);
     }
 
    private:
     std::optional<PlanNodeId> id_;
     std::optional<LocalPartitionNode::Type> type_;
     std::optional<bool> scaleWriter_;
+    bool coalesceSmallBatches_{false};
     std::optional<PartitionFunctionSpecPtr> partitionFunctionSpec_;
     std::optional<std::vector<PlanNodePtr>> sources_;
   };
@@ -2749,6 +2765,12 @@ class LocalPartitionNode : public PlanNode {
   /// Returns true if this is for table writer scaling.
   bool scaleWriter() const {
     return scaleWriter_;
+  }
+
+  /// Returns true if the exchange may merge the small per-partition batches
+  /// produced from each input batch into fewer output batches.
+  bool coalesceSmallBatches() const {
+    return coalesceSmallBatches_;
   }
 
   bool requiresSingleThread() const override {
@@ -2792,6 +2814,7 @@ class LocalPartitionNode : public PlanNode {
   const Type type_;
   const bool scaleWriter_;
   const std::vector<PlanNodePtr> sources_;
+  const bool coalesceSmallBatches_;
   const PartitionFunctionSpecPtr partitionFunctionSpec_;
 };
 
