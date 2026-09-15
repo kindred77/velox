@@ -16,11 +16,18 @@
 
 #pragma once
 
+#include <optional>
+
 #include "velox/dwio/common/Statistics.h"
 #include "velox/dwio/common/compression/Compression.h"
 #include "velox/dwio/parquet/thrift/ParquetThrift.h"
 
 namespace facebook::velox::parquet {
+
+struct PageIndexLocation {
+  int64_t offset;
+  int32_t length;
+};
 
 /// ColumnChunkMetaDataPtr is a proxy around pointer to thrift::ColumnChunk.
 class ColumnChunkMetaDataPtr {
@@ -37,6 +44,11 @@ class ColumnChunkMetaDataPtr {
 
   /// Check the presence of the dictionary page offset in ColumnChunk metadata.
   bool hasDictionaryPageOffset() const;
+
+  /// Returns the serialized page-index locations when both offset and length
+  /// are structurally valid. File-bound checks remain the reader's job.
+  std::optional<PageIndexLocation> columnIndexLocation() const;
+  std::optional<PageIndexLocation> offsetIndexLocation() const;
 
   /// Return the ColumnChunk statistics.
   std::unique_ptr<dwio::common::ColumnStatistics> getColumnStatistics(

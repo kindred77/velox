@@ -380,6 +380,28 @@ bool ColumnChunkMetaDataPtr::hasDictionaryPageOffset() const {
           .has_value();
 }
 
+std::optional<PageIndexLocation>
+ColumnChunkMetaDataPtr::columnIndexLocation() const {
+  const auto* chunk = thriftColumnChunkPtr(ptr_);
+  if (!chunk->column_index_offset() || !chunk->column_index_length() ||
+      *chunk->column_index_offset() < 0 || *chunk->column_index_length() <= 0) {
+    return std::nullopt;
+  }
+  return PageIndexLocation{
+      *chunk->column_index_offset(), *chunk->column_index_length()};
+}
+
+std::optional<PageIndexLocation>
+ColumnChunkMetaDataPtr::offsetIndexLocation() const {
+  const auto* chunk = thriftColumnChunkPtr(ptr_);
+  if (!chunk->offset_index_offset() || !chunk->offset_index_length() ||
+      *chunk->offset_index_offset() < 0 || *chunk->offset_index_length() <= 0) {
+    return std::nullopt;
+  }
+  return PageIndexLocation{
+      *chunk->offset_index_offset(), *chunk->offset_index_length()};
+}
+
 std::unique_ptr<dwio::common::ColumnStatistics>
 ColumnChunkMetaDataPtr::getColumnStatistics(
     const TypePtr type,

@@ -183,6 +183,11 @@ std::shared_ptr<WriterProperties> getArrowParquetWriterOptions(
   } else {
     properties = properties->disableDictionary();
   }
+  if (parquetOptions.enablePageIndex.value_or(false)) {
+    properties = properties->enableWritePageIndex();
+  } else {
+    properties = properties->disableWritePageIndex();
+  }
   properties = properties->compression(getArrowParquetCompression(
       options.compressionKind.value_or(common::CompressionKind_NONE)));
   for (const auto& columnCompressionValues :
