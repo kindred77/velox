@@ -203,6 +203,10 @@ class ReaderBase {
     return options_;
   }
 
+  bool useOffsetIndexForPageSeek() const {
+    return parquetReaderOptions_.useOffsetIndexForPageSeek;
+  }
+
   const std::shared_ptr<const RowType>& schema() const {
     return schema_;
   }
@@ -1428,7 +1432,8 @@ class ParquetRowReader::Impl {
         columnReaderStats_,
         readerBase_->fileMetaData(),
         readerBase->sessionTimezone(),
-        options_.timestampPrecision());
+        options_.timestampPrecision(),
+        readerBase->useOffsetIndexForPageSeek());
     requestedType_ = options_.requestedType() ? options_.requestedType()
                                               : readerBase_->schema();
     columnReader_ = ParquetColumnReader::build(

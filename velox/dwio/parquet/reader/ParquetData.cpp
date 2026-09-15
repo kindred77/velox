@@ -36,7 +36,12 @@ std::unique_ptr<dwio::common::FormatData> ParquetParams::toFormatData(
     const std::shared_ptr<const dwio::common::TypeWithId>& type,
     const common::ScanSpec& /*scanSpec*/) {
   return std::make_unique<ParquetData>(
-      type, metaData_, pool(), runtimeStatistics(), sessionTimezone_);
+      type,
+      metaData_,
+      pool(),
+      runtimeStatistics(),
+      sessionTimezone_,
+      useOffsetIndexForPageSeek_);
 }
 
 void ParquetData::filterRowGroups(
@@ -116,6 +121,7 @@ void ParquetData::enqueueRowGroup(
   auto chunk = fileMetaDataPtr_.rowGroup(index).columnChunk(type_->column());
   streams_.resize(fileMetaDataPtr_.numRowGroups());
   directChunks_.resize(fileMetaDataPtr_.numRowGroups());
+  pageLocations_.resize(fileMetaDataPtr_.numRowGroups());
   VELOX_CHECK(
       chunk.hasMetadata(),
       "ColumnMetaData does not exist for schema Id ",
@@ -133,6 +139,89 @@ void ParquetData::enqueueRowGroup(
       ? chunk.totalUncompressedSize()
       : chunk.totalCompressedSize();
 
+  if (useOffsetIndexForPageSeek_ && maxRepeat_ == 0) {
+    const auto location = chunk.offsetIndexLocation();
+    if (location) {
+      const auto fileLength = input.getInputStream()->getLength();
+      VELOX_CHECK_LE(
+          static_cast<uint64_t>(location->offset),
+          fileLength,
+          "Parquet OffsetIndex starts beyond the immutable file");
+      VELOX_CHECK_LE(
+          static_cast<uint64_t>(location->length),
+          fileLength - static_cast<uint64_t>(location->offset),
+          "Parquet OffsetIndex exceeds the immutable file");
+      std::vector<char> encoded(static_cast<size_t>(location->length));
+      auto indexStream = input.read(
+          static_cast<uint64_t>(location->offset),
+          static_cast<uint64_t>(location->length),
+          dwio::common::LogType::FOOTER);
+      indexStream->readFully(encoded.data(), encoded.size());
+      thrift::OffsetIndex offsetIndex;
+      thrift::deserialize(
+          &offsetIndex, std::string_view(encoded.data(), encoded.size()));
+      const auto& thriftLocations = *offsetIndex.page_locations();
+      VELOX_CHECK(!thriftLocations.empty(), "Parquet OffsetIndex is empty");
+      std::vector<PageReader::DataPageLocation> pages;
+      pages.reserve(thriftLocations.size());
+      VELOX_CHECK_LE(
+          chunkReadOffset,
+          fileLength,
+          "Parquet column chunk starts beyond the immutable file");
+      VELOX_CHECK_LE(
+          readSize,
+          fileLength - chunkReadOffset,
+          "Parquet column chunk exceeds the immutable file");
+      const auto chunkEnd = chunkReadOffset + readSize;
+      uint64_t previousEnd = 0;
+      int64_t previousFirstRow = -1;
+      for (const auto& page : thriftLocations) {
+        const auto offset = *page.offset();
+        const auto size = *page.compressed_page_size();
+        const auto firstRow = *page.first_row_index();
+        VELOX_CHECK_GE(offset, 0, "Parquet data page offset is negative");
+        VELOX_CHECK_GT(size, 0, "Parquet data page size is not positive");
+        VELOX_CHECK_GE(firstRow, 0, "Parquet data page row is negative");
+        const auto unsignedOffset = static_cast<uint64_t>(offset);
+        const auto unsignedSize = static_cast<uint64_t>(size);
+        VELOX_CHECK_GE(
+            unsignedOffset,
+            static_cast<uint64_t>(chunk.dataPageOffset()),
+            "Parquet data page precedes its column chunk");
+        VELOX_CHECK_LE(
+            unsignedOffset,
+            chunkEnd,
+            "Parquet data page starts beyond its column chunk");
+        VELOX_CHECK_LE(
+            unsignedSize,
+            chunkEnd - unsignedOffset,
+            "Parquet data page exceeds its column chunk");
+        VELOX_CHECK(
+            pages.empty() ||
+                (unsignedOffset >= previousEnd && firstRow > previousFirstRow),
+            "Parquet OffsetIndex page order is invalid");
+        pages.push_back(
+            {unsignedOffset - chunkReadOffset,
+             static_cast<uint32_t>(unsignedSize),
+             firstRow});
+        previousEnd = unsignedOffset + unsignedSize;
+        previousFirstRow = firstRow;
+      }
+      VELOX_CHECK_EQ(
+          pages.front().firstRowIndex,
+          0,
+          "Parquet OffsetIndex does not start at row zero");
+      VELOX_CHECK_LT(
+          pages.back().firstRowIndex,
+          fileMetaDataPtr_.rowGroup(index).numRows(),
+          "Parquet OffsetIndex starts beyond its row group");
+      directInput_ = input.getInputStream();
+      directChunks_[index] = std::make_pair(chunkReadOffset, readSize);
+      pageLocations_[index] = std::move(pages);
+      return;
+    }
+  }
+
   if (readSize > 0 && readSize <= kDirectChunkMaxBytes) {
     // E0-B: skip the cache enqueue; the chunk is read directly into a reused
     // buffer on seekToRowGroup(). Keeps the chunk metadata in the footer (T3
@@ -148,17 +237,45 @@ void ParquetData::enqueueRowGroup(
 
 dwio::common::PositionProvider ParquetData::seekToRowGroup(int64_t index) {
   static std::vector<uint64_t> empty;
-  VELOX_CHECK_LT(index, streams_.size());
-  if (directChunks_[index].has_value()) {
+  VELOX_CHECK_GE(index, 0, "Parquet row-group index is negative");
+  const auto groupIndex = static_cast<size_t>(index);
+  VELOX_CHECK_LT(
+      groupIndex,
+      streams_.size(),
+      "Parquet row-group index exceeds the file metadata");
+  if (pageLocations_[groupIndex].has_value()) {
+    reader_.reset();
+    const auto [chunkOffset, chunkSize] = *directChunks_[groupIndex];
+    auto metadata = fileMetaDataPtr_.rowGroup(static_cast<int>(index))
+                        .columnChunk(type_->column());
+    auto stream = std::make_unique<dwio::common::SeekableFileInputStream>(
+        directInput_,
+        chunkOffset,
+        chunkSize,
+        pool_,
+        dwio::common::LogType::FILE);
+    reader_ = std::make_unique<PageReader>(
+        std::move(stream),
+        pool_,
+        type_,
+        metadata.compression(),
+        metadata.totalCompressedSize(),
+        stats_,
+        sessionTimezone_,
+        &bufferCache_,
+        *pageLocations_[groupIndex]);
+    return dwio::common::PositionProvider(empty);
+  }
+  if (directChunks_[groupIndex].has_value()) {
     // E0-B: read the whole chunk with one pread into the reused buffer and
     // serve the pages from memory. The old reader is destroyed first so its
     // shared buffers are returned to bufferCache_ before reuse.
     reader_.reset();
-    const auto [chunkOffset, chunkSize] = *directChunks_[index];
+    const auto [chunkOffset, chunkSize] = *directChunks_[groupIndex];
     dwio::common::ensureCapacity<char>(directChunkBuffer_, chunkSize, &pool_);
     directChunkBuffer_->setSize(chunkSize);
-    std::vector<folly::Range<char*>> ranges = {folly::Range<char*>(
-        directChunkBuffer_->asMutable<char>(), chunkSize)};
+    std::vector<folly::Range<char*>> ranges = {
+        folly::Range<char*>(directChunkBuffer_->asMutable<char>(), chunkSize)};
     uint64_t readUs{0};
     {
       MicrosecondWallTimer timer(&readUs);
@@ -175,8 +292,8 @@ dwio::common::PositionProvider ParquetData::seekToRowGroup(int64_t index) {
       ioStats->incTotalScanTimeNs(readUs * 1'000);
     }
     stats_.pageLoadTimeNs.increment(readUs * 1'000);
-    auto metadata =
-        fileMetaDataPtr_.rowGroup(index).columnChunk(type_->column());
+    auto metadata = fileMetaDataPtr_.rowGroup(static_cast<int>(index))
+                        .columnChunk(type_->column());
     auto stream = std::make_unique<dwio::common::SeekableArrayInputStream>(
         directChunkBuffer_->as<char>(), chunkSize);
     reader_ = std::make_unique<PageReader>(
@@ -190,10 +307,11 @@ dwio::common::PositionProvider ParquetData::seekToRowGroup(int64_t index) {
         &bufferCache_);
     return dwio::common::PositionProvider(empty);
   }
-  VELOX_CHECK(streams_[index], "Stream not enqueued for column");
-  auto metadata = fileMetaDataPtr_.rowGroup(index).columnChunk(type_->column());
+  VELOX_CHECK(streams_[groupIndex], "Stream not enqueued for column");
+  auto metadata = fileMetaDataPtr_.rowGroup(static_cast<int>(index))
+                      .columnChunk(type_->column());
   reader_ = std::make_unique<PageReader>(
-      std::move(streams_[index]),
+      std::move(streams_[groupIndex]),
       pool_,
       type_,
       metadata.compression(),

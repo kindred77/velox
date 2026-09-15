@@ -65,8 +65,12 @@ void PageReader::seekToPage(int64_t row) {
       numRowsInPage_ = 0;
       break;
     }
+    seekToIndexedPage(row);
+    const auto currentPageOffset = pageStart_;
     PageHeader pageHeader = readPageHeader();
     pageStart_ = pageDataStart_ + *pageHeader.compressed_page_size();
+
+    validateIndexedPage(currentPageOffset, pageHeader);
 
     switch (*pageHeader.type()) {
       case thrift::PageType::DATA_PAGE:
@@ -94,6 +98,72 @@ void PageReader::seekToPage(int64_t row) {
     }
     updateRowInfoAfterPageSkipped();
   }
+}
+
+bool PageReader::seekToIndexedPage(int64_t row) {
+  if (!isTopLevel_ || row == kRepDefOnly || pageLocations_.empty()) {
+    return false;
+  }
+  // A dictionary page, when present, precedes the first indexed data page and
+  // must be decoded before any dictionary-encoded target page can be read.
+  if (pageStart_ < pageLocations_.front().offset) {
+    return false;
+  }
+  auto target = std::upper_bound(
+      pageLocations_.begin(),
+      pageLocations_.end(),
+      row,
+      [](int64_t value, const DataPageLocation& location) {
+        return value < location.firstRowIndex;
+      });
+  if (target == pageLocations_.begin()) {
+    return false;
+  }
+  --target;
+  if (target->offset <= pageStart_) {
+    return false;
+  }
+  std::vector<uint64_t> position{target->offset};
+  dwio::common::PositionProvider provider(position);
+  inputStream_->seekToPosition(provider);
+  bufferStart_ = nullptr;
+  bufferEnd_ = nullptr;
+  thriftBuffer_.reset();
+  pageStart_ = target->offset;
+  pageDataStart_ = target->offset;
+  rowOfPage_ = target->firstRowIndex;
+  numRowsInPage_ = 0;
+  numRepDefsInPage_ = 0;
+  return true;
+}
+
+void PageReader::validateIndexedPage(
+    uint64_t pageOffset,
+    const thrift::PageHeader& pageHeader) const {
+  if (pageLocations_.empty() ||
+      (*pageHeader.type() != thrift::PageType::DATA_PAGE &&
+       *pageHeader.type() != thrift::PageType::DATA_PAGE_V2)) {
+    return;
+  }
+  const auto found = std::lower_bound(
+      pageLocations_.begin(),
+      pageLocations_.end(),
+      pageOffset,
+      [](const DataPageLocation& location, uint64_t offset) {
+        return location.offset < offset;
+      });
+  VELOX_CHECK(
+      found != pageLocations_.end() && found->offset == pageOffset,
+      "Parquet OffsetIndex does not describe data page at offset {}",
+      pageOffset);
+  VELOX_CHECK_EQ(
+      found->firstRowIndex,
+      rowOfPage_,
+      "Parquet OffsetIndex row boundary does not match data page");
+  VELOX_CHECK_EQ(
+      found->compressedSize,
+      pageDataStart_ - pageOffset + *pageHeader.compressed_page_size(),
+      "Parquet OffsetIndex size does not match data page");
 }
 
 PageHeader PageReader::readPageHeader() {

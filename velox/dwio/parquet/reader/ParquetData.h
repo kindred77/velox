@@ -41,11 +41,13 @@ class ParquetParams : public dwio::common::FormatParams {
       dwio::common::ColumnReaderStatistics& stats,
       const FileMetaDataPtr metaData,
       const tz::TimeZone* sessionTimezone,
-      TimestampPrecision timestampPrecision)
+      TimestampPrecision timestampPrecision,
+      bool useOffsetIndexForPageSeek)
       : FormatParams(pool, stats),
         metaData_(metaData),
         sessionTimezone_(sessionTimezone),
-        timestampPrecision_(timestampPrecision) {}
+        timestampPrecision_(timestampPrecision),
+        useOffsetIndexForPageSeek_(useOffsetIndexForPageSeek) {}
   std::unique_ptr<dwio::common::FormatData> toFormatData(
       const std::shared_ptr<const dwio::common::TypeWithId>& type,
       const common::ScanSpec& scanSpec) override;
@@ -58,6 +60,7 @@ class ParquetParams : public dwio::common::FormatParams {
   const FileMetaDataPtr metaData_;
   const tz::TimeZone* sessionTimezone_;
   const TimestampPrecision timestampPrecision_;
+  const bool useOffsetIndexForPageSeek_;
 };
 
 /// Format-specific data created for each leaf column of a Parquet rowgroup.
@@ -68,7 +71,8 @@ class ParquetData : public dwio::common::FormatData {
       const FileMetaDataPtr fileMetadataPtr,
       memory::MemoryPool& pool,
       dwio::common::ColumnReaderStatistics& stats,
-      const tz::TimeZone* sessionTimezone)
+      const tz::TimeZone* sessionTimezone,
+      bool useOffsetIndexForPageSeek)
       : pool_(pool),
         type_(std::static_pointer_cast<const ParquetTypeWithId>(type)),
         fileMetaDataPtr_(fileMetadataPtr),
@@ -76,7 +80,8 @@ class ParquetData : public dwio::common::FormatData {
         maxRepeat_(type_->maxRepeat_),
         rowsInRowGroup_(-1),
         stats_(stats),
-        sessionTimezone_(sessionTimezone) {}
+        sessionTimezone_(sessionTimezone),
+        useOffsetIndexForPageSeek_(useOffsetIndexForPageSeek) {}
 
   /// Prepares to read data for 'index'th row group.
   void enqueueRowGroup(uint32_t index, dwio::common::BufferedInput& input);
@@ -234,6 +239,8 @@ class ParquetData : public dwio::common::FormatData {
   // row group i's chunk when it is direct-read; cached chunks keep the stream
   // path above.
   std::vector<std::optional<std::pair<uint64_t, uint64_t>>> directChunks_;
+  std::vector<std::optional<std::vector<PageReader::DataPageLocation>>>
+      pageLocations_;
   // Reused target buffer for direct chunk reads (one allocation per column
   // split, grown to the largest chunk seen).
   BufferPtr directChunkBuffer_;
@@ -251,6 +258,7 @@ class ParquetData : public dwio::common::FormatData {
   int64_t rowsInRowGroup_;
   dwio::common::ColumnReaderStatistics& stats_;
   const tz::TimeZone* sessionTimezone_;
+  const bool useOffsetIndexForPageSeek_;
   std::unique_ptr<PageReader> reader_;
 
   // Nulls derived from leaf repdefs for non-leaf readers.

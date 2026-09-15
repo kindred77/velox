@@ -57,6 +57,10 @@ class ParquetReaderOptions : public dwio::common::FormatSpecificOptions {
   /// Maps table fields to Parquet file fields by position or name.
   dwio::common::ColumnMappingMode columnMappingMode{
       dwio::common::ColumnMappingMode::kPosition};
+
+  /// Uses Parquet OffsetIndex metadata to seek over unvisited data pages.
+  /// Disabled by default because sequential scans benefit from chunk reads.
+  bool useOffsetIndexForPageSeek{false};
 };
 
 /// Implements the RowReader interface for Parquet.

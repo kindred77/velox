@@ -36,6 +36,12 @@ namespace facebook::velox::parquet {
 /// continuous stream accessible via readWithVisitor().
 class PageReader {
  public:
+  struct DataPageLocation {
+    uint64_t offset;
+    uint32_t compressedSize;
+    int64_t firstRowIndex;
+  };
+
   // Transient page buffers reused across row groups of one column split.
   // Allocating and freeing these per page causes page-fault storms and
   // kernel VA-teardown spinlock contention (see dev_tasks performance doc,
@@ -62,8 +68,11 @@ class PageReader {
       int64_t chunkSize,
       dwio::common::ColumnReaderStatistics& stats,
       const tz::TimeZone* sessionTimezone,
-      BufferCache* bufferCache = nullptr)
+      BufferCache* bufferCache = nullptr,
+      std::vector<DataPageLocation> pageLocations = {})
       : pool_(pool),
+        bufferCache_(bufferCache),
+        pageLocations_(std::move(pageLocations)),
         inputStream_(std::move(stream)),
         type_(std::move(fileType)),
         maxRepeat_(type_->maxRepeat_),
@@ -73,8 +82,7 @@ class PageReader {
         chunkSize_(chunkSize),
         nullConcatenation_(pool_),
         stats_(stats),
-        sessionTimezone_(sessionTimezone),
-        bufferCache_(bufferCache) {
+        sessionTimezone_(sessionTimezone) {
     type_->makeLevelInfo(leafInfo_);
     takeBuffersFromCache();
   }
@@ -89,8 +97,11 @@ class PageReader {
       const tz::TimeZone* sessionTimezone = nullptr,
       int32_t maxRepeat = 0,
       int32_t maxDefine = 1,
-      BufferCache* bufferCache = nullptr)
+      BufferCache* bufferCache = nullptr,
+      std::vector<DataPageLocation> pageLocations = {})
       : pool_(pool),
+        bufferCache_(bufferCache),
+        pageLocations_(std::move(pageLocations)),
         inputStream_(std::move(stream)),
         maxRepeat_(maxRepeat),
         maxDefine_(maxDefine),
@@ -99,8 +110,7 @@ class PageReader {
         chunkSize_(chunkSize),
         nullConcatenation_(pool_),
         stats_(stats),
-        sessionTimezone_(sessionTimezone),
-        bufferCache_(bufferCache) {
+        sessionTimezone_(sessionTimezone) {
     takeBuffersFromCache();
   }
 
@@ -217,6 +227,12 @@ class PageReader {
   // nulls. Seeking ahead of pages covered by decodeRepDefs is not
   // allowed for non-top level columns.
   void seekToPage(int64_t row);
+
+  bool seekToIndexedPage(int64_t row);
+
+  void validateIndexedPage(
+      uint64_t pageOffset,
+      const thrift::PageHeader& pageHeader) const;
 
   // Preloads the repdefs for the column chunk. To avoid preloading,
   // would need a way too clone the input stream so that one stream
@@ -446,6 +462,9 @@ class PageReader {
 
   memory::MemoryPool& pool_;
   BufferCache* bufferCache_{nullptr};
+  // Data-page offsets relative to the beginning of inputStream_. Present only
+  // for opt-in flat-column sparse reads.
+  const std::vector<DataPageLocation> pageLocations_;
 
   std::unique_ptr<dwio::common::SeekableInputStream> inputStream_;
   ParquetTypeWithIdPtr type_;
