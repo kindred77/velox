@@ -86,18 +86,34 @@ void writeCompactValue(
 }
 
 template <TypeKind Kind>
-int compareRawValues(const char* a, const char* b) {
-  return SimpleVector<CompactValue<Kind>>::comparePrimitiveAsc(
-      readCompactValue<Kind>(a), readCompactValue<Kind>(b));
-}
-
-template <TypeKind Kind>
 int compareRawToDecoded(
     const char* raw,
     const DecodedVector& decoded,
     vector_size_t row) {
   return SimpleVector<CompactValue<Kind>>::comparePrimitiveAsc(
       readCompactValue<Kind>(raw), decoded.valueAt<CompactValue<Kind>>(row));
+}
+
+// Binds the per-kind compact helpers behind function pointers so the per-row
+// ring path does not repeat the TypeKind dispatch. Only the compact-supported
+// kinds are bound (see isCompactSupportedKind).
+template <TypeKind Kind>
+void bindCompactKindFns(
+    std::vector<TopN::CompactCompareFn>& compares,
+    std::vector<TopN::CompactStoreFn>& stores) {
+  compares.push_back(&compareRawToDecoded<Kind>);
+  stores.push_back(&writeDecodedValue<Kind>);
+}
+
+bool bindCompactColumnFns(
+    TypeKind kind,
+    std::vector<TopN::CompactCompareFn>& compares,
+    std::vector<TopN::CompactStoreFn>& stores) {
+  if (!isCompactSupportedKind(kind)) {
+    return false;
+  }
+  VELOX_DYNAMIC_TYPE_DISPATCH(bindCompactKindFns, kind, compares, stores);
+  return true;
 }
 
 // Leading-key fast discard: returns true when the input row sorts strictly
@@ -271,6 +287,20 @@ TopN::TopN(
   if (compactEligible && rowSize > 0 &&
       rowSize * static_cast<size_t>(count_) <= kMaxCompactRingBytes) {
     compactRowSize_ = rowSize;
+    compactCompareFns_.reserve(numColumns);
+    compactStoreFns_.reserve(numColumns);
+    for (column_index_t i = 0; i < numColumns; ++i) {
+      if (!bindCompactColumnFns(
+              outputType_->childAt(i)->kind(),
+              compactCompareFns_,
+              compactStoreFns_)) {
+        compactCompareFns_.clear();
+        compactStoreFns_.clear();
+        compactColumns_.clear();
+        compactRowSize_ = 0;
+        break;
+      }
+    }
   } else {
     compactColumns_.clear();
   }
@@ -290,16 +320,13 @@ void TopN::maybeEnableCompactRing() {
 void TopN::compactStore(char* slot, vector_size_t row) {
   for (column_index_t col = 0; col < outputType_->size(); ++col) {
     const auto& cc = compactColumns_[col];
-    const bool isNull = decodedVectors_[col].isNullAt(row);
-    slot[cc.nullOffset] = isNull ? 1 : 0;
-    if (!isNull) {
-      VELOX_DYNAMIC_TYPE_DISPATCH(
-          writeDecodedValue,
-          outputType_->childAt(col)->kind(),
-          decodedVectors_[col],
-          row,
-          slot + cc.valueOffset);
+    const auto& decoded = decodedVectors_[col];
+    if (decoded.mayHaveNulls() && decoded.isNullAt(row)) {
+      slot[cc.nullOffset] = 1;
+      continue;
     }
+    slot[cc.nullOffset] = 0;
+    compactStoreFns_[col](decoded, row, slot + cc.valueOffset);
   }
 }
 
@@ -318,47 +345,14 @@ int32_t TopN::compactCompareToDecoded(char* slot, vector_size_t row) const {
     } else if (inputNull) {
       result = so.isNullsFirst() ? 1 : -1;
     } else {
-      result = VELOX_DYNAMIC_TYPE_DISPATCH(
-          compareRawToDecoded,
-          outputType_->childAt(col)->kind(),
-          slot + cc.valueOffset,
-          decodedVectors_[col],
-          row);
+      result = compactCompareFns_[col](
+          slot + cc.valueOffset, decodedVectors_[col], row);
       if (!so.isAscending()) {
         result = -result;
       }
     }
     if (result != 0) {
       return -result;
-    }
-  }
-  return 0;
-}
-
-int32_t TopN::compactCompareSlots(const char* a, const char* b) const {
-  for (size_t i = 0; i < sortingKeyColumns_.size(); ++i) {
-    const auto col = sortingKeyColumns_[i];
-    const auto& so = sortingOrders_[i];
-    const auto& cc = compactColumns_[col];
-    const bool aNull = a[cc.nullOffset] != 0;
-    const bool bNull = b[cc.nullOffset] != 0;
-    int result;
-    if (aNull) {
-      result = bNull ? 0 : (so.isNullsFirst() ? -1 : 1);
-    } else if (bNull) {
-      result = so.isNullsFirst() ? 1 : -1;
-    } else {
-      result = VELOX_DYNAMIC_TYPE_DISPATCH(
-          compareRawValues,
-          outputType_->childAt(col)->kind(),
-          a + cc.valueOffset,
-          b + cc.valueOffset);
-      if (!so.isAscending()) {
-        result = -result;
-      }
-    }
-    if (result != 0) {
-      return result;
     }
   }
   return 0;
@@ -556,9 +550,13 @@ void TopN::addInput(RowVectorPtr input) {
           char* slot = compactSlot(compactHead_);
           compactStore(slot, row);
           lastSeenSlot_ = slot;
-          compactHead_ = (compactHead_ + 1) % count_;
-          compactCount_ =
-              std::min(compactCount_ + 1, static_cast<size_t>(count_));
+          compactHead_ =
+              (compactHead_ + 1 == static_cast<size_t>(count_))
+              ? 0
+              : compactHead_ + 1;
+          if (compactCount_ < static_cast<size_t>(count_)) {
+            ++compactCount_;
+          }
           continue;
         }
         // The stream stopped being strictly monotone. The compact ring still
@@ -567,13 +565,10 @@ void TopN::addInput(RowVectorPtr input) {
         bool rebuildFromRing = false;
         if (compactCount_ == static_cast<size_t>(count_)) {
           ++disorderRows_;
+          // Rows are stored in non-increasing sort order (a store only
+          // happens when the new row sorts at or before the previous one), so
+          // the oldest slot is the k-th best; no scan is needed.
           char* worst = compactSlot(compactHead_);
-          for (size_t i = 1; i < compactCount_; ++i) {
-            char* candidate = compactSlot((compactHead_ + i) % count_);
-            if (compactCompareSlots(candidate, worst) > 0) {
-              worst = candidate;
-            }
-          }
           if (!(compactCompareToDecoded(worst, row) < 0)) {
             if (disorderRows_ > totalRows_ / count_) {
               // Disorder rate too high: fall back to the priority queue.

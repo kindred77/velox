@@ -22,6 +22,15 @@ namespace facebook::velox::exec {
 
 class TopN : public Operator {
  public:
+  // Per-column helpers of the compact ring, resolved once per instance so the
+  // per-row path does not pay a TypeKind switch for every value it compares or
+  // stores. Only compact-supported kinds are bound; compact mode requires
+  // every column to be of one of those kinds.
+  using CompactCompareFn = int32_t (*)(
+      const char* raw, const DecodedVector& decoded, vector_size_t row);
+  using CompactStoreFn = void (*)(
+      const DecodedVector& decoded, vector_size_t row, char* dst);
+
   TopN(
       int32_t operatorId,
       DriverCtx* driverCtx,
@@ -106,6 +115,9 @@ class TopN : public Operator {
     size_t valueOffset;
     size_t valueSize;
   };
+
+  std::vector<CompactCompareFn> compactCompareFns_;
+  std::vector<CompactStoreFn> compactStoreFns_;
   std::vector<CompactColumn> compactColumns_;
   size_t compactRowSize_{0};
   std::vector<char> compactRingStorage_;
@@ -134,9 +146,6 @@ class TopN : public Operator {
   // Returns <0 if the input row sorts before the compact slot row (mirrors
   // RowComparator::compare(decodedVectors_, row, other)).
   int32_t compactCompareToDecoded(char* slot, vector_size_t row) const;
-
-  // Returns <0 if 'a' sorts before 'b' (both compact slots).
-  int32_t compactCompareSlots(const char* a, const char* b) const;
 
   // Converts the compact ring into RowContainer rows (in arrival order),
   // fills ring_ and switches back to the RowContainer-backed ring.
