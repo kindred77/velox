@@ -16,7 +16,9 @@
 #pragma once
 
 #include <folly/container/F14Set.h>
+#include <cstdlib>
 #include <limits>
+#include <type_traits>
 
 #include <velox/type/Filter.h>
 #include "velox/common/memory/RawVector.h"
@@ -125,6 +127,104 @@ struct UniqueValueComparer {
   }
 };
 
+// Spike (C3-M1, enabled only with GPORCA_VECTORHASHER_FLATMAP=1, default off):
+// flat open-addressed read cache for the POD integer value -> id mapping, where
+// the F14 set's chunk probe dominates the aggregation input path.
+//
+// Invariants: 'uniqueValues_' (F14) is the only id authority - ids are always
+// assigned there in first-seen order; this cache never assigns ids. A miss in
+// the cache falls back to the F14 insert and mirrors the resulting id here.
+// Cold paths (clear/copy/merge) rebuild the cache from the F14 set.
+class UniqueValueFlatMap {
+ public:
+  void clear() {
+    keys_.clear();
+    ids_.clear();
+    mask_ = 0;
+    count_ = 0;
+  }
+
+  void reserve(size_t capacity) {
+    size_t pow2 = 1024;
+    while (pow2 < capacity * 2) {
+      pow2 *= 2;
+    }
+    rehash(pow2);
+  }
+
+  uint32_t find(uint64_t key) const {
+    if (ids_.empty()) {
+      return 0;
+    }
+    size_t slot = mix(key) & mask_;
+    while (ids_[slot] != 0) {
+      if (keys_[slot] == key) {
+        return ids_[slot];
+      }
+      slot = (slot + 1) & mask_;
+    }
+    return 0;
+  }
+
+  // Mirrors an id assigned by the F14 set. The F14 set is authoritative, so an
+  // existing entry is overwritten only if the two disagreed (cannot happen
+  // while all inserts keep the cache up to date).
+  void put(uint64_t key, uint32_t id) {
+    if (ids_.empty()) {
+      reserve(1024);
+    }
+    size_t slot = mix(key) & mask_;
+    while (ids_[slot] != 0) {
+      if (keys_[slot] == key) {
+        ids_[slot] = id;
+        return;
+      }
+      slot = (slot + 1) & mask_;
+    }
+    keys_[slot] = key;
+    ids_[slot] = id;
+    ++count_;
+    if (count_ * 10 >= (mask_ + 1) * 7) {
+      rehash((mask_ + 1) * 2);
+    }
+  }
+
+ private:
+  static uint64_t mix(uint64_t value) {
+    value ^= value >> 33;
+    value *= 0xff51afd7ed558ccdULL;
+    value ^= value >> 33;
+    value *= 0xc4ceb9fe1a85ec53ULL;
+    value ^= value >> 33;
+    return value;
+  }
+
+  void rehash(size_t capacity) {
+    std::vector<uint64_t> keys(capacity, 0);
+    std::vector<uint32_t> ids(capacity, 0);
+    const size_t mask = capacity - 1;
+    for (size_t i = 0; i < ids_.size(); ++i) {
+      if (ids_[i] == 0) {
+        continue;
+      }
+      size_t slot = mix(keys_[i]) & mask;
+      while (ids[slot] != 0) {
+        slot = (slot + 1) & mask;
+      }
+      keys[slot] = keys_[i];
+      ids[slot] = ids_[i];
+    }
+    keys_.swap(keys);
+    ids_.swap(ids);
+    mask_ = mask;
+  }
+
+  std::vector<uint64_t> keys_;
+  std::vector<uint32_t> ids_;
+  size_t mask_{0};
+  size_t count_{0};
+};
+
 class VectorHasher {
  public:
   static constexpr uint64_t kUnmappable =
@@ -163,6 +263,14 @@ class VectorHasher {
       // Strings map to value ids through a hash map lookup per row; see
       // 'valueId<StringView>'.
       shortValueIdCache_.resize(kShortValueIdCacheSize);
+    }
+    // C3-M1 spike: opt-in flat value-id cache (see UniqueValueFlatMap). Only
+    // the integer kinds routed through the POD 'valueId<T>' path are covered;
+    // strings/timestamps keep using the F14 set alone.
+    if (const char* flat = std::getenv("GPORCA_VECTORHASHER_FLATMAP")) {
+      useFlatIds_ = flat[0] == '1' &&
+          (typeKind_ == TypeKind::TINYINT || typeKind_ == TypeKind::SMALLINT ||
+           typeKind_ == TypeKind::INTEGER || typeKind_ == TypeKind::BIGINT);
     }
   }
 
@@ -295,6 +403,7 @@ class VectorHasher {
 
   void resetStats() {
     uniqueValues_.clear();
+    flatIds_.clear();
     uniqueValuesStorage_.clear();
     clearShortValueIdCache();
   }
@@ -483,7 +592,13 @@ class VectorHasher {
     if (!distinctOverflow_) {
       UniqueValue unique(normalized);
       unique.setId(uniqueValues_.size() + 1);
-      if (uniqueValues_.insert(unique).second) {
+      const auto pair = uniqueValues_.insert(unique);
+      if (pair.second) {
+        if constexpr (std::is_integral_v<T>) {
+          if (useFlatIds_) {
+            flatIds_.put(static_cast<uint64_t>(normalized), pair.first->id());
+          }
+        }
         if (uniqueValues_.size() > kMaxDistinct) {
           setDistinctOverflow();
         }
@@ -540,6 +655,27 @@ class VectorHasher {
       return int64Value - min_ + 1;
     }
 
+    if constexpr (std::is_integral_v<T>) {
+      if (useFlatIds_) {
+        const uint64_t key = static_cast<uint64_t>(int64Value);
+        const uint32_t cachedId = flatIds_.find(key);
+        if (cachedId != 0) {
+          return cachedId;
+        }
+        // Cache miss: the F14 set assigns the id, then the cache mirrors it.
+        UniqueValue unique(value);
+        unique.setId(uniqueValues_.size() + 1);
+        const auto pair = uniqueValues_.insert(unique);
+        const uint32_t id = pair.first->id();
+        flatIds_.put(key, id);
+        updateRange(int64Value);
+        if (uniqueValues_.size() >= rangeSize_) {
+          return kUnmappable;
+        }
+        return id;
+      }
+    }
+
     UniqueValue unique(value);
     unique.setId(uniqueValues_.size() + 1);
     auto pair = uniqueValues_.insert(unique);
@@ -561,6 +697,12 @@ class VectorHasher {
         return kUnmappable;
       }
       return int64Value - min_ + 1;
+    }
+    if constexpr (std::is_integral_v<T>) {
+      if (useFlatIds_) {
+        const uint32_t id = flatIds_.find(static_cast<uint64_t>(int64Value));
+        return id == 0 ? kUnmappable : id;
+      }
     }
     UniqueValue unique(value);
     auto iter = uniqueValues_.find(unique);
@@ -588,6 +730,9 @@ class VectorHasher {
   void setDistinctOverflow();
 
   void setRangeOverflow();
+
+  // C3-M1 spike: rebuild the flat value-id mirror from 'uniqueValues_'.
+  void rebuildFlatIds();
 
   inline void checkTypeSupportsValueIds() const {
     VELOX_DCHECK(
@@ -689,6 +834,10 @@ class VectorHasher {
   // Table for mapping distinct values to small ints.
   folly::F14FastSet<UniqueValue, UniqueValueHasher, UniqueValueComparer>
       uniqueValues_;
+
+  // C3-M1 spike: flat mirror of 'uniqueValues_' for the hot POD-key path.
+  bool useFlatIds_{false};
+  UniqueValueFlatMap flatIds_;
 
   // Memory for unique string values.
   std::vector<std::string> uniqueValuesStorage_;

@@ -677,6 +677,7 @@ void VectorHasher::copyStringToLocal(const UniqueValue* unique) {
 void VectorHasher::setDistinctOverflow() {
   distinctOverflow_ = true;
   uniqueValues_.clear();
+  flatIds_.clear();
   uniqueValuesStorage_.clear();
   distinctStringsBytes_ = 0;
   clearShortValueIdCache();
@@ -893,8 +894,23 @@ void VectorHasher::copyStatsFrom(const VectorHasher& other) {
   min_ = other.min_;
   max_ = other.max_;
   uniqueValues_ = other.uniqueValues_;
+  rebuildFlatIds();
   // The copied value ids may differ from the cached ones.
   clearShortValueIdCache();
+}
+
+void VectorHasher::rebuildFlatIds() {
+  if (!useFlatIds_) {
+    return;
+  }
+  flatIds_.clear();
+  if (uniqueValues_.empty()) {
+    return;
+  }
+  flatIds_.reserve(uniqueValues_.size());
+  for (const auto& value : uniqueValues_) {
+    flatIds_.put(static_cast<uint64_t>(value.data()), value.id());
+  }
 }
 
 void VectorHasher::merge(const VectorHasher& other, size_t maxNumDistinct) {
@@ -935,6 +951,7 @@ void VectorHasher::merge(const VectorHasher& other, size_t maxNumDistinct) {
       break;
     }
   }
+  rebuildFlatIds();
 }
 
 std::string VectorHasher::toString() const {
