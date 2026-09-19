@@ -16,7 +16,6 @@
 #pragma once
 
 #include <folly/container/F14Set.h>
-#include <cstdlib>
 #include <limits>
 #include <type_traits>
 
@@ -127,69 +126,116 @@ struct UniqueValueComparer {
   }
 };
 
-// Spike (C3-M1, enabled only with GPORCA_VECTORHASHER_FLATMAP=1, default off):
-// flat open-addressed read cache for the POD integer value -> id mapping, where
-// the F14 set's chunk probe dominates the aggregation input path.
+// Maps the distinct values of one 'VectorHasher' to their small integer ids.
+// Integer keys use a flat open-addressed table: mapping sparse integer keys is
+// dominated by the F14 chunk probe on the per-row input path, while dense keys
+// stay on the range fast path and never reach this table. Other key types keep
+// the F14 set.
 //
-// Invariants: 'uniqueValues_' (F14) is the only id authority - ids are always
-// assigned there in first-seen order; this cache never assigns ids. A miss in
-// the cache falls back to the F14 insert and mirrors the resulting id here.
-// Cold paths (clear/copy/merge) rebuild the cache from the F14 set.
-class UniqueValueFlatMap {
+// Entries are kept in first-seen order and ids are 'entry index + 1', so id
+// assignment matches the historical behavior. This class owns the ids; callers
+// must not pre-assign them.
+class UniqueValueMap {
  public:
+  explicit UniqueValueMap(bool flat) : flat_(flat) {}
+
+  bool flat() const {
+    return flat_;
+  }
+
+  size_t size() const {
+    return flat_ ? values_.size() : set_.size();
+  }
+
+  bool empty() const {
+    return flat_ ? values_.empty() : set_.empty();
+  }
+
   void clear() {
-    keys_.clear();
-    ids_.clear();
-    mask_ = 0;
-    count_ = 0;
+    if (flat_) {
+      values_.clear();
+      slots_.clear();
+      mask_ = 0;
+    } else {
+      set_.clear();
+    }
   }
 
-  void reserve(size_t capacity) {
-    size_t pow2 = 1024;
-    while (pow2 < capacity * 2) {
-      pow2 *= 2;
+  // Inserts 'value' if it is not present yet. A new entry gets id
+  // 'size() + 1'. Returns the stored entry and whether it was inserted.
+  std::pair<const UniqueValue*, bool> insert(const UniqueValue& value) {
+    if (flat_) {
+      VELOX_DCHECK_EQ(value.size(), sizeof(int64_t));
+      const auto pair = insertId(value.data());
+      return {&values_[pair.first - 1], pair.second};
     }
-    rehash(pow2);
+    auto entry = value;
+    entry.setId(static_cast<uint32_t>(set_.size() + 1));
+    const auto pair = set_.insert(entry);
+    return {&*pair.first, pair.second};
   }
 
-  uint32_t find(uint64_t key) const {
-    if (ids_.empty()) {
-      return 0;
+  // Fast path of 'insert' for integer keys: does not materialize a
+  // 'UniqueValue' on hits. Returns the id and whether the key was inserted.
+  std::pair<uint64_t, bool> insertId(int64_t key) {
+    VELOX_DCHECK(flat_);
+    if (slots_.empty()) {
+      rehash(kInitialCapacity);
     }
-    size_t slot = mix(key) & mask_;
-    while (ids_[slot] != 0) {
-      if (keys_[slot] == key) {
-        return ids_[slot];
+    size_t slot = mix(static_cast<uint64_t>(key)) & mask_;
+    while (slots_[slot] != 0) {
+      const auto& entry = values_[slots_[slot] - 1];
+      if (entry.data() == key) {
+        return {entry.id(), false};
       }
       slot = (slot + 1) & mask_;
     }
-    return 0;
+    values_.emplace_back(key);
+    const uint64_t id = values_.size();
+    values_.back().setId(static_cast<uint32_t>(id));
+    slots_[slot] = static_cast<uint32_t>(id);
+    if (values_.size() * kLoadFactorDenominator >=
+        slots_.size() * kLoadFactorNumerator) {
+      rehash(slots_.size() * 2);
+    }
+    return {id, true};
   }
 
-  // Mirrors an id assigned by the F14 set. The F14 set is authoritative, so an
-  // existing entry is overwritten only if the two disagreed (cannot happen
-  // while all inserts keep the cache up to date).
-  void put(uint64_t key, uint32_t id) {
-    if (ids_.empty()) {
-      reserve(1024);
+  const UniqueValue* find(const UniqueValue& value) const {
+    if (!flat_) {
+      const auto iter = set_.find(value);
+      return iter == set_.end() ? nullptr : &*iter;
     }
-    size_t slot = mix(key) & mask_;
-    while (ids_[slot] != 0) {
-      if (keys_[slot] == key) {
-        ids_[slot] = id;
-        return;
+    VELOX_DCHECK_EQ(value.size(), sizeof(int64_t));
+    return findInt64(value.data());
+  }
+
+  // Returns the id of 'key' or 0 if it is not present.
+  uint64_t findId(int64_t key) const {
+    const auto* entry = findInt64(key);
+    return entry == nullptr ? 0 : entry->id();
+  }
+
+  // Calls 'func' for each entry in an unspecified order. 'func' may not insert
+  // into this map.
+  template <typename Func>
+  void forEach(Func func) const {
+    if (flat_) {
+      for (const auto& entry : values_) {
+        func(entry);
       }
-      slot = (slot + 1) & mask_;
-    }
-    keys_[slot] = key;
-    ids_[slot] = id;
-    ++count_;
-    if (count_ * 10 >= (mask_ + 1) * 7) {
-      rehash((mask_ + 1) * 2);
+    } else {
+      for (const auto& entry : set_) {
+        func(entry);
+      }
     }
   }
 
  private:
+  static constexpr size_t kInitialCapacity = 32;
+  static constexpr size_t kLoadFactorNumerator = 7;
+  static constexpr size_t kLoadFactorDenominator = 10;
+
   static uint64_t mix(uint64_t value) {
     value ^= value >> 33;
     value *= 0xff51afd7ed558ccdULL;
@@ -199,30 +245,43 @@ class UniqueValueFlatMap {
     return value;
   }
 
-  void rehash(size_t capacity) {
-    std::vector<uint64_t> keys(capacity, 0);
-    std::vector<uint32_t> ids(capacity, 0);
-    const size_t mask = capacity - 1;
-    for (size_t i = 0; i < ids_.size(); ++i) {
-      if (ids_[i] == 0) {
-        continue;
-      }
-      size_t slot = mix(keys_[i]) & mask;
-      while (ids[slot] != 0) {
-        slot = (slot + 1) & mask;
-      }
-      keys[slot] = keys_[i];
-      ids[slot] = ids_[i];
+  const UniqueValue* findInt64(int64_t key) const {
+    VELOX_DCHECK(flat_);
+    if (slots_.empty()) {
+      return nullptr;
     }
-    keys_.swap(keys);
-    ids_.swap(ids);
-    mask_ = mask;
+    size_t slot = mix(static_cast<uint64_t>(key)) & mask_;
+    while (slots_[slot] != 0) {
+      const auto& entry = values_[slots_[slot] - 1];
+      if (entry.data() == key) {
+        return &entry;
+      }
+      slot = (slot + 1) & mask_;
+    }
+    return nullptr;
   }
 
-  std::vector<uint64_t> keys_;
-  std::vector<uint32_t> ids_;
+  void rehash(size_t capacity) {
+    slots_.assign(capacity, 0);
+    mask_ = capacity - 1;
+    for (size_t index = 0; index < values_.size(); ++index) {
+      size_t slot =
+          mix(static_cast<uint64_t>(values_[index].data())) & mask_;
+      while (slots_[slot] != 0) {
+        slot = (slot + 1) & mask_;
+      }
+      slots_[slot] = static_cast<uint32_t>(index + 1);
+    }
+  }
+
+  bool flat_;
+  // Flat mode: entries in first-seen order, ids are 'index + 1'.
+  std::vector<UniqueValue> values_;
+  // Flat mode: 'values_' index + 1 per slot, 0 is empty.
+  std::vector<uint32_t> slots_;
+  // Generic mode: values with their hashes.
+  folly::F14FastSet<UniqueValue, UniqueValueHasher, UniqueValueComparer> set_;
   size_t mask_{0};
-  size_t count_{0};
 };
 
 class VectorHasher {
@@ -248,7 +307,8 @@ class VectorHasher {
       : channel_(channel),
         type_(std::move(type)),
         typeKind_(type_->kind()),
-        typeProvidesCustomComparison_(type_->providesCustomComparison()) {
+        typeProvidesCustomComparison_(type_->providesCustomComparison()),
+        uniqueValues_(typeUsesFlatValueIds(typeKind_)) {
     if (!typeSupportsValueIds()) {
       // Ensure any range or unique value based hashing is disabled.
       setRangeOverflow();
@@ -263,14 +323,6 @@ class VectorHasher {
       // Strings map to value ids through a hash map lookup per row; see
       // 'valueId<StringView>'.
       shortValueIdCache_.resize(kShortValueIdCacheSize);
-    }
-    // C3-M1 spike: opt-in flat value-id cache (see UniqueValueFlatMap). Only
-    // the integer kinds routed through the POD 'valueId<T>' path are covered;
-    // strings/timestamps keep using the F14 set alone.
-    if (const char* flat = std::getenv("GPORCA_VECTORHASHER_FLATMAP")) {
-      useFlatIds_ = flat[0] == '1' &&
-          (typeKind_ == TypeKind::TINYINT || typeKind_ == TypeKind::SMALLINT ||
-           typeKind_ == TypeKind::INTEGER || typeKind_ == TypeKind::BIGINT);
     }
   }
 
@@ -403,7 +455,6 @@ class VectorHasher {
 
   void resetStats() {
     uniqueValues_.clear();
-    flatIds_.clear();
     uniqueValuesStorage_.clear();
     clearShortValueIdCache();
   }
@@ -589,20 +640,22 @@ class VectorHasher {
     if (!rangeOverflow_) {
       updateRange(normalized);
     }
-    if (!distinctOverflow_) {
-      UniqueValue unique(normalized);
-      unique.setId(uniqueValues_.size() + 1);
-      const auto pair = uniqueValues_.insert(unique);
-      if (pair.second) {
-        if constexpr (std::is_integral_v<T>) {
-          if (useFlatIds_) {
-            flatIds_.put(static_cast<uint64_t>(normalized), pair.first->id());
-          }
-        }
-        if (uniqueValues_.size() > kMaxDistinct) {
+    if (distinctOverflow_) {
+      return;
+    }
+    if constexpr (std::is_integral_v<T>) {
+      if (uniqueValues_.flat()) {
+        if (uniqueValues_.insertId(normalized).second &&
+            uniqueValues_.size() > kMaxDistinct) {
           setDistinctOverflow();
         }
+        return;
       }
+    }
+    UniqueValue unique(normalized);
+    if (uniqueValues_.insert(unique).second &&
+        uniqueValues_.size() > kMaxDistinct) {
+      setDistinctOverflow();
     }
   }
 
@@ -656,29 +709,21 @@ class VectorHasher {
     }
 
     if constexpr (std::is_integral_v<T>) {
-      if (useFlatIds_) {
-        const uint64_t key = static_cast<uint64_t>(int64Value);
-        const uint32_t cachedId = flatIds_.find(key);
-        if (cachedId != 0) {
-          return cachedId;
+      if (uniqueValues_.flat()) {
+        const auto idPair = uniqueValues_.insertId(int64Value);
+        if (!idPair.second) {
+          return idPair.first;
         }
-        // Cache miss: the F14 set assigns the id, then the cache mirrors it.
-        UniqueValue unique(value);
-        unique.setId(uniqueValues_.size() + 1);
-        const auto pair = uniqueValues_.insert(unique);
-        const uint32_t id = pair.first->id();
-        flatIds_.put(key, id);
         updateRange(int64Value);
         if (uniqueValues_.size() >= rangeSize_) {
           return kUnmappable;
         }
-        return id;
+        return idPair.first;
       }
     }
 
     UniqueValue unique(value);
-    unique.setId(uniqueValues_.size() + 1);
-    auto pair = uniqueValues_.insert(unique);
+    const auto pair = uniqueValues_.insert(unique);
     if (!pair.second) {
       return pair.first->id();
     }
@@ -686,7 +731,7 @@ class VectorHasher {
     if (uniqueValues_.size() >= rangeSize_) {
       return kUnmappable;
     }
-    return unique.id();
+    return pair.first->id();
   }
 
   template <typename T>
@@ -699,14 +744,14 @@ class VectorHasher {
       return int64Value - min_ + 1;
     }
     if constexpr (std::is_integral_v<T>) {
-      if (useFlatIds_) {
-        const uint32_t id = flatIds_.find(static_cast<uint64_t>(int64Value));
+      if (uniqueValues_.flat()) {
+        const uint64_t id = uniqueValues_.findId(int64Value);
         return id == 0 ? kUnmappable : id;
       }
     }
     UniqueValue unique(value);
-    auto iter = uniqueValues_.find(unique);
-    if (iter != uniqueValues_.end()) {
+    const auto* iter = uniqueValues_.find(unique);
+    if (iter != nullptr) {
       return iter->id();
     }
     return kUnmappable;
@@ -731,8 +776,11 @@ class VectorHasher {
 
   void setRangeOverflow();
 
-  // C3-M1 spike: rebuild the flat value-id mirror from 'uniqueValues_'.
-  void rebuildFlatIds();
+  // Integer key types whose value ids use the flat open-addressed table.
+  static bool typeUsesFlatValueIds(TypeKind kind) {
+    return kind == TypeKind::TINYINT || kind == TypeKind::SMALLINT ||
+        kind == TypeKind::INTEGER || kind == TypeKind::BIGINT;
+  }
 
   inline void checkTypeSupportsValueIds() const {
     VELOX_DCHECK(
@@ -831,13 +879,8 @@ class VectorHasher {
   // Bounds of the range if 'isRange_' is true.
   int64_t min_ = 1;
   int64_t max_ = 0;
-  // Table for mapping distinct values to small ints.
-  folly::F14FastSet<UniqueValue, UniqueValueHasher, UniqueValueComparer>
-      uniqueValues_;
-
-  // C3-M1 spike: flat mirror of 'uniqueValues_' for the hot POD-key path.
-  bool useFlatIds_{false};
-  UniqueValueFlatMap flatIds_;
+  // Maps distinct values to small ints. See 'UniqueValueMap'.
+  UniqueValueMap uniqueValues_;
 
   // Memory for unique string values.
   std::vector<std::string> uniqueValuesStorage_;
@@ -931,8 +974,7 @@ inline uint64_t VectorHasher::valueId(StringView value) {
   }
 
   UniqueValue unique(data, size);
-  unique.setId(uniqueValues_.size() + 1);
-  auto pair = uniqueValues_.insert(unique);
+  const auto pair = uniqueValues_.insert(unique);
   if (!pair.second) {
     const auto id = pair.first->id();
     if (cacheEntry != nullptr) {
@@ -944,7 +986,7 @@ inline uint64_t VectorHasher::valueId(StringView value) {
     }
     return id;
   }
-  copyStringToLocal(&*pair.first);
+  copyStringToLocal(pair.first);
   if (!rangeOverflow_) {
     if (size > kStringASRangeMaxSize) {
       setRangeOverflow();
@@ -960,10 +1002,10 @@ inline uint64_t VectorHasher::valueId(StringView value) {
     cacheEntry->word0 = word0;
     cacheEntry->word1 = word1;
     cacheEntry->word2 = word2;
-    cacheEntry->id = unique.id();
+    cacheEntry->id = pair.first->id();
     cacheEntry->size = static_cast<uint32_t>(size);
   }
-  return unique.id();
+  return pair.first->id();
 }
 
 template <>
@@ -981,8 +1023,8 @@ inline uint64_t VectorHasher::lookupValueId(StringView value) const {
     return number - min_ + 1;
   }
   UniqueValue unique(data, size);
-  auto iter = uniqueValues_.find(unique);
-  if (iter != uniqueValues_.end()) {
+  const auto* iter = uniqueValues_.find(unique);
+  if (iter != nullptr) {
     return iter->id();
   }
   return kUnmappable;

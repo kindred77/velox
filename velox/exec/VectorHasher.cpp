@@ -634,14 +634,13 @@ void VectorHasher::analyzeValue(StringView value) {
   }
   if (!distinctOverflow_) {
     UniqueValue unique(data, size);
-    unique.setId(uniqueValues_.size() + 1);
-    auto pair = uniqueValues_.insert(unique);
+    const auto pair = uniqueValues_.insert(unique);
     if (pair.second) {
       if (uniqueValues_.size() > kMaxDistinct) {
         setDistinctOverflow();
         return;
       }
-      copyStringToLocal(&*pair.first);
+      copyStringToLocal(pair.first);
     }
   }
 }
@@ -677,7 +676,6 @@ void VectorHasher::copyStringToLocal(const UniqueValue* unique) {
 void VectorHasher::setDistinctOverflow() {
   distinctOverflow_ = true;
   uniqueValues_.clear();
-  flatIds_.clear();
   uniqueValuesStorage_.clear();
   distinctStringsBytes_ = 0;
   clearShortValueIdCache();
@@ -705,9 +703,9 @@ std::unique_ptr<common::Filter> VectorHasher::getFilter(
       if (!distinctOverflow_) {
         std::vector<int64_t> values;
         values.reserve(uniqueValues_.size());
-        for (const auto& value : uniqueValues_) {
+        uniqueValues_.forEach([&](const UniqueValue& value) {
           values.emplace_back(value.data());
-        }
+        });
 
         return common::createBigintValues(values, nullAllowed);
       }
@@ -718,9 +716,9 @@ std::unique_ptr<common::Filter> VectorHasher::getFilter(
       if (!distinctOverflow_) {
         std::vector<std::string> values;
         values.reserve(uniqueValues_.size());
-        for (const auto& value : uniqueValues_) {
+        uniqueValues_.forEach([&](const UniqueValue& value) {
           values.emplace_back(value.asString());
-        }
+        });
         return std::make_unique<common::BytesValues>(values, nullAllowed);
       }
       [[fallthrough]];
@@ -894,23 +892,8 @@ void VectorHasher::copyStatsFrom(const VectorHasher& other) {
   min_ = other.min_;
   max_ = other.max_;
   uniqueValues_ = other.uniqueValues_;
-  rebuildFlatIds();
   // The copied value ids may differ from the cached ones.
   clearShortValueIdCache();
-}
-
-void VectorHasher::rebuildFlatIds() {
-  if (!useFlatIds_) {
-    return;
-  }
-  flatIds_.clear();
-  if (uniqueValues_.empty()) {
-    return;
-  }
-  flatIds_.reserve(uniqueValues_.size());
-  for (const auto& value : uniqueValues_) {
-    flatIds_.put(static_cast<uint64_t>(value.data()), value.id());
-  }
 }
 
 void VectorHasher::merge(const VectorHasher& other, size_t maxNumDistinct) {
@@ -940,18 +923,20 @@ void VectorHasher::merge(const VectorHasher& other, size_t maxNumDistinct) {
   }
   // Unique values can be merged without dispatch on type. All the
   // merged hashers must stay live for string type columns.
-  for (UniqueValue value : other.uniqueValues_) {
-    // Assign a new id at end of range for the case 'value' is not
-    // in 'uniqueValues_'. We do not set overflow here because the
-    // memory is already allocated and there is a known cap on size.
-    value.setId(uniqueValues_.size() + 1);
+  bool overflow = false;
+  other.uniqueValues_.forEach([&](const UniqueValue& value) {
+    if (overflow) {
+      return;
+    }
+    // New values get an id at the end of the range. We do not set overflow
+    // here because the memory is already allocated and there is a known cap
+    // on size.
     if (uniqueValues_.insert(value).second &&
         uniqueValues_.size() > maxNumDistinct) {
       setDistinctOverflow();
-      break;
+      overflow = true;
     }
-  }
-  rebuildFlatIds();
+  });
 }
 
 std::string VectorHasher::toString() const {
