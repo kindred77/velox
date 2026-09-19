@@ -634,13 +634,14 @@ void VectorHasher::analyzeValue(StringView value) {
   }
   if (!distinctOverflow_) {
     UniqueValue unique(data, size);
-    const auto pair = uniqueValues_.insert(unique);
+    unique.setId(uniqueValues_.size() + 1);
+    auto pair = uniqueValues_.insert(unique);
     if (pair.second) {
       if (uniqueValues_.size() > kMaxDistinct) {
         setDistinctOverflow();
         return;
       }
-      copyStringToLocal(pair.first);
+      copyStringToLocal(&*pair.first);
     }
   }
 }
@@ -676,6 +677,7 @@ void VectorHasher::copyStringToLocal(const UniqueValue* unique) {
 void VectorHasher::setDistinctOverflow() {
   distinctOverflow_ = true;
   uniqueValues_.clear();
+  flatValues_.clear();
   uniqueValuesStorage_.clear();
   distinctStringsBytes_ = 0;
   clearShortValueIdCache();
@@ -702,10 +704,16 @@ std::unique_ptr<common::Filter> VectorHasher::getFilter(
     case TypeKind::BIGINT:
       if (!distinctOverflow_) {
         std::vector<int64_t> values;
-        values.reserve(uniqueValues_.size());
-        uniqueValues_.forEach([&](const UniqueValue& value) {
-          values.emplace_back(value.data());
-        });
+        values.reserve(numUniqueValues());
+        if (useFlatValueIds_) {
+          flatValues_.forEachKey([&](int64_t key) {
+            values.emplace_back(key);
+          });
+        } else {
+          for (const auto& value : uniqueValues_) {
+            values.emplace_back(value.data());
+          }
+        }
 
         return common::createBigintValues(values, nullAllowed);
       }
@@ -715,10 +723,10 @@ std::unique_ptr<common::Filter> VectorHasher::getFilter(
     case TypeKind::VARBINARY:
       if (!distinctOverflow_) {
         std::vector<std::string> values;
-        values.reserve(uniqueValues_.size());
-        uniqueValues_.forEach([&](const UniqueValue& value) {
+        values.reserve(numUniqueValues());
+        for (const auto& value : uniqueValues_) {
           values.emplace_back(value.asString());
-        });
+        }
         return std::make_unique<common::BytesValues>(values, nullAllowed);
       }
       [[fallthrough]];
@@ -841,7 +849,7 @@ void VectorHasher::cardinality(
     return;
   }
   // Padded count of values + 1 for null.
-  asDistincts = addIdReserve(uniqueValues_.size(), reservePct) + 1;
+  asDistincts = addIdReserve(numUniqueValues(), reservePct) + 1;
 }
 
 uint64_t VectorHasher::enableValueIds(uint64_t multiplier, int32_t reservePct) {
@@ -852,7 +860,7 @@ uint64_t VectorHasher::enableValueIds(uint64_t multiplier, int32_t reservePct) {
   checkTypeSupportsValueIds();
 
   multiplier_ = multiplier;
-  rangeSize_ = addIdReserve(uniqueValues_.size(), reservePct) + 1;
+  rangeSize_ = addIdReserve(numUniqueValues(), reservePct) + 1;
   isRange_ = false;
   uint64_t result;
   if (__builtin_mul_overflow(multiplier_, rangeSize_, &result)) {
@@ -892,6 +900,7 @@ void VectorHasher::copyStatsFrom(const VectorHasher& other) {
   min_ = other.min_;
   max_ = other.max_;
   uniqueValues_ = other.uniqueValues_;
+  flatValues_ = other.flatValues_;
   // The copied value ids may differ from the cached ones.
   clearShortValueIdCache();
 }
@@ -923,20 +932,34 @@ void VectorHasher::merge(const VectorHasher& other, size_t maxNumDistinct) {
   }
   // Unique values can be merged without dispatch on type. All the
   // merged hashers must stay live for string type columns.
-  bool overflow = false;
-  other.uniqueValues_.forEach([&](const UniqueValue& value) {
-    if (overflow) {
-      return;
+  if (useFlatValueIds_) {
+    bool overflow = false;
+    other.flatValues_.forEachKey([&](int64_t key) {
+      if (overflow) {
+        return;
+      }
+      // New keys get an id at the end of the range. We do not set overflow
+      // here because the memory is already allocated and there is a known cap
+      // on size.
+      if (flatValues_.insert(key).second &&
+          flatValues_.size() > maxNumDistinct) {
+        setDistinctOverflow();
+        overflow = true;
+      }
+    });
+  } else {
+    for (UniqueValue value : other.uniqueValues_) {
+      // Assign a new id at end of range for the case 'value' is not
+      // in 'uniqueValues_'. We do not set overflow here because the
+      // memory is already allocated and there is a known cap on size.
+      value.setId(uniqueValues_.size() + 1);
+      if (uniqueValues_.insert(value).second &&
+          uniqueValues_.size() > maxNumDistinct) {
+        setDistinctOverflow();
+        break;
+      }
     }
-    // New values get an id at the end of the range. We do not set overflow
-    // here because the memory is already allocated and there is a known cap
-    // on size.
-    if (uniqueValues_.insert(value).second &&
-        uniqueValues_.size() > maxNumDistinct) {
-      setDistinctOverflow();
-      overflow = true;
-    }
-  });
+  }
 }
 
 std::string VectorHasher::toString() const {
@@ -947,7 +970,7 @@ std::string VectorHasher::toString() const {
     out << " range size " << rangeSize_ << ": [" << min_ << ", " << max_ << "]";
   }
   if (!distinctOverflow_) {
-    out << " numDistinct: " << uniqueValues_.size();
+    out << " numDistinct: " << numUniqueValues();
   }
   return out.str();
 }

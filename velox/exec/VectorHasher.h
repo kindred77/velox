@@ -126,108 +126,76 @@ struct UniqueValueComparer {
   }
 };
 
-// Maps the distinct values of one 'VectorHasher' to their small integer ids.
-// Integer keys use a flat open-addressed table: mapping sparse integer keys is
-// dominated by the F14 chunk probe on the per-row input path, while dense keys
-// stay on the range fast path and never reach this table. Other key types keep
-// the F14 set.
+// Flat value -> id table used for integer keys, where mapping sparse keys was
+// dominated by the F14 chunk probe on the per-row input path; dense keys stay
+// on the range fast path and never reach this table. It is the only storage for
+// value ids of integer keys; other key types keep using the F14 set, whose
+// per-row code stays untouched.
 //
-// Entries are kept in first-seen order and ids are 'entry index + 1', so id
-// assignment matches the historical behavior. This class owns the ids; callers
-// must not pre-assign them.
-class UniqueValueMap {
+// Keys are kept in first-seen order and ids are 'key index + 1', so id
+// assignment matches the historical behavior.
+class FlatValueIds {
  public:
-  explicit UniqueValueMap(bool flat) : flat_(flat) {}
-
-  bool flat() const {
-    return flat_;
-  }
-
   size_t size() const {
-    return flat_ ? values_.size() : set_.size();
+    return keys_.size();
   }
 
   bool empty() const {
-    return flat_ ? values_.empty() : set_.empty();
+    return keys_.empty();
   }
 
   void clear() {
-    if (flat_) {
-      values_.clear();
-      slots_.clear();
-      mask_ = 0;
-    } else {
-      set_.clear();
-    }
+    keys_.clear();
+    slots_.clear();
+    mask_ = 0;
   }
 
-  // Inserts 'value' if it is not present yet. A new entry gets id
-  // 'size() + 1'. Returns the stored entry and whether it was inserted.
-  std::pair<const UniqueValue*, bool> insert(const UniqueValue& value) {
-    if (flat_) {
-      VELOX_DCHECK_EQ(value.size(), sizeof(int64_t));
-      const auto pair = insertId(value.data());
-      return {&values_[pair.first - 1], pair.second};
-    }
-    auto entry = value;
-    entry.setId(static_cast<uint32_t>(set_.size() + 1));
-    const auto pair = set_.insert(entry);
-    return {&*pair.first, pair.second};
-  }
-
-  // Fast path of 'insert' for integer keys: does not materialize a
-  // 'UniqueValue' on hits. Returns the id and whether the key was inserted.
-  std::pair<uint64_t, bool> insertId(int64_t key) {
-    VELOX_DCHECK(flat_);
+  // Inserts 'key' if it is not present yet. A new key gets id 'size() + 1'.
+  // Returns the id and whether the key was inserted.
+  std::pair<uint64_t, bool> insert(int64_t key) {
     if (slots_.empty()) {
       rehash(kInitialCapacity);
     }
     size_t slot = mix(static_cast<uint64_t>(key)) & mask_;
     while (slots_[slot] != 0) {
-      const auto& entry = values_[slots_[slot] - 1];
-      if (entry.data() == key) {
-        return {entry.id(), false};
+      const auto index = slots_[slot] - 1;
+      if (keys_[index] == key) {
+        return {index + 1, false};
       }
       slot = (slot + 1) & mask_;
     }
-    values_.emplace_back(key);
-    const uint64_t id = values_.size();
-    values_.back().setId(static_cast<uint32_t>(id));
+    keys_.emplace_back(key);
+    const uint64_t id = keys_.size();
     slots_[slot] = static_cast<uint32_t>(id);
-    if (values_.size() * kLoadFactorDenominator >=
+    if (keys_.size() * kLoadFactorDenominator >=
         slots_.size() * kLoadFactorNumerator) {
       rehash(slots_.size() * 2);
     }
     return {id, true};
   }
 
-  const UniqueValue* find(const UniqueValue& value) const {
-    if (!flat_) {
-      const auto iter = set_.find(value);
-      return iter == set_.end() ? nullptr : &*iter;
-    }
-    VELOX_DCHECK_EQ(value.size(), sizeof(int64_t));
-    return findInt64(value.data());
-  }
-
   // Returns the id of 'key' or 0 if it is not present.
-  uint64_t findId(int64_t key) const {
-    const auto* entry = findInt64(key);
-    return entry == nullptr ? 0 : entry->id();
+  uint64_t find(int64_t key) const {
+    if (slots_.empty()) {
+      return 0;
+    }
+    size_t slot = mix(static_cast<uint64_t>(key)) & mask_;
+    while (slots_[slot] != 0) {
+      const auto index = slots_[slot] - 1;
+      if (keys_[index] == key) {
+        return index + 1;
+      }
+      slot = (slot + 1) & mask_;
+    }
+    return 0;
   }
 
-  // Calls 'func' for each entry in an unspecified order. 'func' may not insert
-  // into this map.
+  // Calls 'func' for each key in first-seen order. 'func' may not insert into
+  // this table.
   template <typename Func>
-  void forEach(Func func) const {
-    if (flat_) {
-      for (const auto& entry : values_) {
-        func(entry);
-      }
-    } else {
-      for (const auto& entry : set_) {
-        func(entry);
-      }
+  void forEachKey(Func func) const {
+    for (const auto& key : keys_) {
+      func(key);
     }
   }
 
@@ -245,28 +213,11 @@ class UniqueValueMap {
     return value;
   }
 
-  const UniqueValue* findInt64(int64_t key) const {
-    VELOX_DCHECK(flat_);
-    if (slots_.empty()) {
-      return nullptr;
-    }
-    size_t slot = mix(static_cast<uint64_t>(key)) & mask_;
-    while (slots_[slot] != 0) {
-      const auto& entry = values_[slots_[slot] - 1];
-      if (entry.data() == key) {
-        return &entry;
-      }
-      slot = (slot + 1) & mask_;
-    }
-    return nullptr;
-  }
-
   void rehash(size_t capacity) {
     slots_.assign(capacity, 0);
     mask_ = capacity - 1;
-    for (size_t index = 0; index < values_.size(); ++index) {
-      size_t slot =
-          mix(static_cast<uint64_t>(values_[index].data())) & mask_;
+    for (size_t index = 0; index < keys_.size(); ++index) {
+      size_t slot = mix(static_cast<uint64_t>(keys_[index])) & mask_;
       while (slots_[slot] != 0) {
         slot = (slot + 1) & mask_;
       }
@@ -274,13 +225,10 @@ class UniqueValueMap {
     }
   }
 
-  bool flat_;
-  // Flat mode: entries in first-seen order, ids are 'index + 1'.
-  std::vector<UniqueValue> values_;
-  // Flat mode: 'values_' index + 1 per slot, 0 is empty.
+  // Keys in first-seen order, ids are 'index + 1'.
+  std::vector<int64_t> keys_;
+  // 'keys_' index + 1 per slot, 0 is empty.
   std::vector<uint32_t> slots_;
-  // Generic mode: values with their hashes.
-  folly::F14FastSet<UniqueValue, UniqueValueHasher, UniqueValueComparer> set_;
   size_t mask_{0};
 };
 
@@ -308,7 +256,7 @@ class VectorHasher {
         type_(std::move(type)),
         typeKind_(type_->kind()),
         typeProvidesCustomComparison_(type_->providesCustomComparison()),
-        uniqueValues_(typeUsesFlatValueIds(typeKind_)) {
+        useFlatValueIds_(typeUsesFlatValueIds(typeKind_)) {
     if (!typeSupportsValueIds()) {
       // Ensure any range or unique value based hashing is disabled.
       setRangeOverflow();
@@ -455,6 +403,7 @@ class VectorHasher {
 
   void resetStats() {
     uniqueValues_.clear();
+    flatValues_.clear();
     uniqueValuesStorage_.clear();
     clearShortValueIdCache();
   }
@@ -520,13 +469,14 @@ class VectorHasher {
 
   // true if no values have been added.
   bool empty() const {
-    return !hasRange_ && uniqueValues_.empty();
+    return !hasRange_ &&
+        (useFlatValueIds_ ? flatValues_.empty() : uniqueValues_.empty());
   }
 
   std::string toString() const;
 
   size_t numUniqueValues() const {
-    return uniqueValues_.size();
+    return useFlatValueIds_ ? flatValues_.size() : uniqueValues_.size();
   }
 
  private:
@@ -644,18 +594,20 @@ class VectorHasher {
       return;
     }
     if constexpr (std::is_integral_v<T>) {
-      if (uniqueValues_.flat()) {
-        if (uniqueValues_.insertId(normalized).second &&
-            uniqueValues_.size() > kMaxDistinct) {
+      if (useFlatValueIds_) {
+        if (flatValues_.insert(normalized).second &&
+            flatValues_.size() > kMaxDistinct) {
           setDistinctOverflow();
         }
         return;
       }
     }
     UniqueValue unique(normalized);
-    if (uniqueValues_.insert(unique).second &&
-        uniqueValues_.size() > kMaxDistinct) {
-      setDistinctOverflow();
+    unique.setId(uniqueValues_.size() + 1);
+    if (uniqueValues_.insert(unique).second) {
+      if (uniqueValues_.size() > kMaxDistinct) {
+        setDistinctOverflow();
+      }
     }
   }
 
@@ -709,21 +661,22 @@ class VectorHasher {
     }
 
     if constexpr (std::is_integral_v<T>) {
-      if (uniqueValues_.flat()) {
-        const auto idPair = uniqueValues_.insertId(int64Value);
-        if (!idPair.second) {
-          return idPair.first;
+      if (useFlatValueIds_) {
+        const auto id = flatValues_.insert(int64Value);
+        if (!id.second) {
+          return id.first;
         }
         updateRange(int64Value);
-        if (uniqueValues_.size() >= rangeSize_) {
+        if (flatValues_.size() >= rangeSize_) {
           return kUnmappable;
         }
-        return idPair.first;
+        return id.first;
       }
     }
 
     UniqueValue unique(value);
-    const auto pair = uniqueValues_.insert(unique);
+    unique.setId(uniqueValues_.size() + 1);
+    auto pair = uniqueValues_.insert(unique);
     if (!pair.second) {
       return pair.first->id();
     }
@@ -731,7 +684,7 @@ class VectorHasher {
     if (uniqueValues_.size() >= rangeSize_) {
       return kUnmappable;
     }
-    return pair.first->id();
+    return unique.id();
   }
 
   template <typename T>
@@ -744,14 +697,14 @@ class VectorHasher {
       return int64Value - min_ + 1;
     }
     if constexpr (std::is_integral_v<T>) {
-      if (uniqueValues_.flat()) {
-        const uint64_t id = uniqueValues_.findId(int64Value);
+      if (useFlatValueIds_) {
+        const uint64_t id = flatValues_.find(int64Value);
         return id == 0 ? kUnmappable : id;
       }
     }
     UniqueValue unique(value);
-    const auto* iter = uniqueValues_.find(unique);
-    if (iter != nullptr) {
+    auto iter = uniqueValues_.find(unique);
+    if (iter != uniqueValues_.end()) {
       return iter->id();
     }
     return kUnmappable;
@@ -879,8 +832,14 @@ class VectorHasher {
   // Bounds of the range if 'isRange_' is true.
   int64_t min_ = 1;
   int64_t max_ = 0;
-  // Maps distinct values to small ints. See 'UniqueValueMap'.
-  UniqueValueMap uniqueValues_;
+  // Table for mapping distinct values to small ints.
+  folly::F14FastSet<UniqueValue, UniqueValueHasher, UniqueValueComparer>
+      uniqueValues_;
+
+  // True for the integer key types, whose value ids live in 'flatValues_'.
+  // Other key types keep using 'uniqueValues_' with its historical code.
+  bool useFlatValueIds_{false};
+  FlatValueIds flatValues_;
 
   // Memory for unique string values.
   std::vector<std::string> uniqueValuesStorage_;
@@ -974,7 +933,8 @@ inline uint64_t VectorHasher::valueId(StringView value) {
   }
 
   UniqueValue unique(data, size);
-  const auto pair = uniqueValues_.insert(unique);
+  unique.setId(uniqueValues_.size() + 1);
+  auto pair = uniqueValues_.insert(unique);
   if (!pair.second) {
     const auto id = pair.first->id();
     if (cacheEntry != nullptr) {
@@ -986,7 +946,7 @@ inline uint64_t VectorHasher::valueId(StringView value) {
     }
     return id;
   }
-  copyStringToLocal(pair.first);
+  copyStringToLocal(&*pair.first);
   if (!rangeOverflow_) {
     if (size > kStringASRangeMaxSize) {
       setRangeOverflow();
@@ -1002,10 +962,10 @@ inline uint64_t VectorHasher::valueId(StringView value) {
     cacheEntry->word0 = word0;
     cacheEntry->word1 = word1;
     cacheEntry->word2 = word2;
-    cacheEntry->id = pair.first->id();
+    cacheEntry->id = unique.id();
     cacheEntry->size = static_cast<uint32_t>(size);
   }
-  return pair.first->id();
+  return unique.id();
 }
 
 template <>
@@ -1023,8 +983,8 @@ inline uint64_t VectorHasher::lookupValueId(StringView value) const {
     return number - min_ + 1;
   }
   UniqueValue unique(data, size);
-  const auto* iter = uniqueValues_.find(unique);
-  if (iter != nullptr) {
+  auto iter = uniqueValues_.find(unique);
+  if (iter != uniqueValues_.end()) {
     return iter->id();
   }
   return kUnmappable;
