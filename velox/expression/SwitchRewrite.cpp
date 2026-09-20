@@ -20,7 +20,63 @@
 #include "velox/expression/ExprUtils.h"
 #include "velox/expression/SwitchRewrite.h"
 
+#include <cstdlib>
+
 namespace facebook::velox::expression {
+
+namespace {
+
+/// Kill switch for the nested-IF flattening. The rewrite is on by default;
+/// set GPORCA_FLAT_CASE=0 to fall back to the original nested IF form (used for
+/// A/B measurements and as a quick rollback).
+bool flattenSwitchChains() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("GPORCA_FLAT_CASE");
+    return value == nullptr || *value == '\0' || *value != '0';
+  }();
+  return enabled;
+}
+
+bool isSwitchLike(const core::TypedExprPtr& expr) {
+  if (!expr->isCallKind()) {
+    return false;
+  }
+  const auto& name = expr->asUnchecked<core::CallTypedExpr>()->name();
+  return name == kSwitch || name == kIf;
+}
+
+/// Appends the (condition, value) pairs of a chain of nested IF/SWITCH
+/// expressions matching `resultType` to 'pairs' and returns the trailing ELSE
+/// value, or nullptr when the chain has no ELSE clause.
+core::TypedExprPtr flattenSwitchChain(
+    const core::TypedExprPtr& expr,
+    const TypePtr& resultType,
+    std::vector<core::TypedExprPtr>& pairs) {
+  if (!isSwitchLike(expr) || *expr->type() != *resultType) {
+    return expr;
+  }
+
+  const auto& inputs = expr->inputs();
+  const auto numInputs = inputs.size();
+  const bool hasElse = numInputs % 2 == 1;
+  const auto lastPair = hasElse ? numInputs - 2 : numInputs - 1;
+  for (auto i = 0; i + 1 <= lastPair; i += 2) {
+    pairs.push_back(inputs.at(i));
+    pairs.push_back(inputs.at(i + 1));
+  }
+
+  if (!hasElse) {
+    return nullptr;
+  }
+
+  const auto& elseValue = inputs.at(numInputs - 1);
+  if (isSwitchLike(elseValue) && *elseValue->type() == *resultType) {
+    return flattenSwitchChain(elseValue, resultType, pairs);
+  }
+  return elseValue;
+}
+
+} // namespace
 
 core::TypedExprPtr SwitchRewrite::rewrite(const core::TypedExprPtr& expr) {
   if (!expr->isCallKind()) {
@@ -82,6 +138,28 @@ core::TypedExprPtr SwitchRewrite::rewrite(const core::TypedExprPtr& expr) {
   // Return NULL if there are no conditions and `else` value is not present.
   if (optimizedInputs.empty()) {
     return core::ConstantTypedExpr::makeNull(expr->type());
+  }
+
+  // Flatten a chain of nested IF/SWITCH expressions into a single SWITCH with
+  // one (condition, value) pair per branch. Velox evaluates every switch
+  // expression as an independent merge: a chain of N nested IFs allocates a
+  // result vector and re-merges the whole batch at every level, while the
+  // flattened form merges all branches into a single result vector. Branch
+  // values must already have the result type, so mixed-type chains, which need
+  // coercions, are left as they are.
+  if (flattenSwitchChains() && optimizedInputs.size() % 2 == 1 &&
+      optimizedInputs.size() > 1) {
+    std::vector<core::TypedExprPtr> pairs(
+        optimizedInputs.begin(), optimizedInputs.end() - 1);
+    auto elseValue =
+        flattenSwitchChain(optimizedInputs.back(), expr->type(), pairs);
+    if (pairs.size() >= 4) {
+      if (elseValue != nullptr) {
+        pairs.push_back(elseValue);
+      }
+      return std::make_shared<core::CallTypedExpr>(
+          expr->type(), std::move(pairs), kSwitch);
+    }
   }
 
   return std::make_shared<core::CallTypedExpr>(
