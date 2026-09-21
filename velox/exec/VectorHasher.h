@@ -689,6 +689,18 @@ class VectorHasher {
     return unique.id();
   }
 
+  // Slow path of the string specialization of 'valueId': inserts or finds the
+  // value in 'uniqueValues_' and fills the cache slot recorded by the inlined
+  // hit path. Kept out of line (defined in VectorHasher.cpp) so that the
+  // per-row cache hit stays inlinable: low cardinality keys hit the cache once
+  // per row while this fallback runs once per distinct value (P8 #20).
+  FOLLY_NOINLINE uint64_t valueIdStringSlow(
+      StringView value,
+      uint64_t word0,
+      uint64_t word1,
+      uint64_t word2,
+      uint32_t cacheSlot);
+
   template <typename T>
   uint64_t lookupValueId(T value) const {
     auto int64Value = toInt64(value);
@@ -794,6 +806,17 @@ class VectorHasher {
   static constexpr uint32_t kEmptyShortValueIdCacheSize =
       std::numeric_limits<uint32_t>::max();
 
+  // Cache slot index passed to 'valueIdStringSlow' when the inline probe
+  // sequence found no empty slot to fill. Cached entries are never evicted, so
+  // such a key stays uncached and keeps taking the map fallback.
+  static constexpr uint32_t kShortValueIdCacheNoSlot =
+      std::numeric_limits<uint32_t>::max();
+
+  // P8 #20: the string value id cache hit is inlined into the row loop and only
+  // the map fallback stays out of line. False restores the previous single
+  // out-of-line body (one call per row); one-line revert on a regression.
+  static constexpr bool kShortValueIdInlineHitPath = true;
+
   struct ShortValueIdCacheEntry {
     uint64_t word0{0};
     uint64_t word1{0};
@@ -811,6 +834,91 @@ class VectorHasher {
     for (auto& entry : shortValueIdCache_) {
       entry.size = kEmptyShortValueIdCacheSize;
     }
+  }
+
+  // Probes 'shortValueIdCache_' for a non-range string key and returns its id,
+  // or 'kUnmappable' when the value has to go through 'valueIdStringSlow'. On
+  // return 'word0'..'word2' hold the cache key of 'value' and 'cacheSlot' is
+  // the empty slot the fallback may fill ('kShortValueIdCacheNoSlot' when the
+  // value is not cacheable or the probe sequence was full).
+  FOLLY_ALWAYS_INLINE uint64_t probeShortValueId(
+      StringView value,
+      uint64_t& word0,
+      uint64_t& word1,
+      uint64_t& word2,
+      uint32_t& cacheSlot) {
+    word0 = 0;
+    word1 = 0;
+    word2 = 0;
+    cacheSlot = kShortValueIdCacheNoSlot;
+    const auto size = value.size();
+    if (size > kShortValueIdCacheInlineBytes || shortValueIdCache_.empty() ||
+        uniqueValues_.size() > kShortValueIdCacheMaxDistinct) {
+      return kUnmappable;
+    }
+    const auto data = value.data();
+    const auto sizeBytes = static_cast<size_t>(size);
+    if (sizeBytes != 0) {
+      // The words stay zero for the bytes past the end of the string, so
+      // size + words form an exact key.
+      if (sizeBytes <= sizeof(word0)) {
+        if (kShortValueIdCacheNarrowLoad && value.isInline()) {
+          memcpy(&word0, data, sizeof(word0));
+          word0 &= sizeBytes == sizeof(word0)
+              ? ~0ULL
+              : ((1ULL << (8 * sizeBytes)) - 1);
+        } else {
+          memcpy(&word0, data, sizeBytes);
+        }
+      } else {
+        memcpy(&word0, data, sizeof(word0));
+        const auto rest = sizeBytes - sizeof(word0);
+        if (rest <= sizeof(word1)) {
+          memcpy(&word1, data + sizeof(word0), rest);
+        } else {
+          memcpy(&word1, data + sizeof(word0), sizeof(word1));
+          memcpy(
+              &word2,
+              data + sizeof(word0) + sizeof(word1),
+              rest - sizeof(word1));
+        }
+      }
+    }
+    // Keys of at most 8 bytes hash and compare a single word, keeping the
+    // previous per-row cost for the already covered short codes; longer keys
+    // use all words.
+    const bool shortKey = sizeBytes <= sizeof(word0);
+    const auto hash = shortKey
+        ? simd::crc32U64(0, word0)
+        : simd::crc32U64(
+              simd::crc32U64(simd::crc32U64(0, word0), word1), word2);
+    const auto slot = hash & (kShortValueIdCacheSize - 1);
+    for (uint32_t probe = 0; probe < kShortValueIdCacheMaxProbes; ++probe) {
+      const uint32_t index = (slot + probe) & (kShortValueIdCacheSize - 1);
+      auto& entry = shortValueIdCache_[index];
+      if (entry.size == size && entry.word0 == word0 &&
+          (shortKey || (entry.word1 == word1 && entry.word2 == word2))) {
+        return entry.id;
+      }
+      if (entry.size == kEmptyShortValueIdCacheSize) {
+        cacheSlot = index;
+        break;
+      }
+    }
+    return kUnmappable;
+  }
+
+  // Pre-P8 #20 shape kept behind 'kShortValueIdInlineHitPath': the probe and
+  // the fallback call stay out of line, so every row pays one call.
+  FOLLY_NOINLINE uint64_t valueIdStringOutOfLine(StringView value) {
+    uint64_t word0;
+    uint64_t word1;
+    uint64_t word2;
+    uint32_t cacheSlot;
+    const auto id = probeShortValueId(value, word0, word1, word2, cacheSlot);
+    return id != kUnmappable
+        ? id
+        : valueIdStringSlow(value, word0, word1, word2, cacheSlot);
   }
 
   // Single precomputed hash for constant partition keys.
@@ -866,7 +974,7 @@ template <>
 void VectorHasher::analyzeValue(StringView value);
 
 template <>
-inline uint64_t VectorHasher::valueId(StringView value) {
+FOLLY_ALWAYS_INLINE uint64_t VectorHasher::valueId(StringView value) {
   auto size = value.size();
   auto data = value.data();
   if (isRange_) {
@@ -888,96 +996,21 @@ inline uint64_t VectorHasher::valueId(StringView value) {
   // others only lengthens the probe sequence instead of replacing entries of
   // other keys. Longer strings and high cardinality keys take the regular
   // path below.
-  ShortValueIdCacheEntry* cacheEntry = nullptr;
+  //
+  // The hit path is inlined into the row loop while the map fallback stays out
+  // of line: low cardinality keys hit the cache once per row and only touch
+  // the fallback once per distinct value (P8 #20).
+  if (!kShortValueIdInlineHitPath) {
+    return valueIdStringOutOfLine(value);
+  }
   uint64_t word0 = 0;
   uint64_t word1 = 0;
   uint64_t word2 = 0;
-  if (size <= kShortValueIdCacheInlineBytes && !shortValueIdCache_.empty() &&
-      uniqueValues_.size() <= kShortValueIdCacheMaxDistinct) {
-    const auto sizeBytes = static_cast<size_t>(size);
-    if (sizeBytes != 0) {
-      // The words stay zero for the bytes past the end of the string, so
-      // size + words form an exact key.
-      if (sizeBytes <= sizeof(word0)) {
-        if (kShortValueIdCacheNarrowLoad && value.isInline()) {
-          memcpy(&word0, data, sizeof(word0));
-          word0 &= sizeBytes == sizeof(word0)
-              ? ~0ULL
-              : ((1ULL << (8 * sizeBytes)) - 1);
-        } else {
-          memcpy(&word0, data, sizeBytes);
-        }
-      } else {
-        memcpy(&word0, data, sizeof(word0));
-        const auto rest = sizeBytes - sizeof(word0);
-        if (rest <= sizeof(word1)) {
-          memcpy(&word1, data + sizeof(word0), rest);
-        } else {
-          memcpy(&word1, data + sizeof(word0), sizeof(word1));
-          memcpy(
-              &word2,
-              data + sizeof(word0) + sizeof(word1),
-              rest - sizeof(word1));
-        }
-      }
-    }
-    // Keys of at most 8 bytes hash and compare a single word, keeping the
-    // previous per-row cost for the already covered short codes; longer keys
-    // use all words.
-    const bool shortKey = sizeBytes <= sizeof(word0);
-    const auto hash = shortKey
-        ? simd::crc32U64(0, word0)
-        : simd::crc32U64(
-              simd::crc32U64(simd::crc32U64(0, word0), word1), word2);
-    auto slot = hash & (kShortValueIdCacheSize - 1);
-    for (uint32_t probe = 0; probe < kShortValueIdCacheMaxProbes; ++probe) {
-      auto& entry = shortValueIdCache_[(slot + probe) &
-                                       (kShortValueIdCacheSize - 1)];
-      if (entry.size == size && entry.word0 == word0 &&
-          (shortKey || (entry.word1 == word1 && entry.word2 == word2))) {
-        return entry.id;
-      }
-      if (entry.size == kEmptyShortValueIdCacheSize) {
-        cacheEntry = &entry;
-        break;
-      }
-    }
-  }
-
-  UniqueValue unique(data, size);
-  unique.setId(uniqueValues_.size() + 1);
-  auto pair = uniqueValues_.insert(unique);
-  if (!pair.second) {
-    const auto id = pair.first->id();
-    if (cacheEntry != nullptr) {
-      cacheEntry->word0 = word0;
-      cacheEntry->word1 = word1;
-      cacheEntry->word2 = word2;
-      cacheEntry->id = id;
-      cacheEntry->size = static_cast<uint32_t>(size);
-    }
-    return id;
-  }
-  copyStringToLocal(&*pair.first);
-  if (!rangeOverflow_) {
-    if (size > kStringASRangeMaxSize) {
-      setRangeOverflow();
-    } else {
-      updateRange(stringAsNumber(data, size));
-    }
-  }
-  if (uniqueValues_.size() >= rangeSize_ || distinctOverflow_) {
-    // The value has no usable id, so do not cache it.
-    return kUnmappable;
-  }
-  if (cacheEntry != nullptr) {
-    cacheEntry->word0 = word0;
-    cacheEntry->word1 = word1;
-    cacheEntry->word2 = word2;
-    cacheEntry->id = unique.id();
-    cacheEntry->size = static_cast<uint32_t>(size);
-  }
-  return unique.id();
+  uint32_t cacheSlot = kShortValueIdCacheNoSlot;
+  const auto id = probeShortValueId(value, word0, word1, word2, cacheSlot);
+  return id != kUnmappable
+      ? id
+      : valueIdStringSlow(value, word0, word1, word2, cacheSlot);
 }
 
 template <>
