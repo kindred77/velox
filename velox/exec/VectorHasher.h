@@ -780,6 +780,13 @@ class VectorHasher {
   // entry at 32 bytes and the whole table at 8KB.
   static constexpr uint32_t kShortValueIdCacheInlineBytes = 24;
 
+  // Strings of up to 8 bytes are the bulk of the cached group-by codes; a
+  // fixed width load plus a mask keeps the exact key while dropping a variable
+  // length memcpy call from the hit path. Inline values keep their bytes
+  // inside the StringView itself, so the wider load cannot leave the object.
+  // Flip to false to restore the previous form (P8 #19).
+  static constexpr bool kShortValueIdCacheNarrowLoad = true;
+
   // Value id of a string of up to 'kShortValueIdCacheInlineBytes', copied
   // inline so that comparing the copied words and the size is an exact key
   // comparison. 'kEmptyShortValueIdCacheSize' marks an unused entry; cached
@@ -892,7 +899,14 @@ inline uint64_t VectorHasher::valueId(StringView value) {
       // The words stay zero for the bytes past the end of the string, so
       // size + words form an exact key.
       if (sizeBytes <= sizeof(word0)) {
-        memcpy(&word0, data, sizeBytes);
+        if (kShortValueIdCacheNarrowLoad && value.isInline()) {
+          memcpy(&word0, data, sizeof(word0));
+          word0 &= sizeBytes == sizeof(word0)
+              ? ~0ULL
+              : ((1ULL << (8 * sizeBytes)) - 1);
+        } else {
+          memcpy(&word0, data, sizeBytes);
+        }
       } else {
         memcpy(&word0, data, sizeof(word0));
         const auto rest = sizeBytes - sizeof(word0);
