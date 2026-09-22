@@ -276,6 +276,20 @@ RowContainer::RowContainer(
     ++nullOffsetsPos;
   }
   rowColumnsStats_.resize(types_.size());
+  // P0-b1 prototype: remember where the variable-width fields live so
+  // 'initializeRow' can zero those slots only (see the switch below). Only
+  // computed for containers without accumulators, where 'offsets_' indexes the
+  // same columns as 'types_'; otherwise keep the conservative full-row zeroing.
+  if (accumulators_.empty()) {
+    for (auto i = 0; i < types_.size(); ++i) {
+      if (!types_[i]->isFixedWidth()) {
+        variableWidthOffsets_.push_back(offsets_[i]);
+        hasNonStringVariableWidth_ |= !is_string_kind(typeKinds_[i]);
+      }
+    }
+  } else {
+    hasNonStringVariableWidth_ = true;
+  }
 }
 
 RowContainer::~RowContainer() {
@@ -324,7 +338,15 @@ char* RowContainer::initializeRow(char* row, bool reuse) {
   } else if (rowSizeOffset_ != 0) {
     // zero out string views so that clear() will not hit uninited data. The
     // fastest way is to set the whole row to 0.
-    ::memset(row, 0, fixedRowSize_);
+    if (rowContainerFastPath() && !hasNonStringVariableWidth_) {
+      // Only the variable-width slots must be zeroed for 'clear()'; the other
+      // fixed-width fields are always populated by 'store' before use.
+      for (auto offset : variableWidthOffsets_) {
+        ::memset(row + offset, 0, sizeof(StringView));
+      }
+    } else {
+      ::memset(row, 0, fixedRowSize_);
+    }
   }
   if (!nullOffsets_.empty()) {
     // Sets all null and initialized bits to 0 (for each accumulator,

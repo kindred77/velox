@@ -17,6 +17,7 @@
 #include "velox/exec/window/PartitionStreamingWindowBuild.h"
 
 #include <algorithm>
+#include <cstdlib>
 
 namespace facebook::velox::exec::window {
 
@@ -55,6 +56,20 @@ bool isNewPartition(
   return false;
 }
 
+/// Stores the rows of one input batch column-by-column instead of cell-by-cell
+/// (performance_tuning 20260922, P0-b1), so the per-cell type dispatch and
+/// per-row column-stats calls collapse into one pass per column. The same rows
+/// with the same values are stored in the same partition order; only the store
+/// granularity changes. Set GPORCA_WINDOW_BATCH_STORE=0 for a one-line rollback
+/// to the cell-by-cell path.
+bool windowBatchStore() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("GPORCA_WINDOW_BATCH_STORE");
+    return value == nullptr || std::atoi(value) != 0;
+  }();
+  return enabled;
+}
+
 } // namespace
 
 PartitionStreamingWindowBuild::PartitionStreamingWindowBuild(
@@ -83,6 +98,38 @@ void PartitionStreamingWindowBuild::addInput(RowVectorPtr input) {
   }
   for (auto i = 0; i < inputChannels_.size(); ++i) {
     decodedInputVectors_[i].decode(*input->childAt(inputChannels_[i]));
+  }
+
+  if (windowBatchStore() && input->size() > 0) {
+    std::vector<char*> newRows(input->size());
+    std::vector<vector_size_t> partitionStarts;
+    for (vector_size_t row = 0; row < input->size(); ++row) {
+      if (isNewPartition(
+              input, row, previousPartitionKeyValues_, partitionKeyChannels_)) {
+        partitionStarts.push_back(row);
+      }
+      newRows[row] = data_->newRow();
+    }
+    for (auto col = 0; col < input->childrenSize(); ++col) {
+      data_->store(
+          decodedInputVectors_[col],
+          folly::Range<char**>(newRows.data(), newRows.size()),
+          col);
+    }
+    // Rows before a partition start belong to the partition that is being
+    // closed; the order of 'partitionStartRows_' is unchanged.
+    size_t begin = 0;
+    for (const auto start : partitionStarts) {
+      if (start > begin) {
+        inputRows_.insert(
+            inputRows_.end(), newRows.begin() + begin, newRows.begin() + start);
+      }
+      buildNextPartition();
+      begin = start;
+    }
+    inputRows_.insert(inputRows_.end(), newRows.begin() + begin, newRows.end());
+    previousPartitionKeyValues_.capture(input, input->size() - 1);
+    return;
   }
 
   for (auto row = 0; row < input->size(); ++row) {
