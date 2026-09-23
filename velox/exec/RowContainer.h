@@ -15,6 +15,8 @@
  */
 #pragma once
 
+#include <cstdlib>
+
 #include "velox/common/memory/HashStringAllocator.h"
 #include "velox/common/memory/MemoryAllocator.h"
 #include "velox/core/PlanNode.h"
@@ -26,6 +28,21 @@
 namespace facebook::velox::exec {
 namespace test {
 class RowContainerTestHelper;
+}
+
+/// Batched row-store fast path (performance_tuning 20260922, P0-b1). Fixed-width
+/// columns accumulate their row stats once per stored batch instead of once per
+/// cell, and rows whose variable-width fields are string views skip the
+/// full-row zeroing in 'initializeRow'. Both are semantics-preserving (min/max
+/// of a fixed-width cell is constant, and only the string-view slots must be
+/// zeroed for 'clear()'). Set GPORCA_ROWCONTAINER_FASTPATH=0 for a one-line
+/// rollback to the historical per-cell path.
+inline bool rowContainerFastPath() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("GPORCA_ROWCONTAINER_FASTPATH");
+    return value == nullptr || std::atoi(value) != 0;
+  }();
+  return enabled;
 }
 
 class Aggregate;
@@ -189,6 +206,28 @@ class RowColumn {
 
     void addNullCell() {
       ++nullCount_;
+    }
+
+    /// Adds 'count' non-null cells of the same size in one step. For
+    /// fixed-width columns every cell has the same size, so min/max stay equal
+    /// to 'bytes' and only the running totals need updating.
+    void addCellSizeBatch(int32_t bytes, uint32_t count) {
+      if (count == 0) {
+        return;
+      }
+      if (UNLIKELY(nonNullCount_ == 0)) {
+        minBytes_ = bytes;
+        maxBytes_ = bytes;
+      } else {
+        minBytes_ = std::min(minBytes_, bytes);
+        maxBytes_ = std::max(maxBytes_, bytes);
+      }
+      sumBytes_ += static_cast<uint64_t>(bytes) * count;
+      nonNullCount_ += count;
+    }
+
+    void addNullCells(uint32_t count) {
+      nullCount_ += count;
     }
 
     void removeOrUpdateCellStats(int32_t bytes, bool wasNull, bool setToNull);
@@ -1150,6 +1189,22 @@ class RowContainer {
       int32_t nullByte,
       uint8_t nullMask,
       int32_t column) {
+    if (rowContainerFastPath() && !rowColumnsStats_.empty() &&
+        types_[column]->isFixedWidth()) {
+      // Fixed-width cells all have the same size: store the values, count the
+      // nulls and update the column stats once for the whole batch.
+      uint32_t nulls = 0;
+      for (int32_t i = 0; i < rows.size(); ++i) {
+        nulls += decoded.isNullAt(i) ? 1 : 0;
+        storeWithNulls<Kind>(
+            decoded, i, isKey, rows[i], offset, nullByte, nullMask, column);
+      }
+      auto& columnStats = rowColumnsStats_[column];
+      columnStats.addCellSizeBatch(
+          fixedSizeAt(column), static_cast<uint32_t>(rows.size()) - nulls);
+      columnStats.addNullCells(nulls);
+      return;
+    }
     for (int32_t i = 0; i < rows.size(); ++i) {
       storeWithNulls<Kind>(
           decoded, i, isKey, rows[i], offset, nullByte, nullMask, column);
@@ -1164,6 +1219,15 @@ class RowContainer {
       bool isKey,
       int32_t offset,
       int32_t column) {
+    if (rowContainerFastPath() && !rowColumnsStats_.empty() &&
+        types_[column]->isFixedWidth()) {
+      for (int32_t i = 0; i < rows.size(); ++i) {
+        storeNoNulls<Kind>(decoded, i, isKey, rows[i], offset);
+      }
+      rowColumnsStats_[column].addCellSizeBatch(
+          fixedSizeAt(column), static_cast<uint32_t>(rows.size()));
+      return;
+    }
     for (int32_t i = 0; i < rows.size(); ++i) {
       storeNoNulls<Kind>(decoded, i, isKey, rows[i], offset);
       updateColumnStats(decoded, i, rows[i], column);
@@ -1598,6 +1662,12 @@ class RowContainer {
   std::vector<int32_t> nullOffsets_;
   // Position of field or accumulator. Corresponds 1:1 to 'nullOffset_'.
   std::vector<int32_t> offsets_;
+  // P0-b1 prototype: byte offsets of variable-width fields so 'initializeRow'
+  // can zero only those slots instead of the whole fixed row.
+  // 'hasNonStringVariableWidth_' keeps the conservative full-row zeroing when a
+  // variable-width field is not a StringView.
+  std::vector<int32_t> variableWidthOffsets_;
+  bool hasNonStringVariableWidth_{false};
   // Offset and null indicator offset of non-aggregate fields as a single word.
   // Corresponds pairwise to 'types_'.
   std::vector<RowColumn> rowColumns_;

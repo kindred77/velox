@@ -85,20 +85,37 @@ void VectorWindowPartition::addRows(
   totalRows_ += range.size();
 }
 
-void VectorWindowPartition::removeProcessedRows(vector_size_t numRows) {
+void VectorWindowPartition::removeProcessedRows(
+    vector_size_t numRows,
+    vector_size_t rowsToRetain) {
   VELOX_CHECK_LE(numRows, totalRows_);
   if (numRows == 0) {
     return;
   }
 
-  if (complete() && numRows == totalRows_) {
+  consumedRows_ += numRows;
+  // Keep exactly the trailing 'rowsToRetain' consumed rows a bounded-backward
+  // window function still reads. Removing only 'numRows - rowsToRetain' rows
+  // would keep the rows retained by the earlier calls as well, so the retention
+  // would grow with every output block of a long partial partition and keep the
+  // input vectors it points into alive.
+  const auto targetStartRow =
+      consumedRows_ > rowsToRetain ? consumedRows_ - rowsToRetain : 0;
+  const auto rowsToRemove =
+      targetStartRow > startRow_ ? targetStartRow - startRow_ : 0;
+  if (rowsToRemove == 0) {
+    return;
+  }
+  VELOX_CHECK_LE(rowsToRemove, totalRows_);
+
+  if (complete() && rowsToRemove == totalRows_) {
     previousRow_.reset();
   } else {
-    const auto [rangeIndex, localRow] = findRange(numRows - 1);
+    const auto [rangeIndex, localRow] = findRange(rowsToRemove - 1);
     previousRow_.capture(ranges_[rangeIndex].input, localRow);
   }
 
-  auto remaining = numRows;
+  auto remaining = rowsToRemove;
   while (remaining > 0) {
     auto& range = ranges_.front();
     const auto rangeSize = range.size();
@@ -111,7 +128,7 @@ void VectorWindowPartition::removeProcessedRows(vector_size_t numRows) {
     }
   }
 
-  startRow_ += numRows;
+  startRow_ += rowsToRemove;
   rebuildPrefixSums();
 }
 
@@ -160,20 +177,55 @@ void VectorWindowPartition::extractColumn(
 
   result->resize(resultOffset + rowNumbers.size());
 
-  for (auto i = 0; i < rowNumbers.size(); ++i) {
-    const auto rowNumber = rowNumbers[i];
-    if (rowNumber < 0) {
-      result->setNull(resultOffset + i, true);
+  // Copies 'numRows' rows starting at the absolute partition row 'firstRow',
+  // splitting the copy at retained range boundaries.
+  auto copyRun = [&](vector_size_t firstRow,
+                     vector_size_t numRows,
+                     vector_size_t out) {
+    VELOX_CHECK_GE(firstRow, startRow_);
+    auto [rangeIndex, localRow] = findRange(firstRow - startRow_);
+    auto remaining = numRows;
+    while (remaining > 0) {
+      const auto& range = ranges_[rangeIndex];
+      const auto numRowsToCopy =
+          std::min(range.endRow - localRow, remaining);
+      result->copy(
+          range.input->childAt(columnIndex).get(),
+          out,
+          localRow,
+          numRowsToCopy);
+      out += numRowsToCopy;
+      remaining -= numRowsToCopy;
+      if (remaining > 0) {
+        ++rangeIndex;
+        localRow = ranges_[rangeIndex].startRow;
+      }
+    }
+  };
+
+  // Window functions that shift a whole output block by a constant (lag with a
+  // constant offset) or scan backwards emit contiguous row numbers, so maximal
+  // contiguous runs are copied in one call each instead of one per row. This
+  // keeps the range lookup amortized and drops the per-row virtual copy that
+  // otherwise dominates the rows-streaming build for such functions
+  // (performance_tuning 20260922, P0-b2 route B).
+  const auto numRows = static_cast<vector_size_t>(rowNumbers.size());
+  vector_size_t runStart = 0;
+  while (runStart < numRows) {
+    const auto firstRow = rowNumbers[runStart];
+    if (firstRow < 0) {
+      result->setNull(resultOffset + runStart, true);
+      ++runStart;
       continue;
     }
 
-    VELOX_CHECK_GE(rowNumber, startRow_);
-    const auto [rangeIndex, localRow] = findRange(rowNumber - startRow_);
-    result->copy(
-        ranges_[rangeIndex].input->childAt(columnIndex).get(),
-        resultOffset + i,
-        localRow,
-        1);
+    auto runLength = 1;
+    while (runStart + runLength < numRows &&
+           rowNumbers[runStart + runLength] == firstRow + runLength) {
+      ++runLength;
+    }
+    copyRun(firstRow, runLength, resultOffset + runStart);
+    runStart += runLength;
   }
 }
 
@@ -287,11 +339,39 @@ class VectorWindowPartition::VectorAccessor {
   }
 
   // Returns a reference to the absolute partition row.
+  //
+  // The peer and frame computations walk rows in increasing order, so a cursor
+  // over the retained ranges keeps the lookup O(1) amortized per row instead of
+  // a binary search over the range prefix sums (performance_tuning 20260922,
+  // P0-b2 route B). Requests that jump backwards (a peer group start that is
+  // behind the current cursor, as when a fixed start is compared against an
+  // increasing end) do NOT move the cursor: resetting it would make the
+  // following forward request walk the ranges again (measured: quadratic peer
+  // walk for a large peer group), so they use a temporary binary search.
   RowReference rowAt(vector_size_t row) const {
     VELOX_CHECK_GE(row, partition_.startRow_);
-    const auto [rangeIndex, localRow] =
-        partition_.findRange(row - partition_.startRow_);
-    return {partition_.ranges_[rangeIndex].input, localRow};
+    const auto retainedRow = row - partition_.startRow_;
+    if (rangeIndex_ < 0) {
+      const auto [rangeIndex, localRow] = partition_.findRange(retainedRow);
+      rangeIndex_ = static_cast<int32_t>(rangeIndex);
+      rangeStartRetained_ =
+          retainedRow - (localRow - partition_.ranges_[rangeIndex].startRow);
+    } else if (retainedRow < rangeStartRetained_) {
+      const auto [rangeIndex, localRow] = partition_.findRange(retainedRow);
+      return {partition_.ranges_[rangeIndex].input, localRow};
+    } else {
+      auto rangeIndex = static_cast<size_t>(rangeIndex_);
+      while (retainedRow >=
+             rangeStartRetained_ + partition_.ranges_[rangeIndex].size()) {
+        rangeStartRetained_ += partition_.ranges_[rangeIndex].size();
+        ++rangeIndex;
+        VELOX_DCHECK_LT(rangeIndex, partition_.ranges_.size());
+      }
+      rangeIndex_ = static_cast<int32_t>(rangeIndex);
+    }
+    const auto rangeIndex = static_cast<size_t>(rangeIndex_);
+    const auto& range = partition_.ranges_[rangeIndex];
+    return {range.input, range.startRow + (retainedRow - rangeStartRetained_)};
   }
 
   // Returns true if two retained rows are equal over the specified keys.
@@ -312,6 +392,11 @@ class VectorWindowPartition::VectorAccessor {
   }
 
   const VectorWindowPartition& partition_;
+
+  // Retained range and the retained index of its first row, cached by 'rowAt'
+  // to make monotonic row accesses O(1) amortized.
+  mutable int32_t rangeIndex_{-1};
+  mutable vector_size_t rangeStartRetained_{0};
 };
 
 std::pair<vector_size_t, vector_size_t>

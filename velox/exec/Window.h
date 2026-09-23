@@ -51,7 +51,8 @@ class Window : public Operator {
   RowVectorPtr getOutput() override;
 
   bool needsInput() const override {
-    return !noMoreInput_ && windowBuild_->needsInput();
+    return !noMoreInput_ &&
+        (rowsStreamingGatePending_ || windowBuild_->needsInput());
   }
 
   void noMoreInput() override;
@@ -97,6 +98,24 @@ class Window : public Operator {
   // Currently we supports 'rank', 'dense_rank' and 'row_number' functions with
   // any frame type. Also supports the agg window function with default frame.
   bool supportRowsStreaming();
+
+  // Starts sampling the ORDER BY key repetition of the input to decide which
+  // partial-partition build serves this query. Only used when the
+  // rows-streaming build is accepted for a bounded-backward function ('lag'
+  // with a constant offset), see 'rowsStreamingGatePending_'.
+  void initRowsStreamingGate(
+      const std::shared_ptr<const core::WindowNode>& windowNode);
+
+  // Samples the adjacent-row ORDER BY key repetition of one input batch.
+  // Returns true when enough rows were seen to take the build decision.
+  bool sampleRowsStreamingGate(const RowVectorPtr& input);
+
+  // Returns true if the sampled peer rate allows the rows-streaming build.
+  bool rowsStreamingGatePickedRowsStreaming() const;
+
+  // Commits the sampled decision: creates the selected build when it differs
+  // from the one created by the constructor and replays buffered input rows.
+  void resolveRowsStreamingGate(bool useRowsStreaming);
 
   // Creates WindowFunction and frame objects for this operator.
   void createWindowFunctions();
@@ -230,6 +249,29 @@ class Window : public Operator {
 
   // Tracks how far along the partition rows have been output.
   vector_size_t partitionOffset_ = 0;
+
+  // Rows that must stay retained in a partial (rows-streaming) partition
+  // because a bounded-backward window function (lag with a constant offset)
+  // still reads them after their own output row was produced. Zero unless
+  // 'supportRowsStreaming' accepted such a function.
+  vector_size_t lookbackRows_{0};
+
+  // While 'rowsStreamingGatePending_' is set, the operator holds the first
+  // input batches back instead of handing them to a build, and samples how
+  // often adjacent input rows share the ORDER BY keys. The vector partition
+  // computes peers row by row over retained input vectors, which only pays off
+  // when those keys are nearly unique; a repetitive key (measured: 3.1k rows
+  // per peer group for clicks) reverses the trade-off and the container-based
+  // build is kept instead. 'gateBufferedInputs_' grows to at most
+  // 'kMaxGatePendingBatches' batches, so the decision costs neither memory nor
+  // a delay of more than that many batches.
+  bool rowsStreamingGatePending_{false};
+  std::vector<RowVectorPtr> gateBufferedInputs_;
+  std::shared_ptr<const core::WindowNode> gateWindowNode_;
+  std::vector<column_index_t> gatePartitionKeyChannels_;
+  std::vector<column_index_t> gateSortKeyChannels_;
+  vector_size_t gateSampledPairs_{0};
+  vector_size_t gateEqualPairs_{0};
 
   // When traversing input partition rows, the peers are the rows with the same
   // values for the ORDER BY clause. These rows are equal in some ways and

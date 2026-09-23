@@ -646,6 +646,49 @@ void VectorHasher::analyzeValue(StringView value) {
   }
 }
 
+uint64_t VectorHasher::valueIdStringSlow(
+    StringView value,
+    uint64_t word0,
+    uint64_t word1,
+    uint64_t word2,
+    uint32_t cacheSlot) {
+  const auto size = value.size();
+  auto data = value.data();
+  // Mirrors the cache fill of the inlined hit path: no-op when the probe
+  // sequence found no empty slot.
+  auto fillCache = [&](uint32_t id) {
+    if (cacheSlot != kShortValueIdCacheNoSlot) {
+      auto& entry = shortValueIdCache_[cacheSlot];
+      entry.word0 = word0;
+      entry.word1 = word1;
+      entry.word2 = word2;
+      entry.id = id;
+      entry.size = static_cast<uint32_t>(size);
+    }
+    return id;
+  };
+
+  UniqueValue unique(data, size);
+  unique.setId(uniqueValues_.size() + 1);
+  auto pair = uniqueValues_.insert(unique);
+  if (!pair.second) {
+    return fillCache(pair.first->id());
+  }
+  copyStringToLocal(&*pair.first);
+  if (!rangeOverflow_) {
+    if (size > kStringASRangeMaxSize) {
+      setRangeOverflow();
+    } else {
+      updateRange(stringAsNumber(data, size));
+    }
+  }
+  if (uniqueValues_.size() >= rangeSize_ || distinctOverflow_) {
+    // The value has no usable id, so do not cache it.
+    return kUnmappable;
+  }
+  return fillCache(unique.id());
+}
+
 void VectorHasher::copyStringToLocal(const UniqueValue* unique) {
   auto size = unique->size();
   if (size <= sizeof(int64_t)) {

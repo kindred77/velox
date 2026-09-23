@@ -175,8 +175,12 @@ std::shared_ptr<WindowPartition> RowsStreamingWindowBuild::nextPartition() {
   //
   // NOTE: the window operator only calls this after processing a completed
   // partition.
+  //
+  // A completed partition is released once it has no unconsumed rows left.
+  // Rows that are retained only for backward lookback (Window::lookbackRows_)
+  // do not keep it in the queue.
   if (!windowPartitions_.empty() && windowPartitions_.front()->complete() &&
-      windowPartitions_.front()->numRows() == 0) {
+      !windowPartitions_.front()->hasUnconsumedRows()) {
     windowPartitions_.pop_front();
   }
 
@@ -190,7 +194,8 @@ bool RowsStreamingWindowBuild::hasNextPartition() {
   for (auto it = windowPartitions_.rbegin(); it != windowPartitions_.rend();
        ++it) {
     const auto& windowPartition = *it;
-    if (!windowPartition->complete() || windowPartition->numRows() > 0) {
+    if (!windowPartition->complete() ||
+        windowPartition->hasUnconsumedRows()) {
       return true;
     }
   }

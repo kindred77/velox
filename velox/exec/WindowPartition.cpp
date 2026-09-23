@@ -84,8 +84,13 @@ void WindowPartition::eraseRows(vector_size_t numRows) {
   data_->eraseRows(folly::Range<char**>(rows_.data(), numRows));
 }
 
-void WindowPartition::removeProcessedRows(vector_size_t numRows) {
+void WindowPartition::removeProcessedRows(
+    vector_size_t numRows,
+    vector_size_t rowsToRetain) {
   checkPartial();
+  // Row-container based partial partitions do not retain lookback rows; only
+  // the vector partition (rows-streaming build) supports that.
+  VELOX_CHECK_EQ(rowsToRetain, 0);
 
   VELOX_CHECK_NULL(previousRow_);
   if (complete_ && rows_.size() == numRows) {

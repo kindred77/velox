@@ -17,10 +17,127 @@
 #include "velox/exec/window/SortWindowBuild.h"
 #include "velox/exec/MemoryReclaimer.h"
 #include "velox/exec/Window.h"
+#include "velox/common/base/BitUtil.h"
+
+#include <algorithm>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
 
 namespace facebook::velox::exec::window {
 
 namespace {
+
+// The group build packs the row index into the low 32 bits of its sort word.
+constexpr size_t kGroupBuildMaxRows = 0xFFFFFFFFULL;
+// Rows inspected by the adaptive gate before choosing the build strategy.
+constexpr size_t kGroupBuildSampleRows = 4096;
+// Below this input size sorting is cheap enough that the extra grouping pass
+// does not pay off.
+constexpr size_t kGroupBuildMinRows = 64 * 1024;
+// The group build replaces the global prefix sort with a hash grouping plus a
+// per-partition sort. It wins when partitions are small: the global sort spends
+// most of its comparisons ordering rows of *different* partitions. Enable it
+// only when the sampled distinct partition ratio implies an average partition
+// of at most 16 rows; with fewer, larger partitions the normalized-key prefix
+// sort stays the cheaper path. This is a data-driven runtime guard with a
+// conservative fallback and needs no statistics.
+constexpr double kGroupBuildMinDistinctRatio = 1.0 / 16.0;
+
+// Runtime stat exposing which build strategy was chosen (0 = global prefix
+// sort, 1 = hash group build) so debug task stats stay attributable.
+constexpr std::string_view kWindowBuildShape{"windowBuildShape"};
+constexpr int64_t kWindowBuildShapePrefixSort = 0;
+constexpr int64_t kWindowBuildShapeGroup = 1;
+
+// Kill switch, mirroring the other execution-layer flags: default on, set
+// GPORCA_WINDOW_GROUP_BUILD=0 to force the historical prefix-sort path.
+bool windowGroupBuildEnabled() {
+  static const bool enabled = [] {
+    const char* flag = std::getenv("GPORCA_WINDOW_GROUP_BUILD");
+    return flag == nullptr || std::strcmp(flag, "0") != 0;
+  }();
+  return enabled;
+}
+
+// Hashes the partition-key columns of a stored row. Integral keys are hashed
+// with a single fused pass over the row storage; other key types fall back to
+// RowContainer::hash per column so the mechanism stays type-generic.
+struct PartitionKeyHasher {
+  PartitionKeyHasher(
+      const RowContainer* data,
+      const std::vector<std::pair<column_index_t, core::SortOrder>>&
+          partitionKeys)
+      : data_(data) {
+    channels_.reserve(partitionKeys.size());
+    columns_.reserve(partitionKeys.size());
+    kinds_.reserve(partitionKeys.size());
+    for (const auto& key : partitionKeys) {
+      channels_.push_back(key.first);
+      columns_.push_back(data_->columnAt(key.first));
+      kinds_.push_back(data_->keyTypes()[key.first]->kind());
+    }
+    for (const auto kind : kinds_) {
+      if (kind != TypeKind::TINYINT && kind != TypeKind::SMALLINT &&
+          kind != TypeKind::INTEGER && kind != TypeKind::BIGINT) {
+        integral_ = false;
+        break;
+      }
+    }
+  }
+
+  uint64_t operator()(const char* row) const {
+    if (!integral_) {
+      char* mutableRow = const_cast<char*>(row);
+      folly::Range<char**> single(&mutableRow, 1);
+      uint64_t hash = 0;
+      for (size_t k = 0; k < columns_.size(); ++k) {
+        data_->hash(channels_[k], single, k > 0, &hash);
+      }
+      return hash;
+    }
+    uint64_t hash = 0;
+    for (size_t k = 0; k < columns_.size(); ++k) {
+      uint64_t valueHash;
+      if (RowContainer::isNullAt(row, columns_[k])) {
+        valueHash = BaseVector::kNullHash;
+      } else {
+        switch (kinds_[k]) {
+          case TypeKind::TINYINT:
+            valueHash = static_cast<uint64_t>(
+                data_->readValueAt<int8_t>(row, columns_[k].offset()));
+            break;
+          case TypeKind::SMALLINT:
+            valueHash = static_cast<uint64_t>(
+                data_->readValueAt<int16_t>(row, columns_[k].offset()));
+            break;
+          case TypeKind::INTEGER:
+            valueHash = static_cast<uint64_t>(
+                data_->readValueAt<int32_t>(row, columns_[k].offset()));
+            break;
+          default:
+            valueHash = static_cast<uint64_t>(
+                data_->readValueAt<int64_t>(row, columns_[k].offset()));
+            break;
+        }
+      }
+      hash = bits::hashMix(hash, valueHash);
+    }
+    return bits::hashMix(hash, 0x9e3779b97f4a7c15ULL);
+  }
+
+ private:
+  const RowContainer* data_;
+  std::vector<column_index_t> channels_;
+  std::vector<RowColumn> columns_;
+  std::vector<TypeKind> kinds_;
+  bool integral_{true};
+};
+
 std::vector<CompareFlags> makeCompareFlags(
     int32_t numPartitionKeys,
     const std::vector<core::SortOrder>& sortingOrders) {
@@ -265,18 +382,127 @@ void SortWindowBuild::computePartitionStartRows() {
 }
 
 void SortWindowBuild::sortPartitions() {
-  // This is a very inefficient but easy implementation to order the input rows
-  // by partition keys + sort keys.
-  // Sort the pointers to the rows in RowContainer (data_) instead of sorting
-  // the rows.
   sortedRows_.resize(numRows_);
   RowContainerIterator iter;
   data_->listRows(&iter, numRows_, sortedRows_.data());
 
+  const size_t numRows = sortedRows_.size();
+  const PartitionKeyHasher hashPartitionKeys(data_.get(), partitionKeyInfo_);
+
+  // Adaptive gate: group by partition-key hash when the shape is "many small
+  // partitions", otherwise keep the global prefix sort. The sample is strided
+  // over the container so it does not depend on insertion clustering.
+  const bool useGroupBuild = [&]() {
+    if (!windowGroupBuildEnabled() || numRows < kGroupBuildMinRows ||
+        numRows > kGroupBuildMaxRows) {
+      return false;
+    }
+    const size_t sampleSize = std::min(numRows, kGroupBuildSampleRows);
+    const size_t step = std::max<size_t>(1, numRows / sampleSize);
+    std::vector<uint64_t> sampleHashes;
+    sampleHashes.reserve(sampleSize);
+    for (size_t i = 0; i < numRows && sampleHashes.size() < sampleSize;
+         i += step) {
+      sampleHashes.push_back(hashPartitionKeys(sortedRows_[i]));
+    }
+    std::sort(sampleHashes.begin(), sampleHashes.end());
+    sampleHashes.erase(
+        std::unique(sampleHashes.begin(), sampleHashes.end()),
+        sampleHashes.end());
+    return static_cast<double>(sampleHashes.size()) / sampleSize >=
+        kGroupBuildMinDistinctRatio;
+  }();
+
+  const auto recordBuildShape = [&](int64_t shape) {
+    auto lockedStats = opStats_->wlock();
+    lockedStats->runtimeStats[std::string(kWindowBuildShape)] =
+        RuntimeMetric(shape);
+  };
+
+  if (useGroupBuild) {
+    // Group rows by partition key instead of running one global sort:
+    //   1) hash the partition keys of every row,
+    //   2) sort "leading hash bits | row index" words (8 bytes per row, half
+    //      the traffic of sorting (key, pointer) pairs),
+    //   3) split equal-hash runs with the full key comparison - so hash
+    //      collisions stay correct - and order the rows inside each partition.
+    std::vector<uint64_t> sortWords(numRows);
+    for (size_t i = 0; i < numRows; ++i) {
+      const auto hash = hashPartitionKeys(sortedRows_[i]);
+      sortWords[i] =
+          (hash & 0xFFFFFFFF00000000ULL) | static_cast<uint64_t>(i);
+    }
+    std::sort(sortWords.begin(), sortWords.end());
+
+    std::vector<char*> originalOrder(sortedRows_.begin(), sortedRows_.end());
+    for (size_t i = 0; i < numRows; ++i) {
+      const auto source = static_cast<uint32_t>(sortWords[i]);
+      sortedRows_[i] = originalOrder[source];
+    }
+
+    const auto sortPartitionRows = [&](size_t begin, size_t end) {
+      if (end - begin <= 16) {
+        // Micro-partitions dominate in the gated shape, so insertion sort
+        // avoids the per-comparison call overhead of std::sort.
+        for (size_t i = begin + 1; i < end; ++i) {
+          char* row = sortedRows_[i];
+          size_t pos = i;
+          while (pos > begin &&
+                 compareRowsWithKeys(row, sortedRows_[pos - 1], allKeyInfo_)) {
+            sortedRows_[pos] = sortedRows_[pos - 1];
+            --pos;
+          }
+          sortedRows_[pos] = row;
+        }
+      } else {
+        std::sort(
+            sortedRows_.begin() + begin,
+            sortedRows_.begin() + end,
+            [&](const char* lhs, const char* rhs) {
+              return compareRowsWithKeys(lhs, rhs, allKeyInfo_);
+            });
+      }
+    };
+
+    partitionStartRows_.clear();
+    partitionStartRows_.push_back(0);
+    size_t runStart = 0;
+    while (runStart < numRows) {
+      const uint64_t runKey = sortWords[runStart] >> 32;
+      size_t runEnd = runStart + 1;
+      while (runEnd < numRows && (sortWords[runEnd] >> 32) == runKey) {
+        ++runEnd;
+      }
+      if (runEnd - runStart > 1) {
+        sortPartitionRows(runStart, runEnd);
+        for (size_t i = runStart + 1; i < runEnd; ++i) {
+          if (compareRowsWithKeys(
+                  sortedRows_[i - 1], sortedRows_[i], partitionKeyInfo_)) {
+            partitionStartRows_.push_back(i);
+          }
+        }
+      }
+      // Rows in different hash runs always belong to different partitions, so
+      // every run boundary is also a partition boundary.
+      if (runEnd < numRows) {
+        partitionStartRows_.push_back(runEnd);
+      }
+      runStart = runEnd;
+    }
+    partitionStartRows_.push_back(numRows);
+    recordBuildShape(kWindowBuildShapeGroup);
+    return;
+  }
+
+  // This is a very inefficient but easy implementation to order the input rows
+  // by partition keys + sort keys.
+  // Sort the pointers to the rows in RowContainer (data_) instead of sorting
+  // the rows.
   PrefixSort::sort(
       data_.get(), compareFlags_, prefixSortConfig_, pool_, sortedRows_);
 
   computePartitionStartRows();
+  recordBuildShape(kWindowBuildShapePrefixSort);
 }
 
 void SortWindowBuild::noMoreInput() {

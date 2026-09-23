@@ -29,18 +29,26 @@ namespace facebook::velox::exec {
 /// zero.
 class HashPartitionFunction : public core::PartitionFunction {
  public:
+  /// 'segmentChannel' (when set) marks a *segment* column of a segmented
+  /// window's (partition key..., segment) bucket exchange: all key channels
+  /// are hashed as usual, but the segment value rotates the landing driver so
+  /// that one key's segments spread over the drivers instead of being placed
+  /// independently. Every (key, segment) bucket still lands on exactly one
+  /// driver, so partitioned consumers keep their co-location invariant.
   HashPartitionFunction(
       bool localExchange,
       int numPartitions,
       const RowTypePtr& inputType,
       const std::vector<column_index_t>& keyChannels,
-      const std::vector<VectorPtr>& constValues = {});
+      const std::vector<VectorPtr>& constValues = {},
+      std::optional<column_index_t> segmentChannel = std::nullopt);
 
   HashPartitionFunction(
       const HashBitRange& hashBitRange,
       const RowTypePtr& inputType,
       const std::vector<column_index_t>& keyChannels,
-      const std::vector<VectorPtr>& constValues = {});
+      const std::vector<VectorPtr>& constValues = {},
+      std::optional<column_index_t> segmentChannel = std::nullopt);
 
   ~HashPartitionFunction() override = default;
 
@@ -61,11 +69,16 @@ class HashPartitionFunction : public core::PartitionFunction {
   const bool localExchange_;
   const int numPartitions_;
   const std::optional<HashBitRange> hashBitRange_ = std::nullopt;
+  const std::optional<column_index_t> segmentChannel_ = std::nullopt;
+  /// Index of the segment column inside 'hashers_', -1 when disabled.
+  int segmentHasherIndex_{-1};
   std::vector<std::unique_ptr<VectorHasher>> hashers_;
 
   // Reusable memory.
   SelectivityVector rows_;
   raw_vector<uint64_t> hashes_;
+  /// Key-only hash snapshot used by the segment rotation.
+  raw_vector<uint64_t> segmentKeyHashes_;
 };
 
 /// Factory class to create HashPartitionFunction
@@ -78,10 +91,12 @@ class HashPartitionFunctionSpec : public core::PartitionFunctionSpec {
   HashPartitionFunctionSpec(
       RowTypePtr inputType,
       std::vector<column_index_t> keyChannels,
-      std::vector<VectorPtr> constValues = {})
+      std::vector<VectorPtr> constValues = {},
+      std::optional<column_index_t> segmentChannel = std::nullopt)
       : inputType_{std::move(inputType)},
         keyChannels_{std::move(keyChannels)},
-        constValues_{std::move(constValues)} {}
+        constValues_{std::move(constValues)},
+        segmentChannel_{segmentChannel} {}
 
   std::unique_ptr<core::PartitionFunction> create(
       int numPartitions,
@@ -99,5 +114,7 @@ class HashPartitionFunctionSpec : public core::PartitionFunctionSpec {
   const RowTypePtr inputType_;
   const std::vector<column_index_t> keyChannels_;
   const std::vector<VectorPtr> constValues_;
+  /// Set for segmented-window bucket exchanges; see HashPartitionFunction.
+  const std::optional<column_index_t> segmentChannel_;
 };
 } // namespace facebook::velox::exec
