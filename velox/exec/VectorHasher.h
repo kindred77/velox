@@ -817,6 +817,19 @@ class VectorHasher {
   // out-of-line body (one call per row); one-line revert on a regression.
   static constexpr bool kShortValueIdInlineHitPath = true;
 
+  // P1-a (2026-09-23): keys that fit in the StringView object build the cache
+  // key straight from it - two loads instead of the size dependent
+  // memcpy/mask sequence below - which halves the per row cost of the hottest
+  // aggregation path (mapping string group-by keys to value ids). Inline
+  // strings keep size plus their 12 content bytes in the object with the tail
+  // zeroed (StringView relies on that for its own word-wise comparisons), so
+  // the words stay bit for bit identical to the previous form and cache
+  // entries remain interchangeable. Keys longer than the inline limit keep the
+  // previous path, which is where the condition was already paid. False
+  // restores the previous key build ('kShortValueIdCacheNarrowLoad' then
+  // applies again); one-line revert on a regression.
+  static constexpr bool kStringObjectKey = true;
+
   struct ShortValueIdCacheEntry {
     uint64_t word0{0};
     uint64_t word1{0};
@@ -861,7 +874,20 @@ class VectorHasher {
     if (sizeBytes != 0) {
       // The words stay zero for the bytes past the end of the string, so
       // size + words form an exact key.
-      if (sizeBytes <= sizeof(word0)) {
+      if (kStringObjectKey && value.isInline()) {
+        // Size and the 12 content bytes live in the object itself, so two
+        // loads give the same key as the memcpy/mask form without its length
+        // dependent branches.
+        uint64_t object0;
+        uint64_t object1;
+        memcpy(&object0, &value, sizeof(object0));
+        memcpy(
+            &object1,
+            reinterpret_cast<const char*>(&value) + sizeof(object0),
+            sizeof(object1));
+        word0 = (object0 >> 32) | (object1 << 32);
+        word1 = object1 >> 32;
+      } else if (sizeBytes <= sizeof(word0)) {
         if (kShortValueIdCacheNarrowLoad && value.isInline()) {
           memcpy(&word0, data, sizeof(word0));
           word0 &= sizeBytes == sizeof(word0)
