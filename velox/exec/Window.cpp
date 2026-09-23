@@ -22,6 +22,11 @@
 #include "velox/exec/window/SortWindowBuild.h"
 #include "velox/exec/window/SubPartitionedSortWindowBuild.h"
 
+#include <algorithm>
+#include <cstdlib>
+#include <optional>
+#include <vector>
+
 namespace facebook::velox::exec {
 
 namespace {
@@ -31,6 +36,96 @@ common::PrefixSortConfig makePrefixSortConfig(
       queryConfig.prefixSortNormalizedKeyMaxBytes(),
       queryConfig.prefixSortMinRows(),
       queryConfig.prefixSortMaxStringPrefixLength()};
+}
+
+/// Performance switch (performance_tuning 20260922, P0-b2/R1): lets 'lag' with
+/// a constant, non-negative offset use the rows-streaming build. The build then
+/// retains the rows the function still needs to look back at. The build is only
+/// chosen when the sampled ORDER BY key repetition allows it (see
+/// 'kMaxStreamingPeerRate'); set GPORCA_WINDOW_LAG_ROWS_STREAM=0 for a one-line
+/// rollback to the historical container-based build.
+bool lagRowsStreamingEnabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("GPORCA_WINDOW_LAG_ROWS_STREAM");
+    return value == nullptr || std::atoi(value) != 0;
+  }();
+  return enabled;
+}
+
+/// Sampled fraction of adjacent input rows sharing the ORDER BY keys ('peer
+/// rate') above which the rows-streaming build is not chosen. Peers are
+/// computed row by row over retained input vectors while the container build
+/// compares materialized rows, so a repetitive ORDER BY key reverses the
+/// trade-off: measured 2026-09-22, `lag` over clicks (single ORDER BY key, ~3.1k
+/// rows per peer group, sampled rate ~1.0) lost 46% with the rows-streaming
+/// build, while the orders family (ORDER BY key includes a unique column,
+/// sampled rate 0) gained 5-8%.
+constexpr double kMaxStreamingPeerRate = 0.25;
+
+/// Sampled adjacent pairs required before the rows-streaming build may be
+/// chosen. Fewer samples keep the historical container-based build, which is
+/// the no-stats fallback for shapes that cannot be classified.
+constexpr vector_size_t kMinGateSamplePairs = 256;
+
+/// Sampled pairs per input batch (strided over the batch) and the number of
+/// input batches held back while sampling. Together they bound both the
+/// sampling cost and how long input is buffered before the build is chosen.
+constexpr vector_size_t kGateSamplePairsPerBatch = 512;
+constexpr size_t kMaxGatePendingBatches = 4;
+
+/// Largest bounded lookback (relative to the output block) served by the
+/// rows-streaming build: the build keeps that many rows of every partition
+/// alive and the function reads that far behind the current output block, so
+/// the retention must stay a small fraction of a block. Measured 2026-09-22:
+/// short lookbacks (offset 1-5) gained 4-7%, `lag(pay_amount, 1000)` regressed
+/// 7-16% -> keep the historical container-based build for long lookbacks.
+constexpr vector_size_t kLookbackBlocksDenominator = 16;
+
+/// Returns true when 'row' and its predecessor are equal over 'channels'.
+bool rowsEqualOver(
+    const RowVectorPtr& input,
+    vector_size_t row,
+    const std::vector<column_index_t>& channels) {
+  for (const auto channel : channels) {
+    if (!input->childAt(channel)->equalValueAt(
+            input->childAt(channel).get(), row - 1, row)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/// Returns how many preceding rows a bounded-backward window function may still
+/// read after its own output row has been produced, or std::nullopt when the
+/// call cannot be served by the rows-streaming build (variable or negative
+/// offset, IGNORE NULLS, non-constant arguments).
+std::optional<vector_size_t> boundedBackwardLookbackRows(
+    const core::WindowNode::Function& windowFunction) {
+  if (windowFunction.ignoreNulls) {
+    // IGNORE NULLS scans back to the start of the partition.
+    return std::nullopt;
+  }
+  const auto& inputs = windowFunction.functionCall->inputs();
+  if (inputs.empty()) {
+    return std::nullopt;
+  }
+  if (inputs.size() == 1) {
+    // 'lag(value)' uses the default offset of 1.
+    return 1;
+  }
+  const auto* constant =
+      dynamic_cast<const core::ConstantTypedExpr*>(inputs[1].get());
+  if (constant == nullptr || constant->value().isNull()) {
+    return std::nullopt;
+  }
+  const auto offset =
+      VariantConverter::convert(constant->value(), TypeKind::BIGINT)
+          .value<int64_t>();
+  if (offset < 0) {
+    // A negative offset turns lag into a forward-looking function.
+    return std::nullopt;
+  }
+  return static_cast<vector_size_t>(offset);
 }
 
 } // namespace
@@ -64,6 +159,12 @@ Window::Window(
     if (supportRowsStreaming()) {
       windowBuild_ = std::make_unique<window::RowsStreamingWindowBuild>(
           windowNode_, pool(), spillConfig, &nonReclaimableSection_);
+      if (lookbackRows_ > 0) {
+        // Serving 'lag' from the rows-streaming build only pays off when the
+        // ORDER BY keys are nearly unique, so the build is confirmed against
+        // the input once it arrives.
+        initRowsStreamingGate(windowNode);
+      }
     } else {
       windowBuild_ = std::make_unique<window::PartitionStreamingWindowBuild>(
           windowNode, pool(), spillConfig, &nonReclaimableSection_);
@@ -100,6 +201,12 @@ void Window::initialize() {
   createWindowFunctions();
   createPeerAndFrameBuffers();
   windowBuild_->setNumRowsPerOutput(numRowsPerOutput_);
+  if (rowsStreamingGatePending_ &&
+      lookbackRows_ > numRowsPerOutput_ / kLookbackBlocksDenominator) {
+    // A long lookback is known to lose (see 'kLookbackBlocksDenominator'), so
+    // settle the build here instead of holding input back for sampling.
+    resolveRowsStreamingGate(false);
+  }
   windowNode_.reset();
 }
 
@@ -239,6 +346,7 @@ void Window::createWindowFunctions() {
 }
 
 bool Window::supportRowsStreaming() {
+  vector_size_t lookbackRows = 0;
   for (const auto& windowFunction : windowNode_->windowFunctions()) {
     const auto& functionName = windowFunction.functionCall->name();
     const auto windowFunctionMetadata =
@@ -246,7 +354,17 @@ bool Window::supportRowsStreaming() {
 
     if (windowFunctionMetadata.processMode !=
         exec::WindowFunction::ProcessMode::kRows) {
-      return false;
+      // A function that only looks a bounded, constant number of rows back can
+      // still be streamed when the build retains those rows.
+      const auto lookback =
+          windowFunctionMetadata.boundedBackwardLookback &&
+              lagRowsStreamingEnabled()
+          ? boundedBackwardLookbackRows(windowFunction)
+          : std::nullopt;
+      if (!lookback.has_value()) {
+        return false;
+      }
+      lookbackRows = std::max(lookbackRows, lookback.value());
     }
 
     const auto& frame = windowFunction.frame;
@@ -260,12 +378,119 @@ bool Window::supportRowsStreaming() {
     }
   }
 
+  lookbackRows_ = lookbackRows;
   return true;
 }
 
 void Window::addInput(RowVectorPtr input) {
-  windowBuild_->addInput(input);
+  if (rowsStreamingGatePending_) {
+    // Hold the input back until the sampled ORDER BY key repetition decides
+    // which build serves this query (see 'initRowsStreamingGate').
+    gateBufferedInputs_.push_back(input);
+    if (sampleRowsStreamingGate(input)) {
+      resolveRowsStreamingGate(rowsStreamingGatePickedRowsStreaming());
+    }
+  } else {
+    windowBuild_->addInput(input);
+  }
   numRows_ += input->size();
+}
+
+void Window::initRowsStreamingGate(
+    const std::shared_ptr<const core::WindowNode>& windowNode) {
+  const auto& inputType = windowNode->inputType();
+  // Constant keys are equal for every row, so they carry no repetition
+  // signal; 'exprToChannel' maps them to 'kConstantChannel', which is not a
+  // vector child and must not be indexed while sampling.
+  for (const auto& key : windowNode->partitionKeys()) {
+    const auto channel = exprToChannel(key.get(), inputType);
+    if (channel != kConstantChannel) {
+      gatePartitionKeyChannels_.push_back(channel);
+    }
+  }
+  for (const auto& key : windowNode->sortingKeys()) {
+    const auto channel = exprToChannel(key.get(), inputType);
+    if (channel != kConstantChannel) {
+      gateSortKeyChannels_.push_back(channel);
+    }
+  }
+  gateBufferedInputs_.reserve(kMaxGatePendingBatches);
+  gateWindowNode_ = windowNode;
+  rowsStreamingGatePending_ = true;
+}
+
+bool Window::sampleRowsStreamingGate(const RowVectorPtr& input) {
+  const auto numRows = input->size();
+  if (numRows > 1) {
+    const auto maxPairs =
+        std::min<vector_size_t>(numRows - 1, kGateSamplePairsPerBatch);
+    const auto stride = (numRows + maxPairs - 1) / maxPairs;
+    for (auto row = stride; row < numRows; row += stride) {
+      // Pairs that straddle a partition boundary always differ and would bias
+      // the estimate towards "nearly unique", so they are not sampled.
+      if (!gatePartitionKeyChannels_.empty() &&
+          !rowsEqualOver(input, row, gatePartitionKeyChannels_)) {
+        continue;
+      }
+      ++gateSampledPairs_;
+      if (rowsEqualOver(input, row, gateSortKeyChannels_)) {
+        ++gateEqualPairs_;
+      }
+    }
+  }
+
+  return gateSampledPairs_ >= kMinGateSamplePairs ||
+      gateBufferedInputs_.size() >= kMaxGatePendingBatches;
+}
+
+bool Window::rowsStreamingGatePickedRowsStreaming() const {
+  // A long lookback keeps that many rows of every partition alive and reads
+  // far behind the current block; require it to stay a small fraction of the
+  // output block (see 'kLookbackBlocksDenominator').
+  const auto maxLookbackRows = numRowsPerOutput_ / kLookbackBlocksDenominator;
+  return lookbackRows_ <= maxLookbackRows &&
+      gateSampledPairs_ >= kMinGateSamplePairs &&
+      static_cast<double>(gateEqualPairs_) / gateSampledPairs_ <=
+      kMaxStreamingPeerRate;
+}
+
+void Window::resolveRowsStreamingGate(bool useRowsStreaming) {
+  if (!useRowsStreaming) {
+    // Repetitive ORDER BY keys keep the build historically used for 'lag'.
+    auto* spillConfig =
+        spillConfig_.has_value() ? &spillConfig_.value() : nullptr;
+    windowBuild_ = std::make_unique<window::PartitionStreamingWindowBuild>(
+        gateWindowNode_, pool(), spillConfig, &nonReclaimableSection_);
+    // Both builds report no row size estimate before the first input arrives,
+    // so the output batch size computed by 'initialize' carries over.
+    windowBuild_->setNumRowsPerOutput(numRowsPerOutput_);
+  }
+
+  for (const auto& input : gateBufferedInputs_) {
+    windowBuild_->addInput(input);
+  }
+
+  // Evidence for the build decision, reported per driver in the operator
+  // stats (debug output) and used by the performance docs.
+  {
+    auto lockedStats = stats_.wlock();
+    lockedStats->addRuntimeStat(
+        "windowLagRowsStreaming", RuntimeCounter(useRowsStreaming ? 1 : 0));
+    lockedStats->addRuntimeStat(
+        "windowLagSampledPairs", RuntimeCounter(gateSampledPairs_));
+    lockedStats->addRuntimeStat(
+        "windowLagSampledPeerRatePpm",
+        RuntimeCounter(
+            gateSampledPairs_ == 0
+                ? 0
+                : static_cast<int64_t>(gateEqualPairs_) * 1000000 /
+                    gateSampledPairs_));
+  }
+
+  gateBufferedInputs_.clear();
+  gateBufferedInputs_.shrink_to_fit();
+  gateWindowNode_.reset();
+  rowsStreamingGatePending_ = false;
 }
 
 void Window::reclaim(
@@ -318,6 +543,11 @@ void Window::createPeerAndFrameBuffers() {
 
 void Window::noMoreInput() {
   Operator::noMoreInput();
+  if (rowsStreamingGatePending_) {
+    // Too little input to classify the ORDER BY keys: keep the historical
+    // container-based build.
+    resolveRowsStreamingGate(rowsStreamingGatePickedRowsStreaming());
+  }
   windowBuild_->noMoreInput();
 }
 
@@ -645,7 +875,10 @@ void Window::callApplyForPartitionRows(
   partitionOffset_ += numRows;
 
   if (currentPartition_->partial()) {
-    currentPartition_->removeProcessedRows(numRows);
+    // Keep the rows a bounded-backward function (lag) still has to read. The
+    // lookback is the total retention of the partition, not a per-block budget.
+    currentPartition_->removeProcessedRows(
+        numRows, lookbackRows_);
   }
 }
 

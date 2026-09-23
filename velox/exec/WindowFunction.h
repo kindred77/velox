@@ -49,6 +49,13 @@ class WindowFunction {
   struct Metadata {
     ProcessMode processMode;
     bool isAggregate;
+    /// True for functions that read only the current row and a bounded,
+    /// constant number of preceding rows (e.g. lag with a constant offset). The
+    /// rows-streaming build can serve them as long as it retains that many rows;
+    /// the bound is taken from the function's constant, non-negative offset
+    /// argument. Functions that may look ahead (lead) or need the whole
+    /// partition (IGNORE NULLS) must leave this false.
+    bool boundedBackwardLookback{false};
 
     static Metadata defaultMetadata() {
       static Metadata defaultValue{ProcessMode::kPartition, false};

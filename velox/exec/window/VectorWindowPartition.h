@@ -42,9 +42,12 @@ class VectorWindowPartition : public WindowPartition {
   }
 
   /// Returns the number of retained rows available for processing.
+  /// Rows retained for backward lookback (see Window::lookbackRows_) were
+  /// already processed, so they are excluded and cannot be processed twice.
   vector_size_t numRowsForProcessing(
       vector_size_t /*partitionOffset*/) const override {
-    return totalRows_;
+    const auto endRow = startRow_ + totalRows_;
+    return endRow > consumedRows_ ? endRow - consumedRows_ : 0;
   }
 
   /// Rejects RowContainer rows because this partition stores vector ranges.
@@ -56,8 +59,17 @@ class VectorWindowPartition : public WindowPartition {
       vector_size_t startRow,
       vector_size_t endRow);
 
-  /// Removes processed rows from the front of this partition.
-  void removeProcessedRows(vector_size_t numRows) override;
+  /// Removes processed rows from the front of this partition. 'rowsToRetain' is
+  /// the total number of already consumed rows that must stay available for
+  /// backward lookback, not a per-call budget.
+  void removeProcessedRows(
+      vector_size_t numRows,
+      vector_size_t rowsToRetain = 0) override;
+
+  /// Returns true while rows that were never processed remain in this partition.
+  bool hasUnconsumedRows() const override {
+    return startRow_ + totalRows_ > consumedRows_;
+  }
 
   /// Extracts a contiguous row range from retained input vectors.
   void extractColumn(
@@ -127,6 +139,10 @@ class VectorWindowPartition : public WindowPartition {
 
   // Absolute partition offset of the first retained row.
   vector_size_t startRow_{0};
+
+  // Absolute partition offset of the first row that was never processed.
+  // Exceeds startRow_ while rows are retained for backward lookback.
+  vector_size_t consumedRows_{0};
 
   // Last row from the previously processed range, if needed for peer grouping.
   SingleRowValues previousRow_;

@@ -462,7 +462,10 @@ void registerLag(const std::string& name) {
   exec::registerWindowFunction(
       name,
       signatures(),
-      exec::WindowFunction::Metadata::defaultMetadata(),
+      // lag only reads the current row and 'offset' preceding rows, so the
+      // rows-streaming build can serve it when it retains the lookback rows.
+      exec::WindowFunction::Metadata{
+          exec::WindowFunction::ProcessMode::kPartition, false, true},
       [name](
           const std::vector<exec::WindowFunctionArg>& args,
           const TypePtr& resultType,

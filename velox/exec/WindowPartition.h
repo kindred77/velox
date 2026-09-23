@@ -61,9 +61,22 @@ class WindowPartition {
   /// Adds remaining input 'rows' for a partial window partition.
   virtual void addRows(const std::vector<char*>& rows);
 
-  /// Removes the first 'numRows' in 'rows_' from a partial window partition
-  /// after been processed.
-  virtual void removeProcessedRows(vector_size_t numRows);
+  /// Marks the first 'numRows' in 'rows_' as processed. All but the trailing
+  /// 'rowsToRetain' consumed rows are removed from a partial window partition;
+  /// retained rows stay available to window functions that read a bounded
+  /// number of preceding rows (see Window::lookbackRows_). 'rowsToRetain' is
+  /// the total retention after the call, so it does not accumulate across
+  /// output blocks.
+  virtual void removeProcessedRows(
+      vector_size_t numRows,
+      vector_size_t rowsToRetain = 0);
+
+  /// Returns true if the partition still has rows that were not processed yet.
+  /// Faster to query than numRowsForProcessing() and unaffected by rows that are
+  /// retained only for backward lookback.
+  virtual bool hasUnconsumedRows() const {
+    return numRows() > 0;
+  }
 
   /// Returns the number of rows in the current WindowPartition.
   virtual vector_size_t numRows() const {
