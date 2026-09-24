@@ -35,6 +35,7 @@
 #include "velox/expression/FieldReference.h"
 #include "velox/expression/LambdaExpr.h"
 #include "velox/expression/PeeledEncoding.h"
+#include "velox/expression/PeelStatsProbe.h"
 #include "velox/expression/ScopedVarSetter.h"
 #include "velox/expression/VectorFunction.h"
 #include "velox/vector/LazyVector.h"
@@ -1063,6 +1064,15 @@ Expr::PeelEncodingsResult Expr::peelEncodings(
   if (!peeledEncoding) {
     return Expr::PeelEncodingsResult::empty();
   }
+  if (peelstats::enabled()) {
+    peelstats::init();
+    auto& counters = peelstats::counters();
+    counters.peelSuccess.fetch_add(1, std::memory_order_relaxed);
+    counters.peelRows.fetch_add(
+        rows.countSelected(), std::memory_order_relaxed);
+    counters.peelFields.fetch_add(
+        distinctFields_.size(), std::memory_order_relaxed);
+  }
 
   // Translate the relevant rows.
   SelectivityVector* newFinalSelection = nullptr;
@@ -1095,6 +1105,9 @@ Expr::PeelEncodingsResult Expr::peelEncodings(
 
   common::testutil::TestValue::adjust(
       "facebook::velox::exec::Expr::peelEncodings::mayCache", &mayCache);
+  if (mayCache && peelstats::enabled()) {
+    peelstats::counters().mayCache.fetch_add(1, std::memory_order_relaxed);
+  }
   return {newRows, finalRowsHolder.get(), mayCache};
 }
 

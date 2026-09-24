@@ -16,6 +16,7 @@
 
 #include "velox/expression/PeeledEncoding.h"
 #include "velox/expression/EvalCtx.h"
+#include "velox/expression/PeelStatsProbe.h"
 #include "velox/vector/LazyVector.h"
 
 namespace facebook::velox::exec {
@@ -56,6 +57,13 @@ SelectivityVector* PeeledEncoding::translateToInnerRows(
     const SelectivityVector& outerRows,
     LocalSelectivityVector& innerRowsHolder) const {
   VELOX_CHECK(wrapEncoding_ != VectorEncoding::Simple::FLAT);
+  if (peelstats::enabled()) {
+    peelstats::init();
+    auto& counters = peelstats::counters();
+    counters.innerRowsCalls.fetch_add(1, std::memory_order_relaxed);
+    counters.innerRows.fetch_add(
+        outerRows.countSelected(), std::memory_order_relaxed);
+  }
   if (wrapEncoding_ == VectorEncoding::Simple::CONSTANT) {
     auto newRows = innerRowsHolder.get(constantWrapIndex_ + 1, false);
     newRows->setValid(constantWrapIndex_, true);
@@ -98,13 +106,22 @@ void PeeledEncoding::setDictionaryWrapping(
     BaseVector& firstWrapper) {
   wrapEncoding_ = VectorEncoding::Simple::DICTIONARY;
   baseSize_ = decoded.base()->size();
+  if (peelstats::enabled()) {
+    peelstats::init();
+  }
   if (isDictionaryOverFlat(firstWrapper)) {
     // Re-use indices and nulls buffers.
     wrap_ = firstWrapper.wrapInfo();
     wrapNulls_ = firstWrapper.nulls();
+    if (peelstats::enabled()) {
+      peelstats::counters().wrapperReuse.fetch_add(1, std::memory_order_relaxed);
+    }
     return;
   }
   auto wrapping = decoded.dictionaryWrapping(*firstWrapper.pool(), rows.end());
+  if (peelstats::enabled()) {
+    peelstats::counters().wrapperCopy.fetch_add(1, std::memory_order_relaxed);
+  }
   wrap_ = std::move(wrapping.indices);
   wrapNulls_ = std::move(wrapping.nulls);
 }
@@ -187,9 +204,24 @@ bool PeeledEncoding::peelInternal(
   } while (peeled && nonConstant);
 
   if (numLevels == 0 && nonConstant) {
+    if (peelstats::enabled()) {
+      peelstats::counters().peelNotPeelable.fetch_add(
+          1, std::memory_order_relaxed);
+    }
     return false;
   }
 
+  if (peelstats::enabled()) {
+    peelstats::init();
+    auto& counters = peelstats::counters();
+    if (numLevels <= 1) {
+      counters.levels1.fetch_add(1, std::memory_order_relaxed);
+    } else if (numLevels == 2) {
+      counters.levels2.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      counters.levels3Plus.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
   if (firstPeeled == -1) {
     wrapEncoding_ = VectorEncoding::Simple::CONSTANT;
     // Check if constant encoding can be peeled off too if the input is of the
@@ -233,6 +265,14 @@ bool PeeledEncoding::peelInternal(
       }
     }
   }
+  if (peelstats::enabled()) {
+    auto& counters = peelstats::counters();
+    if (wrapEncoding_ == VectorEncoding::Simple::DICTIONARY) {
+      counters.peelDictWrap.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      counters.peelConstWrap.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
   return true;
 }
 
@@ -247,6 +287,14 @@ VectorPtr PeeledEncoding::wrap(
     const SelectivityVector& rows) const {
   VELOX_CHECK(wrapEncoding_ != VectorEncoding::Simple::FLAT);
   VectorPtr wrappedResult;
+  if (peelstats::enabled()) {
+    peelstats::init();
+    auto& counters = peelstats::counters();
+    counters.resultWrapCalls.fetch_add(1, std::memory_order_relaxed);
+    if (wrapEncoding_ != VectorEncoding::Simple::DICTIONARY) {
+      counters.resultConstWrap.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
   if (wrapEncoding_ == VectorEncoding::Simple::DICTIONARY) {
     if (!peeledResult) {
       // If all rows are null, make a constant null vector of the right type.
