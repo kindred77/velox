@@ -28,6 +28,9 @@
 #include <io.h>
 #include <cstdint>
 #include <cstddef>
+#include <cstdlib>
+#include <cstring>
+#include <algorithm>
 #include <mutex>
 #include <unordered_map>
 #include <errno.h>
@@ -448,6 +451,101 @@ inline int posix_madvise(void* addr, size_t length, int advice) {
  * - posix_memalign
  * All must be freed via the smart wrapper functions.
  */
+/**
+ * Fast self-describing aligned allocation (opt-in: GPORCA_POSIX_ALLOC_FAST=1).
+ *
+ * Why: the legacy path below keeps a process-wide registry
+ * (AlignedAllocationRegistry: std::mutex + std::unordered_map) purely so that
+ * posix_free() can tell _aligned_malloc memory from plain malloc memory. On a
+ * 16-thread box running per-batch aligned buffers (millions of them) that
+ * registry is a real cost: every alloc/free takes one global mutex and touches
+ * the map, whose nodes are themselves heap allocations - measured as
+ * ntdll!RtlBackoff ≈16% of process CPU on Q653 (see
+ * dev_tasks/performance_tuning/20260923_win §五·D ④ / §五·F).
+ *
+ * The fast path removes the shared state entirely: every block carries a small
+ * header immediately before the pointer handed to the caller, so posix_free()
+ * recovers the original malloc() pointer by pointer arithmetic.
+ *
+ *   [ AllocHeader{base,size} ][ padding ][ user data ... ]
+ *                             ^ pointer returned to the caller
+ *
+ * The flag is read once (static), so all allocations and frees in a process use
+ * the same path.  DEFAULT ON since 2026-09-24 (validated: fast 87/87 twice,
+ * full 727/727 with the fast path, result multisets identical, plan diff 0/0/0,
+ * peak memory unchanged; wall -10..-15% on allocation-heavy aggregations,
+ * controls flat).  Set GPORCA_POSIX_ALLOC_FAST=0 to fall back to the legacy
+ * registry path.
+ *
+ * Contract is unchanged: pointers from posix_malloc / posix_calloc /
+ * posix_aligned_alloc / posix_memalign / posix_realloc must be released with
+ * posix_free (or posix_aligned_free).
+ */
+inline bool useHeaderAllocFast() {
+  static const bool enabled = []() {
+    const char* env = std::getenv("GPORCA_POSIX_ALLOC_FAST");
+    if (env != nullptr && *env != '\0') {
+      // Explicit override: 0 restores the legacy registry path.
+      return std::atoi(env) != 0;
+    }
+    return true;
+  }();
+  return enabled;
+}
+
+namespace header_alloc_detail {
+
+constexpr size_t kHeaderBytes = 2 * sizeof(void*);
+
+struct AllocHeader {
+  void* base;
+  size_t size;
+};
+
+// The offset math below assumes the header is exactly two pointers; if this
+// struct ever grows, the object layout MUST be updated together with it.
+static_assert(
+    sizeof(AllocHeader) == kHeaderBytes,
+    "AllocHeader must stay exactly kHeaderBytes so posix_free can locate it");
+
+/// Allocates 'size' bytes aligned to 'alignment' (power of two) with a header
+/// stored just before the returned pointer. Returns nullptr on failure.
+inline void* allocate(size_t alignment, size_t size, bool zeroFill) {
+  if (alignment == 0 || (alignment & (alignment - 1)) != 0) {
+    errno = EINVAL;
+    return nullptr;
+  }
+  const size_t minAlign = alignof(std::max_align_t);
+  const size_t align = std::max(alignment, minAlign);
+  // Worst case padding is align - 1; the header sits right before the aligned
+  // address, so the allocation must reserve an extra kHeaderBytes as well.
+  const size_t extra = align + kHeaderBytes;
+  if (size > SIZE_MAX - extra) {
+    errno = ENOMEM;
+    return nullptr;
+  }
+  void* base = zeroFill ? ::calloc(1, size + extra) : ::malloc(size + extra);
+  if (base == nullptr) {
+    errno = ENOMEM;
+    return nullptr;
+  }
+  const uintptr_t first =
+      reinterpret_cast<uintptr_t>(base) + kHeaderBytes;
+  const uintptr_t aligned =
+      (first + (align - 1)) & ~static_cast<uintptr_t>(align - 1);
+  auto* header = reinterpret_cast<AllocHeader*>(aligned - kHeaderBytes);
+  header->base = base;
+  header->size = size;
+  return reinterpret_cast<void*>(aligned);
+}
+
+inline AllocHeader* headerOf(void* ptr) {
+  return reinterpret_cast<AllocHeader*>(
+      reinterpret_cast<uintptr_t>(ptr) - kHeaderBytes);
+}
+
+} // namespace header_alloc_detail
+
 class AlignedAllocationRegistry {
  private:
   static std::mutex& getMutex() {
@@ -516,6 +614,15 @@ inline int posix_memalign(void** memptr, size_t alignment, size_t size) {
     return EINVAL;
   }
 
+  if (useHeaderAllocFast()) {
+    void* ptr = header_alloc_detail::allocate(alignment, size, false);
+    if (ptr == nullptr) {
+      return ENOMEM;
+    }
+    *memptr = ptr;
+    return 0;
+  }
+
   void* ptr = _aligned_malloc(size, alignment);
   if (!ptr) {
     return ENOMEM;
@@ -543,6 +650,10 @@ inline void* posix_aligned_alloc(size_t alignment, size_t size) {
     return nullptr;
   }
 
+  if (useHeaderAllocFast()) {
+    return header_alloc_detail::allocate(alignment, size, false);
+  }
+
   void* ptr = _aligned_malloc(size, alignment);
   if (!ptr) {
     errno = ENOMEM;
@@ -559,6 +670,9 @@ inline void* posix_aligned_alloc(size_t alignment, size_t size) {
  * Ensures consistency with the deallocation strategy.
  */
 inline void* posix_malloc(size_t size) {
+  if (useHeaderAllocFast()) {
+    return header_alloc_detail::allocate(alignof(std::max_align_t), size, false);
+  }
   return ::malloc(size);
 }
 
@@ -567,6 +681,14 @@ inline void* posix_malloc(size_t size) {
  * Ensures consistency with the deallocation strategy.
  */
 inline void* posix_calloc(size_t num, size_t size) {
+  if (useHeaderAllocFast()) {
+    if (num != 0 && size > SIZE_MAX / num) {
+      errno = ENOMEM;
+      return nullptr;
+    }
+    return header_alloc_detail::allocate(
+        alignof(std::max_align_t), num * size, true);
+  }
   return ::calloc(num, size);
 }
 
@@ -581,7 +703,20 @@ inline void* posix_calloc(size_t num, size_t size) {
 inline void* posix_realloc(void* ptr, size_t new_size) {
   if (!ptr) {
     // Acts like malloc
-    return ::realloc(nullptr, new_size);
+    return useHeaderAllocFast() ? posix_malloc(new_size)
+                                : ::realloc(nullptr, new_size);
+  }
+
+  if (useHeaderAllocFast()) {
+    auto* header = header_alloc_detail::headerOf(ptr);
+    void* fresh = header_alloc_detail::allocate(
+        alignof(std::max_align_t), new_size, false);
+    if (fresh == nullptr) {
+      return nullptr;
+    }
+    ::memcpy(fresh, ptr, std::min(header->size, new_size));
+    ::free(header->base);
+    return fresh;
   }
 
   // Check if this is an aligned allocation
@@ -611,6 +746,11 @@ inline void posix_free(void* ptr) {
     return;
   }
 
+  if (useHeaderAllocFast()) {
+    ::free(header_alloc_detail::headerOf(ptr)->base);
+    return;
+  }
+
   if (AlignedAllocationRegistry::unregisterAllocation(ptr)) {
     // This was an aligned allocation - must use _aligned_free
     _aligned_free(ptr);
@@ -626,6 +766,10 @@ inline void posix_free(void* ptr) {
  */
 inline void posix_aligned_free(void* ptr) {
   if (ptr) {
+    if (useHeaderAllocFast()) {
+      ::free(header_alloc_detail::headerOf(ptr)->base);
+      return;
+    }
     AlignedAllocationRegistry::unregisterAllocation(ptr);
     _aligned_free(ptr);
   }

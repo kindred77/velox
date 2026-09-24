@@ -543,11 +543,17 @@ class MinMaxAggregateBase : public exec::Aggregate {
     auto accumulator = value<SingleValueAccumulator>(group);
 
     T best{};
+    // Keeps the deserialized value alive for the whole batch: for
+    // variable-width types `best` is a StringView pointing into this vector's
+    // string buffer, so destroying it before the comparisons below would make
+    // `best` dangle (use-after-free: wrong min/max results, or 0xC0000005 once
+    // the buffer is unmapped).
+    VectorPtr bestHolder;
     bool hasBest = accumulator->hasValue();
     if (hasBest) {
-      auto current = BaseVector::create(arg->type(), 1, allocator_->pool());
-      accumulator->read(current, 0);
-      best = current->asUnchecked<SimpleVector<T>>()->valueAt(0);
+      bestHolder = BaseVector::create(arg->type(), 1, allocator_->pool());
+      accumulator->read(bestHolder, 0);
+      best = bestHolder->asUnchecked<SimpleVector<T>>()->valueAt(0);
     }
 
     vector_size_t bestIndex = -1;
@@ -586,7 +592,7 @@ class MinMaxAggregateBase : public exec::Aggregate {
     }
   }
 
- private:
+  private:
   const bool throwOnNestedNulls_;
 };
 

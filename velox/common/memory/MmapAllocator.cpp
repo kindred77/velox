@@ -454,8 +454,11 @@ void* MmapAllocator::allocateBytesWithoutRetry(
 
   if (useMalloc(bytes)) {
 #ifdef _WIN32
+    // See MallocAllocator::allocateBytesWithoutRetry: on Windows every pointer
+    // released by posix_free() must come from the posix_* family (the fast path
+    // stores its own header in front of the returned pointer).
     auto* result = alignment > kMinAlignment ? ::posix_aligned_alloc(alignment, bytes)
-                                              : ::malloc(bytes);
+                                              : ::posix_malloc(bytes);
 #else
     auto* result = alignment > kMinAlignment ? ::aligned_alloc(alignment, bytes)
                                               : ::malloc(bytes);
