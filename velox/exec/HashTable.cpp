@@ -15,6 +15,9 @@
  */
 
 #include "velox/exec/HashTable.h"
+
+#include <cstdlib>
+
 #include "velox/common/base/AsyncSource.h"
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/base/Portability.h"
@@ -454,6 +457,21 @@ inline uint64_t mixNormalizedKey(uint64_t k, uint8_t bits) {
   return folly::hasher<uint64_t>()(k);
 }
 
+// Slice-1 of P1-M2 (tasks/P1M2_normalized_key_batch.md): the group-probe loops
+// below issue a look-ahead prefetch for the bucket of a future probe row. The
+// prefetch inside preProbe() targets the bucket that is loaded right away, so
+// it cannot hide the DRAM latency of the tag word (nor the candidate row read
+// that follows it). Set GPORCA_AGG_PROBE_PREFETCH=0 to restore the original
+// instruction stream (one-line rollback); default on after the [Win] 20260923
+// ABBA (Q456 -9~10%, no regression in the aggregation family).
+bool probePrefetchEnabled() {
+  static const bool enabled = []() -> bool {
+    const char* env = std::getenv("GPORCA_AGG_PROBE_PREFETCH");
+    return nullptr == env || 0 != std::atoi(env);
+  }();
+  return enabled;
+}
+
 void populateNormalizedKeys(HashLookup& lookup, int8_t sizeBits) {
   lookup.normalizedKeys.resize(lookup.rows.back() + 1);
   uint64_t* __restrict hashes = lookup.hashes.data();
@@ -502,7 +520,26 @@ void HashTable<ignoreNullKeys>::groupProbe(
   int32_t probeIndex = 0;
   int32_t numProbes = lookup.rows.size();
   auto rows = lookup.rows.data();
+  // Same look-ahead discipline as the normalized-key probe (see the comment
+  // there): preProbe() prefetches only the bucket it is about to load, so the
+  // tag words of the next probes are prefetched here instead.
+  static const bool prefetchBuckets = probePrefetchEnabled();
+  AdaptivePrefetch bucketPrefetch(numProbes);
+  auto prefetchBucketsAhead = [&](int32_t base) {
+    for (int32_t k = 0; k < 4; ++k) {
+      const auto ahead = bucketPrefetch.lookAhead();
+      const int32_t future = base + k + ahead;
+      if (ahead > 0 && future < numProbes) {
+        __builtin_prefetch(
+            reinterpret_cast<uint8_t*>(table_) +
+            bucketOffset(lookup.hashes[rows[future]]));
+      }
+    }
+  };
   for (; probeIndex + 4 <= numProbes; probeIndex += 4) {
+    if (prefetchBuckets) {
+      prefetchBucketsAhead(probeIndex);
+    }
     int32_t row = rows[probeIndex];
     state1.preProbe(*this, lookup.hashes[row], row);
     row = rows[probeIndex + 1];
@@ -541,7 +578,25 @@ void HashTable<ignoreNullKeys>::groupNormalizedKeyProbe(HashLookup& lookup) {
   auto rows = lookup.rows.data();
   constexpr int32_t kKeyOffset =
       -static_cast<int32_t>(sizeof(normalized_key_t));
+
+  // Slice-1 of P1-M2 (see tasks/P1M2_normalized_key_batch.md): prefetch the
+  // bucket of a future probe row with the same AdaptivePrefetch discipline the
+  // build side uses (hashRows). The kHash probe above mirrors this block.
+  static const bool prefetchBuckets = probePrefetchEnabled();
+  AdaptivePrefetch bucketPrefetch(numProbes);
+
   for (; probeIndex + 4 <= numProbes; probeIndex += 4) {
+    if (prefetchBuckets) {
+      for (int32_t k = 0; k < 4; ++k) {
+        const auto ahead = bucketPrefetch.lookAhead();
+        const int32_t future = probeIndex + k + ahead;
+        if (ahead > 0 && future < numProbes) {
+          __builtin_prefetch(
+              reinterpret_cast<uint8_t*>(table_) +
+              bucketOffset(lookup.hashes[rows[future]]));
+        }
+      }
+    }
     int32_t row = rows[probeIndex];
     state1.preProbe(*this, lookup.hashes[row], row);
     row = rows[probeIndex + 1];
