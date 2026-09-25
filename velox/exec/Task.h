@@ -37,6 +37,8 @@ class OutputBufferManager;
 class HashJoinBridge;
 class IndexLookupJoinBridge;
 class NestedLoopJoinBridge;
+class ReplicateSource;
+class SegmentPatchState;
 class SpatialJoinBridge;
 class SplitListener;
 struct MergeSkipState;
@@ -530,6 +532,32 @@ class Task : public std::enable_shared_from_this<Task> {
   std::shared_ptr<MergeJoinSource> getMergeJoinSource(
       uint32_t splitGroupId,
       const core::PlanNodeId& planNodeId);
+
+  /// Returns the fan-out hub for 'replicateId' in 'splitGroupId', creating it
+  /// on first use. Both the producer sink and the consumer readers of a hub
+  /// call this with the same 'numConsumers' and 'rowType'; a mismatch is a
+  /// programming error and is reported as such.
+  std::shared_ptr<ReplicateSource> getOrCreateReplicateSource(
+      uint32_t splitGroupId,
+      const core::PlanNodeId& replicateId,
+      int32_t numConsumers,
+      const RowTypePtr& rowType);
+
+  /// Called after all driver pipelines of 'splitGroupId' were created: from
+  /// then on a hub signals EOF to its consumers as soon as the last registered
+  /// producer driver is done.
+  void noMoreReplicateProducers(uint32_t splitGroupId);
+
+  /// Returns the segment-patch state of 'planNodeId', creating it on first use
+  /// (once per driver of the patching pipeline). See SegmentPatchState.
+  std::shared_ptr<SegmentPatchState> getOrCreateSegmentPatch(
+      uint32_t splitGroupId,
+      const core::PlanNodeId& planNodeId);
+
+  /// Called after all driver pipelines of 'splitGroupId' were created: from
+  /// then on the state computes its patch table as soon as the last producer
+  /// driver finished.
+  void noMoreSegmentPatchProducers(uint32_t splitGroupId);
 
   void createLocalExchangeQueuesLocked(
       uint32_t splitGroupId,

@@ -3571,6 +3571,39 @@ std::shared_ptr<PartitionedOutputNode> PartitionedOutputNode::single(
       std::move(source));
 }
 
+// NOTE: Replicate/ReplicateConsumer/SegmentPatch are execution-layer primitives
+// produced by our translator inside a single process. None of them has a SerDe
+// factory yet, so a plan containing them cannot be deserialized from a
+// serialized PLAN fragment (serialize() returns the base node description).
+// SegmentPatch runs on the default path of segmented windows (mechanism S1):
+// before such a plan crosses a fragment/stage boundary it needs a SerDe factory
+// and the distributed form of the S1 design doc (sections 6/8).
+// Replicate/ReplicateConsumer are the mechanism A prototype (env-gated).
+void ReplicateNode::addDetails(std::stringstream& stream) const {
+  stream << " consumers: " << numConsumers_;
+}
+
+folly::dynamic ReplicateNode::serialize() const {
+  return PlanNode::serialize();
+}
+
+void ReplicateConsumerNode::addDetails(std::stringstream& stream) const {
+  stream << " replicate: " << replicateId_ << " channel: " << channel_;
+}
+
+folly::dynamic ReplicateConsumerNode::serialize() const {
+  return PlanNode::serialize();
+}
+
+void SegmentPatchNode::addDetails(std::stringstream& stream) const {
+  stream << " keys: " << keyChannels_.size() << " seg: " << segChannel_
+         << " patch: " << patchChannel_;
+}
+
+folly::dynamic SegmentPatchNode::serialize() const {
+  return PlanNode::serialize();
+}
+
 void EnforceSingleRowNode::addDetails(std::stringstream& /* stream */) const {
   // Nothing to add.
 }

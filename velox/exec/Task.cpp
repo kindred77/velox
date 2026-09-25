@@ -42,6 +42,8 @@
 #include "velox/exec/SpatialJoinBuild.h"
 #include "velox/exec/TableScan.h"
 #include "velox/exec/Task.h"
+#include "velox/exec/ReplicateSource.h"
+#include "velox/exec/SegmentPatch.h"
 
 using facebook::velox::common::testutil::TestValue;
 
@@ -1542,6 +1544,8 @@ std::vector<std::shared_ptr<Driver>> Task::createDriversLocked(
     }
   }
   noMoreLocalExchangeProducers(splitGroupId);
+  noMoreReplicateProducers(splitGroupId);
+  noMoreSegmentPatchProducers(splitGroupId);
   if (groupedExecutionDrivers) {
     ++numRunningSplitGroups_;
   }
@@ -3336,6 +3340,74 @@ std::shared_ptr<MergeJoinSource> Task::getMergeJoinSource(
       "Merge join source for specified plan node doesn't exist: {}",
       planNodeId);
   return it->second;
+}
+
+std::shared_ptr<ReplicateSource> Task::getOrCreateReplicateSource(
+    uint32_t splitGroupId,
+    const core::PlanNodeId& replicateId,
+    int32_t numConsumers,
+    const RowTypePtr& rowType) {
+  auto& splitGroupState = splitGroupStates_[splitGroupId];
+  auto it = splitGroupState.replicateSources.find(replicateId);
+  if (it != splitGroupState.replicateSources.end()) {
+    VELOX_CHECK_EQ(
+        it->second->numConsumers(),
+        numConsumers,
+        "Fan-out hub {} was already created with a different consumer count",
+        replicateId);
+    return it->second;
+  }
+
+  auto source =
+      std::make_shared<ReplicateSource>(
+          replicateId,
+          numConsumers,
+          rowType,
+          /*maxBufferBytes=*/[]() -> int64_t {
+            // Prototype knob (mechanism A slice 1): the fan-out hub buffer
+            // budget. Default 32 MB; raise it to study how much of the shared
+            // input has to be buffered when one consumer lags behind.
+            const char* env = std::getenv("GPORCA_FANOUT_BUFFER_BYTES");
+            if (env != nullptr) {
+              try {
+                const auto value = std::stoll(env);
+                if (value > 0) {
+                  return value;
+                }
+              } catch (...) {
+              }
+            }
+            return ReplicateSource::kDefaultMaxBufferBytes;
+          }());
+  splitGroupState.replicateSources.insert({replicateId, source});
+  return source;
+}
+
+void Task::noMoreReplicateProducers(uint32_t splitGroupId) {
+  auto& splitGroupState = splitGroupStates_[splitGroupId];
+  for (auto& [id, source] : splitGroupState.replicateSources) {
+    source->noMoreProducers();
+  }
+}
+
+std::shared_ptr<SegmentPatchState> Task::getOrCreateSegmentPatch(
+    uint32_t splitGroupId,
+    const core::PlanNodeId& planNodeId) {
+  auto& splitGroupState = splitGroupStates_[splitGroupId];
+  auto it = splitGroupState.segmentPatches.find(planNodeId);
+  if (it != splitGroupState.segmentPatches.end()) {
+    return it->second;
+  }
+  auto state = std::make_shared<SegmentPatchState>(planNodeId);
+  splitGroupState.segmentPatches.insert({planNodeId, state});
+  return state;
+}
+
+void Task::noMoreSegmentPatchProducers(uint32_t splitGroupId) {
+  auto& splitGroupState = splitGroupStates_[splitGroupId];
+  for (auto& [id, state] : splitGroupState.segmentPatches) {
+    state->noMoreProducers();
+  }
 }
 
 void Task::createLocalExchangeQueuesLocked(

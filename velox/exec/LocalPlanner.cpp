@@ -40,9 +40,12 @@
 #include "velox/exec/OrderBy.h"
 #include "velox/exec/ParallelProject.h"
 #include "velox/exec/PartitionedOutput.h"
+#include "velox/exec/Replicate.h"
+#include "velox/exec/ReplicateSource.h"
 #include "velox/exec/RoundRobinPartitionFunction.h"
 #include "velox/exec/RowNumber.h"
 #include "velox/exec/ScaleWriterLocalPartition.h"
+#include "velox/exec/SegmentPatch.h"
 #include "velox/exec/SpatialJoinBuild.h"
 #include "velox/exec/SpatialJoinProbe.h"
 #include "velox/exec/StreamingAggregation.h"
@@ -99,6 +102,12 @@ bool mustStartNewPipeline(
   }
 
   if (std::dynamic_pointer_cast<const core::LocalPartitionNode>(planNode)) {
+    return true;
+  }
+
+  if (std::dynamic_pointer_cast<const core::ReplicateNode>(planNode)) {
+    // The replicated source runs on its own pipeline: the Replicate node is
+    // materialized as the sink that feeds every consumer channel.
     return true;
   }
 
@@ -285,6 +294,40 @@ OperatorSupplier makeOperatorSupplier(
     };
   }
 
+  if (auto replicate =
+          std::dynamic_pointer_cast<const core::ReplicateNode>(planNode)) {
+    return [replicate](int32_t operatorId, DriverCtx* ctx) {
+      auto hub = ctx->task->getOrCreateReplicateSource(
+          ctx->splitGroupId,
+          replicate->id(),
+          replicate->numConsumers(),
+          replicate->outputType());
+      // One producer per driver of this pipeline: register it so that EOF is
+      // only delivered after the last driver of the pipeline is done.
+      hub->addProducer();
+      auto consumer =
+          [hub](RowVectorPtr input, bool drained, ContinueFuture* future) {
+            // CallbackSink::close() invokes the callback with a null batch and
+            // a null future, so only 'enqueue' may look at 'future'.
+            if (drained) {
+              hub->drain();
+              return BlockingReason::kNotBlocked;
+            }
+            if (input == nullptr) {
+              hub->producerFinished();
+              return BlockingReason::kNotBlocked;
+            }
+            return hub->enqueue(std::move(input), future);
+          };
+      return std::make_unique<CallbackSink>(
+          operatorId,
+          ctx,
+          std::move(consumer),
+          nullptr,
+          ctx->queryConfig().queryTraceEnabled() ? replicate->id() : "N/A");
+    };
+  }
+
   return Operator::operatorSupplierFromPlanNode(planNode);
 }
 
@@ -304,7 +347,12 @@ void plan(
 
   const auto& sources = planNode->sources();
   if (sources.empty()) {
-    driverFactories->back()->inputDriver = true;
+    // A ReplicateConsumer leaf is fed by its producer pipeline through the
+    // task-level hub, not by splits: marking it as an input driver would make
+    // it wait for splits that never arrive.
+    if (!std::dynamic_pointer_cast<const core::ReplicateConsumerNode>(planNode)) {
+      driverFactories->back()->inputDriver = true;
+    }
   } else {
     const auto numSourcesToPlan =
         isIndexLookupJoin(planNode.get()) ? 1 : sources.size();
@@ -737,6 +785,48 @@ std::shared_ptr<Driver> DriverFactory::createDriver(
         auto unnest =
             std::dynamic_pointer_cast<const core::UnnestNode>(planNode)) {
       operators.push_back(std::make_unique<Unnest>(id, ctx.get(), unnest));
+    } else if (
+        auto replicateNode =
+            std::dynamic_pointer_cast<const core::ReplicateNode>(planNode)) {
+      // Channel 0 belongs to the pipeline that owns the Replicate node; the
+      // remaining channels are read by ReplicateConsumerNode leaves.
+      operators.push_back(
+          std::make_unique<ReplicateConsumer>(
+              id,
+              ctx.get(),
+              replicateNode->id(),
+              replicateNode->id(),
+              /*channel=*/0,
+              replicateNode->numConsumers(),
+              replicateNode->outputType()));
+    } else if (
+        auto replicateConsumerNode =
+            std::dynamic_pointer_cast<const core::ReplicateConsumerNode>(
+                planNode)) {
+      operators.push_back(
+          std::make_unique<ReplicateConsumer>(
+              id,
+              ctx.get(),
+              replicateConsumerNode->id(),
+              replicateConsumerNode->replicateId(),
+              replicateConsumerNode->channel(),
+              replicateConsumerNode->numConsumers(),
+              replicateConsumerNode->outputType()));
+    } else if (
+        auto segmentPatchNode =
+            std::dynamic_pointer_cast<const core::SegmentPatchNode>(planNode)) {
+      operators.push_back(
+          std::make_unique<SegmentPatch>(
+              id,
+              ctx.get(),
+              segmentPatchNode->id(),
+              segmentPatchNode->outputType(),
+              ctx->task->getOrCreateSegmentPatch(
+                  ctx->splitGroupId, segmentPatchNode->id()),
+              segmentPatchNode->keyChannels(),
+              segmentPatchNode->segChannel(),
+              segmentPatchNode->tailValueChannel(),
+              segmentPatchNode->patchChannel()));
     } else if (
         auto enforceSingleRow =
             std::dynamic_pointer_cast<const core::EnforceSingleRowNode>(

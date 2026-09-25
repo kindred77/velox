@@ -5069,6 +5069,204 @@ using UnnestNodePtr = std::shared_ptr<const UnnestNode>;
 /// contains more than one row raises an exception.
 ///
 /// This plan node is used in query plans that use non-correlated sub-queries.
+/// Fans one input stream out to multiple consumer pipelines.
+///
+/// 'ReplicateNode' plays two roles, mirroring 'LocalPartitionNode':
+///  - at the end of the pipeline that materializes its source it is the sink
+///    that feeds every channel of the task-level fan-out hub; and
+///  - inside the pipeline that owns its single parent it is the reader of
+///    channel 0.
+/// Additional consumers are expressed as 'ReplicateConsumerNode' leaves that
+/// read channels 1..numConsumers-1 of the same hub.
+///
+/// Every input row is delivered to every channel exactly once, so a logical
+/// input shared by N consumers is scanned once instead of N times. The hub is
+/// process-local and split-group scoped: it crosses no fragment/stage boundary
+/// and does not change split ownership.
+class ReplicateNode : public PlanNode {
+ public:
+  ReplicateNode(
+      PlanNodeId id,
+      RowTypePtr outputType,
+      int32_t numConsumers,
+      PlanNodePtr source)
+      : PlanNode(std::move(id)),
+        outputType_(std::move(outputType)),
+        numConsumers_(numConsumers),
+        sources_{std::move(source)} {
+    VELOX_USER_CHECK_GE(
+        numConsumers_, 2, "Replicate needs at least 2 consumers");
+    VELOX_USER_CHECK_NOT_NULL(sources_[0]);
+  }
+
+  const RowTypePtr& outputType() const override {
+    return outputType_;
+  }
+
+  const std::vector<PlanNodePtr>& sources() const override {
+    return sources_;
+  }
+
+  int32_t numConsumers() const {
+    return numConsumers_;
+  }
+
+  std::string_view name() const override {
+    return "Replicate";
+  }
+
+  folly::dynamic serialize() const override;
+
+ private:
+  void addDetails(std::stringstream& stream) const override;
+
+  const RowTypePtr outputType_;
+  const int32_t numConsumers_;
+  const std::vector<PlanNodePtr> sources_;
+};
+
+using ReplicateNodePtr = std::shared_ptr<const ReplicateNode>;
+
+/// Reads one channel of a 'ReplicateNode' hub. Leaf node without splits: the
+/// operator blocks until the producer delivers a batch, so such a pipeline
+/// must not be treated as an input driver (see LocalPlanner).
+class ReplicateConsumerNode : public PlanNode {
+ public:
+  ReplicateConsumerNode(
+      PlanNodeId id,
+      PlanNodeId replicateId,
+      int32_t channel,
+      int32_t numConsumers,
+      RowTypePtr outputType)
+      : PlanNode(std::move(id)),
+        replicateId_(std::move(replicateId)),
+        channel_(channel),
+        numConsumers_(numConsumers),
+        outputType_(std::move(outputType)) {
+    VELOX_USER_CHECK_GE(channel_, 1, "Channel 0 belongs to the Replicate node");
+    VELOX_USER_CHECK_LT(channel_, numConsumers_);
+  }
+
+  const RowTypePtr& outputType() const override {
+    return outputType_;
+  }
+
+  const std::vector<PlanNodePtr>& sources() const override {
+    return sources_;
+  }
+
+  const PlanNodeId& replicateId() const {
+    return replicateId_;
+  }
+
+  int32_t channel() const {
+    return channel_;
+  }
+
+  int32_t numConsumers() const {
+    return numConsumers_;
+  }
+
+  /// The channel is fed by the producer pipeline; this node never needs
+  /// splits.
+  bool requiresSplits() const override {
+    return false;
+  }
+
+  std::string_view name() const override {
+    return "ReplicateConsumer";
+  }
+
+  folly::dynamic serialize() const override;
+
+ private:
+  void addDetails(std::stringstream& stream) const override;
+
+  const PlanNodeId replicateId_;
+  const int32_t channel_;
+  const int32_t numConsumers_;
+  const RowTypePtr outputType_;
+  const std::vector<PlanNodePtr> sources_;
+};
+
+using ReplicateConsumerNodePtr = std::shared_ptr<const ReplicateConsumerNode>;
+
+/// Patches the segment-boundary rows of a segmented window (see
+/// dev_tasks/performance_tuning/20260923_win/tasks/S1_patchfree_seg_window_design.md).
+///
+/// The input is the local lag output of the window: rows sorted by
+/// (partition keys..., segment, order key), where the lag column is NULL
+/// exactly on the first row of every (partition, segment) bucket. The operator
+/// reports one bucket tail per bucket, and once every driver of the pipeline
+/// finished it computes the tiny table
+///
+///   patch(key, seg) = tail of the previous existing bucket of 'key'
+///
+/// which the stitched hash join used to build from a second pass over the
+/// input, and writes it into the deferred boundary rows. This replaces the
+/// "second scan + hash aggregation + hash join" shape with a side stream of one
+/// row per bucket: no barrier on the shared input, no second read.
+class SegmentPatchNode : public PlanNode {
+ public:
+  SegmentPatchNode(
+      PlanNodeId id,
+      PlanNodePtr source,
+      std::vector<column_index_t> keyChannels,
+      column_index_t segChannel,
+      column_index_t tailValueChannel,
+      column_index_t patchChannel)
+      : PlanNode(std::move(id)),
+        sources_{std::move(source)},
+        keyChannels_(std::move(keyChannels)),
+        segChannel_(segChannel),
+        tailValueChannel_(tailValueChannel),
+        patchChannel_(patchChannel) {
+    VELOX_USER_CHECK(!keyChannels_.empty());
+    VELOX_USER_CHECK_NOT_NULL(sources_[0]);
+  }
+
+  const RowTypePtr& outputType() const override {
+    return sources_[0]->outputType();
+  }
+
+  const std::vector<PlanNodePtr>& sources() const override {
+    return sources_;
+  }
+
+  const std::vector<column_index_t>& keyChannels() const {
+    return keyChannels_;
+  }
+
+  column_index_t segChannel() const {
+    return segChannel_;
+  }
+
+  column_index_t tailValueChannel() const {
+    return tailValueChannel_;
+  }
+
+  column_index_t patchChannel() const {
+    return patchChannel_;
+  }
+
+  std::string_view name() const override {
+    return "SegmentPatch";
+  }
+
+  folly::dynamic serialize() const override;
+
+ private:
+  void addDetails(std::stringstream& stream) const override;
+
+  const std::vector<PlanNodePtr> sources_;
+  const std::vector<column_index_t> keyChannels_;
+  const column_index_t segChannel_;
+  const column_index_t tailValueChannel_;
+  const column_index_t patchChannel_;
+};
+
+using SegmentPatchNodePtr = std::shared_ptr<const SegmentPatchNode>;
+
 class EnforceSingleRowNode : public PlanNode {
  public:
   EnforceSingleRowNode(const PlanNodeId& id, PlanNodePtr source)

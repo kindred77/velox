@@ -81,6 +81,9 @@ velox_add_library(
   ProbeOperatorState.cpp
   RowContainer.cpp
   RowNumber.cpp
+  Replicate.cpp
+  ReplicateSource.cpp
+  SegmentPatch.cpp
   ScaleWriterLocalPartition.cpp
   ScaledScanController.cpp
   SortBuffer.cpp
@@ -182,6 +185,9 @@ velox_add_library(
   RoundRobinPartitionFunction.h
   RowContainer.h
   RowNumber.h
+  Replicate.h
+  ReplicateSource.h
+  SegmentPatch.h
   ScaleWriterLocalPartition.h
   ScaledScanController.h
   SerializedPage.h

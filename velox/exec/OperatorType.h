@@ -57,7 +57,9 @@ struct OperatorType {
   static constexpr std::string_view kPartitionedOutput = "PartitionedOutput";
   static constexpr std::string_view kRangePartitionedMerge =
       "RangePartitionedMerge";
+  static constexpr std::string_view kReplicateConsumer = "ReplicateConsumer";
   static constexpr std::string_view kRowNumber = "RowNumber";
+  static constexpr std::string_view kSegmentPatch = "SegmentPatch";
   static constexpr std::string_view kSpatialJoinBuild = "SpatialJoinBuild";
   static constexpr std::string_view kSpatialJoinProbe = "SpatialJoinProbe";
   static constexpr std::string_view kStreamingEnforceDistinct =

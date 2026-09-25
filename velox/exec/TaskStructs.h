@@ -39,6 +39,8 @@ class JoinBridge;
 class LocalExchangeMemoryManager;
 class MergeSource;
 class MergeJoinSource;
+class ReplicateSource;
+class SegmentPatchState;
 
 /// Corresponds to Presto TaskState, needed for reporting query completion.
 enum class TaskState : int {
@@ -233,6 +235,16 @@ struct SplitGroupState {
   std::unordered_map<core::PlanNodeId, std::shared_ptr<MergeJoinSource>>
       mergeJoinSources;
 
+  /// Map of fan-out hubs keyed on ReplicateNode plan node ID. Shared by the
+  /// producer sink and by the consumer readers of the same hub.
+  std::unordered_map<core::PlanNodeId, std::shared_ptr<ReplicateSource>>
+      replicateSources;
+
+  /// Map of segment-patch states keyed on SegmentPatchNode plan node ID.
+  /// Shared by every driver of the patching pipeline.
+  std::unordered_map<core::PlanNodeId, std::shared_ptr<SegmentPatchState>>
+      segmentPatches;
+
   /// Map of local exchanges keyed on LocalPartition plan node ID.
   std::unordered_map<core::PlanNodeId, LocalExchangeState> localExchanges;
 
@@ -265,6 +277,8 @@ struct SplitGroupState {
     }
     localMergeSources.clear();
     mergeJoinSources.clear();
+    replicateSources.clear();
+    segmentPatches.clear();
     localExchanges.clear();
   }
 };
