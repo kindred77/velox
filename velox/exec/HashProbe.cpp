@@ -34,12 +34,30 @@ namespace {
 // Batch size used when iterating the row container.
 constexpr int kBatchSize = 1024;
 
+// The join's own residual filter is evaluated per matched row inside the
+// probe (HashProbe::evalFilter). Its fixed per-batch cost - and the fixed
+// per-batch cost it imposes on the operators downstream - is the same kind
+// of cost that postJoinFilterOutputBatchRows() was introduced for, but
+// postJoinFilter() only carries the outer-join filter the optimizer pushed
+// into the join. Inner joins keep a residual filter in HashJoinNode::filter(),
+// which left such shapes stuck on the generic preferredOutputBatchRows().
+// The flag controls whether those shapes also get the dedicated (larger) row
+// target. It defaults to enabled; GPORCA_HASH_PROBE_FILTER_BATCH=0 restores the
+// historical rows (the one-line rollback).
+bool residualFilterBatchRowsEnabled() {
+  const char* env = std::getenv("GPORCA_HASH_PROBE_FILTER_BATCH");
+  return env == nullptr || 0 != std::atoi(env);
+}
+
 vector_size_t hashProbeOutputBatchRows(
     DriverCtx* driverCtx,
     const core::HashJoinNode& joinNode) {
   const auto& queryConfig = driverCtx->queryConfig();
   const auto preferredRows = queryConfig.preferredOutputBatchRows();
-  if (!joinNode.postJoinFilter()) {
+  const bool hasPerRowFilter =
+      joinNode.postJoinFilter() != nullptr ||
+      (residualFilterBatchRowsEnabled() && joinNode.filter() != nullptr);
+  if (!hasPerRowFilter) {
     return preferredRows;
   }
 
