@@ -15,7 +15,12 @@
  */
 
 #include "velox/exec/HashBuild.h"
+#include <cstdlib>
+#include <cstdio>
 #include <fmt/format.h>
+#include <iostream>
+#include <mutex>
+#include <unordered_map>
 #include "velox/common/base/Counters.h"
 #include "velox/common/base/StatsReporter.h"
 #include "velox/common/testutil/TestValue.h"
@@ -30,6 +35,34 @@ using facebook::velox::common::testutil::TestValue;
 
 namespace facebook::velox::exec {
 namespace {
+// [Win] 20260923 Q628 evidence probe (env-gated, default off): per-instance
+// build input rows + gathering-driver summary, so a build that collapses to a
+// single driver can be told apart from a parallel build with uneven input.
+// GPORCA_HASH_BUILD_STATS=1.
+bool hashBuildStatsEnabled() {
+  static const bool enabled = []() {
+    const char* env = std::getenv("GPORCA_HASH_BUILD_STATS");
+    return env != nullptr && *env != '\0' && std::atoi(env) != 0;
+  }();
+  return enabled;
+}
+
+// Per (planNodeId, driverId) input row counter for the probe above; kept
+// separate from numHashInputRows_ (which is only maintained on the dedup path).
+std::mutex& hashBuildProbeMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+std::unordered_map<std::string, int64_t>& hashBuildProbeRows() {
+  static std::unordered_map<std::string, int64_t> rows;
+  return rows;
+}
+
+std::string hashBuildProbeKey(const std::string& nodeId, int driverId) {
+  return fmt::format("{}:{}", nodeId, driverId);
+}
+
 // Map HashBuild 'state' to the corresponding driver blocking reason.
 BlockingReason fromStateToBlockingReason(HashBuild::State state) {
   switch (state) {
@@ -441,6 +474,12 @@ void HashBuild::removeInputRowsForAntiJoinFilter() {
 void HashBuild::addInput(RowVectorPtr input) {
   checkRunning();
 
+  if (hashBuildStatsEnabled()) {
+    std::lock_guard<std::mutex> l(hashBuildProbeMutex());
+    hashBuildProbeRows()[hashBuildProbeKey(
+        planNodeId(), operatorCtx_->driverCtx()->driverId)] += input->size();
+  }
+
   VELOX_CHECK(
       !useHashTableCache() ||
       (cacheEntry_->builderTaskId == taskId() && !cacheEntry_->buildComplete));
@@ -808,6 +847,21 @@ void HashBuild::noMoreInput() {
 }
 
 void HashBuild::noMoreInputInternal() {
+  if (hashBuildStatsEnabled()) {
+    const int driverId = operatorCtx_->driverCtx()->driverId;
+    int64_t rows = 0;
+    {
+      std::lock_guard<std::mutex> l(hashBuildProbeMutex());
+      rows = hashBuildProbeRows()[hashBuildProbeKey(planNodeId(), driverId)];
+    }
+    const std::string line = fmt::format(
+        "[gp-hashbuild] node={} driver={} rows={}\n",
+        planNodeId(),
+        driverId,
+        rows);
+    std::fputs(line.c_str(), stderr);
+  }
+
   if (!finishHashBuild()) {
     return;
   }
@@ -895,6 +949,18 @@ bool HashBuild::finishHashBuild() {
       numRows += build->table_->rows()->numRows();
     }
     otherBuilds.push_back(build);
+  }
+
+  // [Win] 20260923 Q628 evidence probe (env-gated, default off): this instance
+  // is the last (gathering) driver of the build pipeline.
+  if (hashBuildStatsEnabled()) {
+    const std::string line = fmt::format(
+        "[gp-hashbuild-finish] node={} driver={} peers={} mergedRows={}\n",
+        planNodeId(),
+        operatorCtx_->driverCtx()->driverId,
+        peers.size(),
+        numRows);
+    std::fputs(line.c_str(), stderr);
   }
 
   ensureTableFits(numRows);
