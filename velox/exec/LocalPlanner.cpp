@@ -15,6 +15,8 @@
  */
 #include "velox/exec/LocalPlanner.h"
 #include "velox/core/PlanFragment.h"
+#include <cstdlib>
+#include <iostream>
 #include "velox/exec/ArrowStream.h"
 #include "velox/exec/AssignUniqueId.h"
 #include "velox/exec/CallbackSink.h"
@@ -442,6 +444,14 @@ void LocalPlanner::plan(
     std::vector<std::unique_ptr<DriverFactory>>* driverFactories,
     const core::QueryConfig& queryConfig,
     uint32_t maxDrivers) {
+  // [Win] 20260923 Q628 evidence probe (env-gated, default off): dump each
+  // pipeline's driver budget so a build pipeline that collapses to a single
+  // driver can be traced to the exact limiter (consumer cap / node
+  // maxDrivers / plan fragment maxDrivers). GPORCA_JOIN_PIPELINE_STATS=1.
+  static const bool kJoinPipelineStats = []() {
+    const char* env = std::getenv("GPORCA_JOIN_PIPELINE_STATS");
+    return env != nullptr && *env != '\0' && std::atoi(env) != 0;
+  }();
   for (auto& adapter : DriverFactory::adapters) {
     if (adapter.inspect) {
       adapter.inspect(planFragment);
@@ -462,6 +472,7 @@ void LocalPlanner::plan(
   }
 
   // Determine number of drivers for each pipeline.
+  uint32_t pipelineIndex = 0;
   for (auto& factory : *driverFactories) {
     factory->maxDrivers = detail::maxDrivers(*factory, queryConfig);
     factory->numDrivers = std::min(factory->maxDrivers, maxDrivers);
@@ -476,6 +487,24 @@ void LocalPlanner::plan(
     } else {
       factory->numTotalDrivers = factory->numDrivers;
     }
+    if (kJoinPipelineStats) {
+      std::cerr << "[gp-pipeline] #" << pipelineIndex
+                << " consumer="
+                << (factory->consumerNode
+                        ? std::string(factory->consumerNode->name())
+                        : std::string("<none>"))
+                << " nodes=[";
+      for (const auto& node : factory->planNodes) {
+        std::cerr << node->name() << ",";
+      }
+      std::cerr << "] maxDrivers=" << factory->maxDrivers
+                << " numDrivers=" << factory->numDrivers
+                << " fragmentMaxDrivers=" << maxDrivers
+                << " inputDriver=" << factory->inputDriver
+                << " outputDriver=" << factory->outputDriver
+                << " grouped=" << factory->groupedExecution << std::endl;
+    }
+    ++pipelineIndex;
   }
 }
 
