@@ -382,6 +382,21 @@ class RowContainer {
   /// Allocates a new row and initializes possible aggregates to null.
   char* newRow();
 
+  /// Prototype ([Win] 20260923 sort-row bulk allocation, slice 1): allocates
+  /// 'numRows' contiguous rows with a single AllocationPool call instead of one
+  /// 'newRow()' call per row, and registers them in the row index. Returns the
+  /// first row; row 'i' lives at 'first + i * rowStride()'.
+  /// Requires an empty free list (append-only containers such as the sort
+  /// buffer satisfy this), because freed rows are not reused here.
+  /// Callers gate this behind an env switch; see dev_tasks/performance_tuning/
+  /// 20260923_win (tracking doc section 13, prototype section 14).
+  char* newRows(uint32_t numRows);
+
+  /// Distance in bytes between consecutive rows created by 'newRows()'.
+  uint32_t rowStride() const {
+    return static_cast<uint32_t>(fixedRowSize_ + normalizedKeySize_);
+  }
+
   uint32_t rowSize(const char* row) const {
     return fixedRowSize_ +
         (rowSizeOffset_

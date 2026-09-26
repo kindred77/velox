@@ -319,6 +319,37 @@ char* RowContainer::newRow() {
   return initializeRow(row, false /* reuse */);
 }
 
+char* RowContainer::newRows(uint32_t numRows) {
+  VELOX_DCHECK(mutable_, "Can't add rows into an immutable row container");
+  VELOX_CHECK_EQ(
+      firstFreeRow_,
+      nullptr,
+      "bulk row allocation requires an empty free list");
+  if (numRows == 0) {
+    return nullptr;
+  }
+  const uint32_t stride = rowStride();
+  // Same per-row allocation as 'newRow()' (fixedRowSize_ + normalizedKeySize_,
+  // aligned), only batched: the rows stay contiguous so callers can derive each
+  // row address arithmetically. The row index is still maintained because
+  // 'listRowsFast()' returns it directly.
+  char* first =
+      rows_.allocateFixed(static_cast<uint64_t>(numRows) * stride, alignment_) +
+      normalizedKeySize_;
+  for (uint32_t i = 0; i < numRows; ++i) {
+    char* row = first + static_cast<uint64_t>(i) * stride;
+    if (useListRowIndex_) {
+      rowPointers_.push_back(row);
+    }
+    initializeRow(row, false /* reuse */);
+  }
+  numRows_ += numRows;
+  if (normalizedKeySize_) {
+    numRowsWithNormalizedKey_ += numRows;
+  }
+  return first;
+}
+
 void RowContainer::setAllNull(char* row) {
   VELOX_CHECK(!bits::isBitSet(row, freeFlagOffset_));
   removeOrUpdateRowColumnStats(row, /*setToNull=*/true);

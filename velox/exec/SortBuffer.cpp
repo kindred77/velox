@@ -18,7 +18,25 @@
 #include "velox/exec/MemoryReclaimer.h"
 #include "velox/exec/Spiller.h"
 
+#include <cstdlib>
+
 namespace facebook::velox::exec {
+
+namespace {
+
+/// Prototype for the [Win] 20260923 sort-row bulk allocation (tracking doc
+/// section 13/14): allocate the rows of one input batch with a single
+/// AllocationPool call instead of one call per row. Default off; set
+/// GPORCA_SORT_ROW_BULK_ALLOC=1 to enable it for A/B measurement.
+bool sortRowBulkAlloc() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("GPORCA_SORT_ROW_BULK_ALLOC");
+    return value != nullptr && std::atoi(value) != 0;
+  }();
+  return enabled;
+}
+
+} // namespace
 
 SortBuffer::SortBuffer(
     const RowTypePtr& input,
@@ -91,9 +109,20 @@ void SortBuffer::addInput(const VectorPtr& input) {
   ensureInputFits(input);
 
   const SelectivityVector allRows(input->size());
-  std::vector<char*> rows(input->size());
-  for (int row = 0; row < input->size(); ++row) {
-    rows[row] = data_->newRow();
+  const auto numRows = input->size();
+  std::vector<char*> rows(numRows);
+  if (sortRowBulkAlloc()) {
+    // Prototype: one allocation for the whole batch, row addresses derived
+    // arithmetically (see RowContainer::newRows).
+    char* first = data_->newRows(numRows);
+    const uint32_t stride = data_->rowStride();
+    for (auto row = 0; row < numRows; ++row) {
+      rows[row] = first + static_cast<uint64_t>(row) * stride;
+    }
+  } else {
+    for (int row = 0; row < numRows; ++row) {
+      rows[row] = data_->newRow();
+    }
   }
   const auto* inputRow = input->as<RowVector>();
   for (const auto& columnProjection : columnMap_) {
