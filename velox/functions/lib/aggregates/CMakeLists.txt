@@ -39,6 +39,7 @@ velox_add_library(
   SimpleNumericAggregate.h
   SingleValueAccumulator.h
   SumAggregateBase.h
+  SumOverflowFast.h
   ValueList.h
   ValueSet.h
   VarianceAggregatesBase.h
