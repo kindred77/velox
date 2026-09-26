@@ -21,7 +21,129 @@
 #include "velox/common/memory/HashStringAllocator.h"
 #include "velox/type/FloatingPointUtil.h"
 
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+
 namespace facebook::velox::exec {
+
+namespace {
+
+/// Temporary diagnostic probe for the [Win] 20260923 P2 aggregation/key-path
+/// study (dev_tasks/performance_tuning/20260923_win section 22). It counts how
+/// the grouping-key value-ID computation splits between the flat path and the
+/// dictionary-decoded path, whether the decoded path uses the per-distinct
+/// inner-value cache or falls back to one valueId() call per row, and how large
+/// the decoded bases are. The study uses these counts to size a mechanism for
+/// dictionary-encoded group-by keys before implementing it.
+///
+/// Disabled unless GPORCA_HASHER_STATS is set; one summary line is printed to
+/// stderr at process exit. Remove or turn into a mechanism once the study is
+/// done (same pattern as GPORCA_PEEL_STATS).
+struct HasherStats {
+  std::atomic<uint64_t> flatCalls{0};
+  std::atomic<uint64_t> flatRows{0};
+  std::atomic<uint64_t> flatStrCalls{0};
+  std::atomic<uint64_t> flatStrRows{0};
+  std::atomic<uint64_t> decodedCalls{0};
+  std::atomic<uint64_t> decodedRows{0};
+  std::atomic<uint64_t> decodedStrCalls{0};
+  std::atomic<uint64_t> decodedStrRows{0};
+  std::atomic<uint64_t> decodedStrPerRowCalls{0};
+  std::atomic<uint64_t> decodedStrPerRowRows{0};
+  std::atomic<uint64_t> decodedStrCachedCalls{0};
+  std::atomic<uint64_t> decodedStrCachedRows{0};
+  std::atomic<uint64_t> decodedStrFirstSight{0};
+  std::atomic<uint64_t> decodedStrBaseRowsSum{0};
+  std::atomic<uint64_t> decodedStrBaseRowsMax{0};
+
+  HasherStats();
+};
+
+inline bool hasherStatsEnabled() {
+  static const bool value = ::getenv("GPORCA_HASHER_STATS") != nullptr;
+  return value;
+}
+
+inline HasherStats*& hasherStatsPtr() {
+  static HasherStats* ptr = nullptr;
+  return ptr;
+}
+
+inline void reportHasherStats() {
+  auto* s = hasherStatsPtr();
+  if (s == nullptr) {
+    return;
+  }
+  ::fprintf(
+      stderr,
+      "[hasherstats] flat_calls=%llu flat_rows=%llu flat_str_calls=%llu"
+      " flat_str_rows=%llu decoded_calls=%llu decoded_rows=%llu"
+      " decoded_str_calls=%llu decoded_str_rows=%llu"
+      " decoded_str_perrow_calls=%llu decoded_str_perrow_rows=%llu"
+      " decoded_str_cached_calls=%llu decoded_str_cached_rows=%llu"
+      " decoded_str_firstsight=%llu decoded_str_base_rows_sum=%llu"
+      " decoded_str_base_rows_max=%llu\n",
+      static_cast<unsigned long long>(s->flatCalls.load()),
+      static_cast<unsigned long long>(s->flatRows.load()),
+      static_cast<unsigned long long>(s->flatStrCalls.load()),
+      static_cast<unsigned long long>(s->flatStrRows.load()),
+      static_cast<unsigned long long>(s->decodedCalls.load()),
+      static_cast<unsigned long long>(s->decodedRows.load()),
+      static_cast<unsigned long long>(s->decodedStrCalls.load()),
+      static_cast<unsigned long long>(s->decodedStrRows.load()),
+      static_cast<unsigned long long>(s->decodedStrPerRowCalls.load()),
+      static_cast<unsigned long long>(s->decodedStrPerRowRows.load()),
+      static_cast<unsigned long long>(s->decodedStrCachedCalls.load()),
+      static_cast<unsigned long long>(s->decodedStrCachedRows.load()),
+      static_cast<unsigned long long>(s->decodedStrFirstSight.load()),
+      static_cast<unsigned long long>(s->decodedStrBaseRowsSum.load()),
+      static_cast<unsigned long long>(s->decodedStrBaseRowsMax.load()));
+}
+
+HasherStats::HasherStats() {
+  if (hasherStatsEnabled()) {
+    std::atexit(reportHasherStats);
+  }
+}
+
+inline HasherStats& hasherStats() {
+  static HasherStats stats;
+  hasherStatsPtr() = &stats;
+  return stats;
+}
+
+/// Prototype switch (2026-09-26, [Win] 20260923 section 22): always use an
+/// inner-index-keyed memo for dictionary-decoded keys. The historical code
+/// only uses the memo when the selection is larger than the base, because the
+/// reset is O(base); small dictionaries with a few hundred entries therefore
+/// fall back to one valueId() call per row even though only a handful of inner
+/// entries are used per batch. The memo below resets in O(touched) via
+/// generation stamps, so the first row of every distinct inner entry pays the
+/// valueId() call and the rest read the memo. Set
+/// GPORCA_HASHER_DICT_CACHE=1 to enable; default off keeps the historical
+/// behaviour byte for byte.
+bool hasherDictCacheEnabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("GPORCA_HASHER_DICT_CACHE");
+    return value != nullptr && *value != '\0' && std::atoi(value) != 0;
+  }();
+  return enabled;
+}
+
+/// Upper bound on the memo size: larger dictionaries keep the historical path
+/// so that the per-thread scratch stays small.
+constexpr uint32_t kThreadLocalDictCacheMaxRows = 1 << 16;
+
+struct ThreadLocalDictCache {
+  std::vector<uint64_t> ids;
+  std::vector<uint32_t> generations;
+  uint32_t generation{0};
+};
+
+thread_local ThreadLocalDictCache threadLocalDictCache;
+
+} // namespace
 
 #define VALUE_ID_TYPE_DISPATCH(TEMPLATE_FUNC, typeKind, ...)                \
   [&]() {                                                                   \
@@ -224,6 +346,15 @@ template <typename T>
 bool VectorHasher::makeValueIdsFlatNoNulls(
     const SelectivityVector& rows,
     uint64_t* result) {
+  if (hasherStatsEnabled()) {
+    auto& stats = hasherStats();
+    ++stats.flatCalls;
+    stats.flatRows += rows.countSelected();
+    if constexpr (std::is_same_v<T, StringView>) {
+      ++stats.flatStrCalls;
+      stats.flatStrRows += rows.countSelected();
+    }
+  }
   const auto* values = decoded_.data<T>();
   if (isRange_ && tryMapToRange(values, rows, result)) {
     return true;
@@ -241,6 +372,15 @@ template <typename T>
 bool VectorHasher::makeValueIdsFlatWithNulls(
     const SelectivityVector& rows,
     uint64_t* result) {
+  if (hasherStatsEnabled()) {
+    auto& stats = hasherStats();
+    ++stats.flatCalls;
+    stats.flatRows += rows.countSelected();
+    if constexpr (std::is_same_v<T, StringView>) {
+      ++stats.flatStrCalls;
+      stats.flatStrRows += rows.countSelected();
+    }
+  }
   const auto* values = decoded_.data<T>();
   const auto* nulls = decoded_.nulls(&rows);
 
@@ -258,9 +398,83 @@ bool VectorHasher::makeValueIdsDecoded(
   auto indices = decoded_.indices();
   auto values = decoded_.data<T>();
   bool success = true;
+  const bool statsOn = hasherStatsEnabled();
+  if (statsOn) {
+    auto& stats = hasherStats();
+    ++stats.decodedCalls;
+    stats.decodedRows += rows.countSelected();
+    if constexpr (std::is_same_v<T, StringView>) {
+      const uint64_t baseRows = decoded_.base()->size();
+      ++stats.decodedStrCalls;
+      stats.decodedStrRows += rows.countSelected();
+      stats.decodedStrBaseRowsSum += baseRows;
+      uint64_t prevMax = stats.decodedStrBaseRowsMax.load();
+      while (baseRows > prevMax &&
+             !stats.decodedStrBaseRowsMax.compare_exchange_weak(
+                 prevMax, baseRows)) {
+      }
+    }
+  }
+
+  const auto baseRows = decoded_.base()->size();
+  if (hasherDictCacheEnabled() && baseRows > 0 &&
+      baseRows <= kThreadLocalDictCacheMaxRows) {
+    auto& cache = threadLocalDictCache;
+    if (cache.ids.size() < baseRows) {
+      cache.ids.resize(baseRows);
+      cache.generations.assign(baseRows, 0);
+    }
+    ++cache.generation;
+    if (cache.generation == 0) {
+      std::fill(cache.generations.begin(), cache.generations.end(), 0);
+      cache.generation = 1;
+    }
+    const auto generation = cache.generation;
+    auto* ids = cache.ids.data();
+    auto* generations = cache.generations.data();
+    auto* nulls = decoded_.nulls(&rows);
+    rows.applyToSelected([&](vector_size_t row) INLINE_LAMBDA {
+      if constexpr (mayHaveNulls) {
+        if (bits::isBitNull(nulls, row)) {
+          if (multiplier_ == 1) {
+            result[row] = 0;
+          }
+          return;
+        }
+      }
+      const auto baseIndex = indices[row];
+      const bool fresh = generations[baseIndex] != generation;
+      uint64_t id;
+      if (fresh) {
+        id = valueId(values[baseIndex]);
+        generations[baseIndex] = generation;
+        ids[baseIndex] = id;
+      } else {
+        id = ids[baseIndex];
+      }
+      if (id == kUnmappable) {
+        if (fresh) {
+          analyzeValue(values[baseIndex]);
+        }
+        success = false;
+        return;
+      }
+      if (success) {
+        result[row] = multiplier_ == 1 ? id : result[row] + multiplier_ * id;
+      }
+    });
+    return success;
+  }
 
   if (rows.countSelected() <= decoded_.base()->size()) {
     // Cache is not beneficial in this case and we don't use them.
+    if (statsOn) {
+      auto& stats = hasherStats();
+      if constexpr (std::is_same_v<T, StringView>) {
+        ++stats.decodedStrPerRowCalls;
+        stats.decodedStrPerRowRows += rows.countSelected();
+      }
+    }
     auto* nulls = decoded_.nulls(&rows);
     rows.applyToSelected([&](vector_size_t row) INLINE_LAMBDA {
       makeValueIdForOneRow<T, mayHaveNulls>(
@@ -269,6 +483,13 @@ bool VectorHasher::makeValueIdsDecoded(
     return success;
   }
 
+  if (statsOn) {
+    auto& stats = hasherStats();
+    if constexpr (std::is_same_v<T, StringView>) {
+      ++stats.decodedStrCachedCalls;
+      stats.decodedStrCachedRows += rows.countSelected();
+    }
+  }
   cachedHashes_.resize(decoded_.base()->size());
   std::fill(cachedHashes_.begin(), cachedHashes_.end(), 0);
 
@@ -291,6 +512,11 @@ bool VectorHasher::makeValueIdsDecoded(
         T value = values[baseIndex];
         id = valueId(value);
         numCachedHashes++;
+        if (statsOn) {
+          if constexpr (std::is_same_v<T, StringView>) {
+            ++hasherStats().decodedStrFirstSight;
+          }
+        }
         if (id == kUnmappable) {
           analyzeValue(value);
           success = false;

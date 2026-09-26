@@ -52,6 +52,20 @@ bool lagRowsStreamingEnabled() {
   return enabled;
 }
 
+/// Research-only override (env-gated, default off): bypass the sampled peer
+/// rate rejection so the rows-streaming build can be measured on repetitive
+/// ORDER BY keys. The historical gate rejects those shapes because the
+/// rows-streaming build lost on them; this switch exists to re-measure that
+/// trade-off on the current binary and is not a landing shape. See
+/// dev_tasks/performance_tuning/20260923_win sections 21/22.
+bool forceLagRowsStreaming() {
+  static const bool force = [] {
+    const char* value = std::getenv("GPORCA_WINDOW_LAG_STREAM_FORCE");
+    return value != nullptr && *value != '\0' && std::atoi(value) != 0;
+  }();
+  return force;
+}
+
 /// Sampled fraction of adjacent input rows sharing the ORDER BY keys ('peer
 /// rate') above which the rows-streaming build is not chosen. Peers are
 /// computed row by row over retained input vectors while the container build
@@ -450,8 +464,9 @@ bool Window::rowsStreamingGatePickedRowsStreaming() const {
   const auto maxLookbackRows = numRowsPerOutput_ / kLookbackBlocksDenominator;
   return lookbackRows_ <= maxLookbackRows &&
       gateSampledPairs_ >= kMinGateSamplePairs &&
-      static_cast<double>(gateEqualPairs_) / gateSampledPairs_ <=
-      kMaxStreamingPeerRate;
+      (forceLagRowsStreaming() ||
+       static_cast<double>(gateEqualPairs_) / gateSampledPairs_ <=
+           kMaxStreamingPeerRate);
 }
 
 void Window::resolveRowsStreamingGate(bool useRowsStreaming) {
