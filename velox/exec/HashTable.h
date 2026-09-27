@@ -1228,6 +1228,21 @@ class HashTable : public BaseHashTable {
   int64_t numTombstones_{0};
   // Counts the number of rehash() calls.
   int64_t numRehashes_{0};
+
+  // P2-A' (2026-09-27): gate for the batch-local normalized-key probe memo.
+  // The gate lives on the table because driver threads migrate between probe
+  // calls: per-thread state would pay one trial budget per (thread x table)
+  // pair (measured 9.37M trial rows on Q688) and never settle.  The memo
+  // itself stays batch-local and is cleared on every probe call, so only the
+  // trial counters and the decision need to persist across calls/threads.
+  struct ProbeMemoGate {
+    uint64_t rows{0};
+    uint64_t hits{0};
+    bool decided{false};
+    bool enabled{false};
+  };
+  ProbeMemoGate probeMemoGate_;
+
   HashMode hashMode_ = HashMode::kArray;
   // Owns the memory of multiple build side hash join tables that are
   // combined into a single probe hash table.

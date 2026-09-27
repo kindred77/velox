@@ -24,6 +24,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 namespace facebook::velox::exec {
 
@@ -110,6 +111,134 @@ HasherStats::HasherStats() {
 inline HasherStats& hasherStats() {
   static HasherStats stats;
   hasherStatsPtr() = &stats;
+  return stats;
+}
+
+/// Diagnostic probe for the [Win] 20260923 P2-B study (join-probe key
+/// lookup): in the flat value-ID path it simulates a small direct-mapped memo
+/// (256 entries) over the probe batch and counts how many rows would hit it,
+/// plus the adjacent-equal run rate.  These numbers size the mechanism
+/// (batch-local memo vs. look-ahead prefetch) before implementing it.
+/// Disabled unless GPORCA_JOIN_PROBE_STATS is set; one summary line is printed
+/// to stderr at process exit.
+struct JoinProbeStats {
+  std::atomic<uint64_t> batches{0};
+  std::atomic<uint64_t> rows{0};
+  std::atomic<uint64_t> memoHits{0};
+  std::atomic<uint64_t> memoMisses{0};
+  std::atomic<uint64_t> runs{0};
+
+  JoinProbeStats();
+};
+
+inline bool joinProbeStatsEnabled() {
+  static const bool value = ::getenv("GPORCA_JOIN_PROBE_STATS") != nullptr;
+  return value;
+}
+
+inline JoinProbeStats*& joinProbeStatsPtr() {
+  static JoinProbeStats* ptr = nullptr;
+  return ptr;
+}
+
+inline void reportJoinProbeStats() {
+  auto* s = joinProbeStatsPtr();
+  if (s == nullptr) {
+    return;
+  }
+  ::fprintf(
+      stderr,
+      "[joinprobestats] batches=%llu rows=%llu memo_hits=%llu"
+      " memo_misses=%llu adjacent_runs=%llu\n",
+      static_cast<unsigned long long>(s->batches.load()),
+      static_cast<unsigned long long>(s->rows.load()),
+      static_cast<unsigned long long>(s->memoHits.load()),
+      static_cast<unsigned long long>(s->memoMisses.load()),
+      static_cast<unsigned long long>(s->runs.load()));
+}
+
+JoinProbeStats::JoinProbeStats() {
+  if (joinProbeStatsEnabled()) {
+    std::atexit(reportJoinProbeStats);
+  }
+}
+
+inline JoinProbeStats& joinProbeStats() {
+  static JoinProbeStats stats;
+  joinProbeStatsPtr() = &stats;
+  return stats;
+}
+
+/// Prototype switch (2026-09-27, [Win] 20260923 P2-B): batch-local
+/// direct-mapped memo for flat integral join-probe keys.  The probe hasher
+/// resolves each probe row's key to the build side's value id with an
+/// open-addressed hash lookup (FlatValueIds::find); the P2-B probe measured a
+/// 98.8% hit rate for a 256-entry direct-mapped memo on Q646 (300M rows, 3.7M
+/// misses), so most rows can skip the random access entirely.  The memo is
+/// per batch (stack storage, cleared per call) and stores the exact key, so a
+/// hit is exact.  Enabled by default since the [Win] 20260923 P2-B acceptance
+/// (Q646 -7.7~-8.2%, Q655 -7.3~-9.3%, results byte-identical); set
+/// GPORCA_JOIN_PROBE_MEMO=0 for the historical lookup.
+bool joinProbeMemoEnabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("GPORCA_JOIN_PROBE_MEMO");
+    return value == nullptr || std::atoi(value) != 0;
+  }();
+  return enabled;
+}
+
+/// Diagnostic probe for the [Win] 20260923 aggregation/dictionary family study
+/// (2026-09-27 evening): `VectorHasher::makeValueIdsDecoded<StringView>` hashes
+/// and looks up a `valueId` for **every row** when the selection is not larger
+/// than the decoded base (the Q524/Q653 VARCHAR grouping-key shape, ~16% of
+/// process CPU).  This probe simulates a small (1024 entry) direct-mapped memo
+/// keyed by the decoded base index (exact tag, no value comparison needed) and
+/// reports its hit rate.  Disabled unless GPORCA_HASHER_MEMO_STATS is set.
+struct HasherMemoStats {
+  std::atomic<uint64_t> calls{0};
+  std::atomic<uint64_t> rows{0};
+  std::atomic<uint64_t> hits{0};
+  std::atomic<uint64_t> misses{0};
+  std::atomic<uint64_t> distinct{0};
+
+  HasherMemoStats();
+};
+
+inline bool hasherMemoStatsEnabled() {
+  static const bool value = ::getenv("GPORCA_HASHER_MEMO_STATS") != nullptr;
+  return value;
+}
+
+inline HasherMemoStats*& hasherMemoStatsPtr() {
+  static HasherMemoStats* ptr = nullptr;
+  return ptr;
+}
+
+inline void reportHasherMemoStats() {
+  auto* s = hasherMemoStatsPtr();
+  if (s == nullptr) {
+    return;
+  }
+  ::fprintf(
+      stderr,
+      "[hashermemostats] calls=%llu rows=%llu hits=%llu misses=%llu"
+      " distinct=%llu\n",
+      static_cast<unsigned long long>(s->calls.load()),
+      static_cast<unsigned long long>(s->rows.load()),
+      static_cast<unsigned long long>(s->hits.load()),
+      static_cast<unsigned long long>(s->misses.load()),
+      static_cast<unsigned long long>(s->distinct.load()));
+}
+
+HasherMemoStats::HasherMemoStats() {
+  if (hasherMemoStatsEnabled()) {
+    std::atexit(reportHasherMemoStats);
+  }
+}
+
+inline HasherMemoStats& hasherMemoStats() {
+  static HasherMemoStats stats;
+  hasherMemoStatsPtr() = &stats;
   return stats;
 }
 
@@ -475,6 +604,42 @@ bool VectorHasher::makeValueIdsDecoded(
         stats.decodedStrPerRowRows += rows.countSelected();
       }
     }
+    if constexpr (std::is_same_v<T, StringView>) {
+      // [Probe] hit rate of a 1024 entry direct-mapped memo keyed by the decoded
+      // base index; disabled by default, does not change behavior.
+      if (hasherMemoStatsEnabled()) {
+        constexpr int32_t kMemoSize = 1024;
+        auto& stats = hasherMemoStats();
+        ++stats.calls;
+        const auto selected = rows.countSelected();
+        stats.rows += selected;
+        int32_t tag[kMemoSize];
+        std::fill(std::begin(tag), std::end(tag), -1);
+        uint64_t hits = 0;
+        uint64_t misses = 0;
+        uint64_t distinct = 0;
+        auto* nullsForProbe = decoded_.nulls(&rows);
+        rows.applyToSelected([&](vector_size_t row) {
+          if constexpr (mayHaveNulls) {
+            if (bits::isBitNull(nullsForProbe, row)) {
+              return;
+            }
+          }
+          const auto baseIndex = indices[row];
+          int32_t& slot = tag[baseIndex & (kMemoSize - 1)];
+          if (slot == baseIndex) {
+            ++hits;
+          } else {
+            slot = baseIndex;
+            ++misses;
+            ++distinct;
+          }
+        });
+        stats.hits += hits;
+        stats.misses += misses;
+        stats.distinct += distinct;
+      }
+    }
     auto* nulls = decoded_.nulls(&rows);
     rows.applyToSelected([&](vector_size_t row) INLINE_LAMBDA {
       makeValueIdForOneRow<T, mayHaveNulls>(
@@ -670,6 +835,24 @@ void VectorHasher::lookupValueIdsTyped(
 
   if (decoded.isIdentityMapping() ||
       rows.countSelected() <= decoded.base()->size()) {
+    // [P2-B probe] batch-local repetition simulation; disabled by default.
+    // Only integral keys (the FlatValueIds path) are simulated.
+    const bool fProbeStats = joinProbeStatsEnabled();
+    const bool fProbeMemo = joinProbeMemoEnabled();
+    constexpr uint32_t kProbeMemoSize = 256;
+    int64_t probeMemoKeys[kProbeMemoSize];
+    uint8_t probeMemoValid[kProbeMemoSize];
+    uint64_t probeMemoIds[kProbeMemoSize];
+    int64_t probeLastKey = 0;
+    bool probeHasLast = false;
+    if constexpr (std::is_integral_v<T>) {
+      if (fProbeStats || fProbeMemo) {
+        std::memset(probeMemoValid, 0, sizeof(probeMemoValid));
+        if (fProbeStats) {
+          joinProbeStats().batches.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
+    }
     rows.applyToSelected([&](vector_size_t row) INLINE_LAMBDA {
       if (decoded.isNullAt(row)) {
         if (multiplier_ == 1) {
@@ -678,7 +861,55 @@ void VectorHasher::lookupValueIdsTyped(
         return;
       }
       T value = decoded.valueAt<T>(row);
-      uint64_t id = lookupValueId(value);
+      if constexpr (std::is_integral_v<T>) {
+        if (fProbeStats) {
+          const int64_t probeKey = static_cast<int64_t>(value);
+          const uint64_t probeHash =
+              static_cast<uint64_t>(probeKey) * 0x9E3779B97F4A7C15ull;
+          const uint32_t probeSlot =
+              static_cast<uint32_t>(probeHash >> 56) & (kProbeMemoSize - 1);
+          auto& stats = joinProbeStats();
+          if (probeMemoValid[probeSlot] != 0 &&
+              probeMemoKeys[probeSlot] == probeKey) {
+            stats.memoHits.fetch_add(1, std::memory_order_relaxed);
+          } else {
+            stats.memoMisses.fetch_add(1, std::memory_order_relaxed);
+            probeMemoValid[probeSlot] = 1;
+            probeMemoKeys[probeSlot] = probeKey;
+          }
+          if (probeHasLast && probeLastKey == probeKey) {
+            stats.runs.fetch_add(1, std::memory_order_relaxed);
+          }
+          probeLastKey = probeKey;
+          probeHasLast = true;
+          stats.rows.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
+      uint64_t id;
+      if constexpr (std::is_integral_v<T>) {
+        if (fProbeMemo) {
+          const int64_t memoKey = static_cast<int64_t>(value);
+          const uint64_t memoHash =
+              static_cast<uint64_t>(memoKey) * 0x9E3779B97F4A7C15ull;
+          const uint32_t memoSlot =
+              static_cast<uint32_t>(memoHash >> 56) & (kProbeMemoSize - 1);
+          if (probeMemoValid[memoSlot] != 0 &&
+              probeMemoKeys[memoSlot] == memoKey) {
+            id = probeMemoIds[memoSlot];
+          } else {
+            id = lookupValueId(value);
+            if (id != kUnmappable) {
+              probeMemoValid[memoSlot] = 1;
+              probeMemoKeys[memoSlot] = memoKey;
+              probeMemoIds[memoSlot] = id;
+            }
+          }
+        } else {
+          id = lookupValueId(value);
+        }
+      } else {
+        id = lookupValueId(value);
+      }
       if (id == kUnmappable) {
         rows.setValid(row, false);
         return;

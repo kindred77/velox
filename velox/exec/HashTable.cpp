@@ -16,7 +16,11 @@
 
 #include "velox/exec/HashTable.h"
 
+#include <array>
+#include <atomic>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #include "velox/common/base/AsyncSource.h"
 #include "velox/common/base/Exceptions.h"
@@ -42,6 +46,141 @@
 using facebook::velox::common::testutil::TestValue;
 
 namespace facebook::velox::exec {
+
+namespace {
+
+/// Sizes the "reuse the previous probe result when the grouping key repeats"
+/// mechanism for the group-by probe. Per probe batch it counts the processed
+/// rows and how many of them repeat the immediately preceding row's normalized
+/// key (those rows could skip the hash table probe entirely; in
+/// kNormalizedKey mode the normalized key is the equality key the probe itself
+/// compares, so equal keys imply the same group). Nothing is collected and no
+/// branch is added to the probe loop unless GPORCA_HASH_PROBE_STATS is set; one
+/// summary line is printed to stderr at process exit, same pattern as
+/// GPORCA_HASHER_STATS. Remove once the mechanism is decided.
+struct HashProbeStats {
+  std::atomic<uint64_t> batches{0};
+  std::atomic<uint64_t> rows{0};
+  std::atomic<uint64_t> runs{0};
+  std::atomic<uint64_t> dupRows{0};
+  std::atomic<uint64_t> memoBatches{0};
+  std::atomic<uint64_t> memoRows{0};
+  std::atomic<uint64_t> memoHits{0};
+  std::atomic<uint64_t> memoMisses{0};
+
+  HashProbeStats();
+};
+
+inline bool hashProbeStatsEnabled() {
+  static const bool value = ::getenv("GPORCA_HASH_PROBE_STATS") != nullptr;
+  return value;
+}
+
+/// P2-A' memo mode.  Unset = adaptive: the table runs a bounded trial (see
+/// kProbeMemoTrialRows / kProbeMemoMinHitRatePct) and keeps the memo only when
+/// its keys repeat within a batch enough to pay for the bookkeeping.  =1
+/// forces the memo on (calibration/A-B), =0 keeps the historical probe.
+enum class ProbeMemoMode { kAdaptive, kOn, kOff };
+
+inline ProbeMemoMode aggProbeMemoMode() {
+  static const ProbeMemoMode mode = []() -> ProbeMemoMode {
+    const char* env = ::getenv("GPORCA_AGG_PROBE_MEMO");
+    if (nullptr == env || '\0' == *env) {
+      return ProbeMemoMode::kAdaptive;
+    }
+    return 0 != std::atoi(env) ? ProbeMemoMode::kOn : ProbeMemoMode::kOff;
+  }();
+  return mode;
+}
+
+inline HashProbeStats*& hashProbeStatsPtr() {
+  static HashProbeStats* ptr = nullptr;
+  return ptr;
+}
+
+inline void reportHashProbeStats() {
+  auto* s = hashProbeStatsPtr();
+  if (s == nullptr) {
+    return;
+  }
+  ::fprintf(
+      stderr,
+      "[hashprobestats] batches=%llu rows=%llu runs=%llu dup_rows=%llu"
+      " memo_batches=%llu memo_rows=%llu memo_hits=%llu memo_misses=%llu\n",
+      static_cast<unsigned long long>(s->batches.load()),
+      static_cast<unsigned long long>(s->rows.load()),
+      static_cast<unsigned long long>(s->runs.load()),
+      static_cast<unsigned long long>(s->dupRows.load()),
+      static_cast<unsigned long long>(s->memoBatches.load()),
+      static_cast<unsigned long long>(s->memoRows.load()),
+      static_cast<unsigned long long>(s->memoHits.load()),
+      static_cast<unsigned long long>(s->memoMisses.load()));
+}
+
+HashProbeStats::HashProbeStats() {
+  if (hashProbeStatsEnabled()) {
+    std::atexit(reportHashProbeStats);
+  }
+}
+
+inline HashProbeStats& hashProbeStats() {
+  static HashProbeStats stats;
+  hashProbeStatsPtr() = &stats;
+  return stats;
+}
+
+/// Counts the run structure of one normalized-key probe batch.
+void accumulateProbeRunStats(const HashLookup& lookup) {
+  if (!hashProbeStatsEnabled()) {
+    return;
+  }
+  const auto* keys = lookup.normalizedKeys.data();
+  const auto* rows = lookup.rows.data();
+  const int32_t count = lookup.rows.size();
+  uint64_t runs = 0;
+  uint64_t dups = 0;
+  for (int32_t i = 0; i < count; ++i) {
+    if (i == 0 || keys[rows[i]] != keys[rows[i - 1]]) {
+      ++runs;
+    } else {
+      ++dups;
+    }
+  }
+  auto& stats = hashProbeStats();
+  stats.batches.fetch_add(1, std::memory_order_relaxed);
+  stats.rows.fetch_add(count, std::memory_order_relaxed);
+  stats.runs.fetch_add(runs, std::memory_order_relaxed);
+  stats.dupRows.fetch_add(dups, std::memory_order_relaxed);
+}
+
+/// Batch-local, L1-resident memo of "normalized key -> group pointer" used by
+/// the GPORCA_AGG_PROBE_MEMO prototype. A hit is exact: the memo stores the
+/// full normalized key, which is the equality key the probe itself compares in
+/// kNormalizedKey mode. Entries are cleared at the start of every probe call,
+/// so a memo never outlives the table state it was filled from.
+struct ProbeMemoEntry {
+  uint64_t key;
+  char* group;
+};
+
+constexpr int32_t kProbeMemoEntries = 2048;
+constexpr int32_t kProbeMemoChunk = 256;
+
+/// Trial budget and hit-rate floor of the memo gate. The first
+/// 'kProbeMemoTrialRows' rows of a table run with the memo while its hit rate is
+/// measured (the memo is batch-local, so this is the rate the mechanism actually
+/// operates at, cold start included). Below the floor the memo is disabled for
+/// that table, which keeps low-locality aggregations (all-distinct keys, where
+/// the memo only adds bookkeeping) on the historical probe.
+constexpr uint64_t kProbeMemoTrialRows = 30000;
+constexpr uint64_t kProbeMemoMinHitRatePct = 30;
+
+inline uint32_t probeMemoIndex(uint64_t key) {
+  return static_cast<uint32_t>(
+      (key * 0x9E3779B97F4A7C15ull) >> (64 - 11));
+}
+
+} // namespace
 
 // static
 std::string BaseHashTable::modeString(HashMode mode) {
@@ -569,56 +708,140 @@ void HashTable<ignoreNullKeys>::groupProbe(
 
 template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::groupNormalizedKeyProbe(HashLookup& lookup) {
-  ProbeState state1;
-  ProbeState state2;
-  ProbeState state3;
-  ProbeState state4;
-  int32_t probeIndex = 0;
-  int32_t numProbes = lookup.rows.size();
-  auto rows = lookup.rows.data();
-  constexpr int32_t kKeyOffset =
-      -static_cast<int32_t>(sizeof(normalized_key_t));
+  const int32_t numProbes = lookup.rows.size();
+  const auto* allRows = lookup.rows.data();
 
-  // Slice-1 of P1-M2 (see tasks/P1M2_normalized_key_batch.md): prefetch the
-  // bucket of a future probe row with the same AdaptivePrefetch discipline the
-  // build side uses (hashRows). The kHash probe above mirrors this block.
-  static const bool prefetchBuckets = probePrefetchEnabled();
-  AdaptivePrefetch bucketPrefetch(numProbes);
+  // Probes the given row list. The default path passes the whole batch; the
+  // memo prototype below passes the batch's not-yet-memoized keys.
+  auto probeRange = [&](const vector_size_t* rows, int32_t count) {
+    ProbeState state1;
+    ProbeState state2;
+    ProbeState state3;
+    ProbeState state4;
+    int32_t probeIndex = 0;
+    constexpr int32_t kKeyOffset =
+        -static_cast<int32_t>(sizeof(normalized_key_t));
 
-  for (; probeIndex + 4 <= numProbes; probeIndex += 4) {
-    if (prefetchBuckets) {
-      for (int32_t k = 0; k < 4; ++k) {
-        const auto ahead = bucketPrefetch.lookAhead();
-        const int32_t future = probeIndex + k + ahead;
-        if (ahead > 0 && future < numProbes) {
-          __builtin_prefetch(
-              reinterpret_cast<uint8_t*>(table_) +
-              bucketOffset(lookup.hashes[rows[future]]));
+    // Slice-1 of P1-M2 (see tasks/P1M2_normalized_key_batch.md): prefetch the
+    // bucket of a future probe row with the same AdaptivePrefetch discipline the
+    // build side uses (hashRows). The kHash probe above mirrors this block.
+    static const bool prefetchBuckets = probePrefetchEnabled();
+    AdaptivePrefetch bucketPrefetch(count);
+
+    for (; probeIndex + 4 <= count; probeIndex += 4) {
+      if (prefetchBuckets) {
+        for (int32_t k = 0; k < 4; ++k) {
+          const auto ahead = bucketPrefetch.lookAhead();
+          const int32_t future = probeIndex + k + ahead;
+          if (ahead > 0 && future < count) {
+            __builtin_prefetch(
+                reinterpret_cast<uint8_t*>(table_) +
+                bucketOffset(lookup.hashes[rows[future]]));
+          }
         }
       }
+      int32_t row = rows[probeIndex];
+      state1.preProbe(*this, lookup.hashes[row], row);
+      row = rows[probeIndex + 1];
+      state2.preProbe(*this, lookup.hashes[row], row);
+      row = rows[probeIndex + 2];
+      state3.preProbe(*this, lookup.hashes[row], row);
+      row = rows[probeIndex + 3];
+      state4.preProbe(*this, lookup.hashes[row], row);
+      state1.firstProbe<ProbeState::Operation::kInsert>(*this, kKeyOffset);
+      state2.firstProbe<ProbeState::Operation::kInsert>(*this, kKeyOffset);
+      state3.firstProbe<ProbeState::Operation::kInsert>(*this, kKeyOffset);
+      state4.firstProbe<ProbeState::Operation::kInsert>(*this, kKeyOffset);
+      fullProbe<false, true>(lookup, state1, false);
+      fullProbe<false, true>(lookup, state2, true);
+      fullProbe<false, true>(lookup, state3, true);
+      fullProbe<false, true>(lookup, state4, true);
     }
-    int32_t row = rows[probeIndex];
-    state1.preProbe(*this, lookup.hashes[row], row);
-    row = rows[probeIndex + 1];
-    state2.preProbe(*this, lookup.hashes[row], row);
-    row = rows[probeIndex + 2];
-    state3.preProbe(*this, lookup.hashes[row], row);
-    row = rows[probeIndex + 3];
-    state4.preProbe(*this, lookup.hashes[row], row);
-    state1.firstProbe<ProbeState::Operation::kInsert>(*this, kKeyOffset);
-    state2.firstProbe<ProbeState::Operation::kInsert>(*this, kKeyOffset);
-    state3.firstProbe<ProbeState::Operation::kInsert>(*this, kKeyOffset);
-    state4.firstProbe<ProbeState::Operation::kInsert>(*this, kKeyOffset);
-    fullProbe<false, true>(lookup, state1, false);
-    fullProbe<false, true>(lookup, state2, true);
-    fullProbe<false, true>(lookup, state3, true);
-    fullProbe<false, true>(lookup, state4, true);
+    for (; probeIndex < count; ++probeIndex) {
+      int32_t row = rows[probeIndex];
+      state1.preProbe(*this, lookup.hashes[row], row);
+      state1.firstProbe(*this, kKeyOffset);
+      fullProbe<false, true>(lookup, state1, false);
+    }
+  };
+
+  if (numProbes == 0) {
+    return;
   }
-  for (; probeIndex < numProbes; ++probeIndex) {
-    int32_t row = rows[probeIndex];
-    state1.preProbe(*this, lookup.hashes[row], row);
-    state1.firstProbe(*this, kKeyOffset);
-    fullProbe<false, true>(lookup, state1, false);
+
+  const auto memoMode = aggProbeMemoMode();
+  if (ProbeMemoMode::kOff == memoMode ||
+      (ProbeMemoMode::kAdaptive == memoMode && probeMemoGate_.decided &&
+       !probeMemoGate_.enabled)) {
+    accumulateProbeRunStats(lookup);
+    probeRange(allRows, numProbes);
+    return;
+  }
+
+  // One hash table probe per distinct key of a batch, the remaining rows
+  // resolve from the memo. The memo is cleared per call, so it can only hold
+  // pointers produced by the table state of this call; the pending list keeps
+  // the probed misses batched so they still go through the unrolled probe with
+  // look-ahead prefetch. In adaptive mode the per-table gate turns the memo
+  // off for keys that do not repeat within a batch, where it would only add
+  // bookkeeping.
+
+  const auto* keys = lookup.normalizedKeys.data();
+  auto* hits = lookup.hits.data();
+  static thread_local std::array<ProbeMemoEntry, kProbeMemoEntries> memo;
+  static thread_local std::vector<vector_size_t> pending;
+  std::memset(memo.data(), 0, sizeof(memo));
+  pending.clear();
+  uint64_t memoHits = 0;
+  uint64_t memoMisses = 0;
+
+  auto flushPending = [&]() {
+    if (pending.empty()) {
+      return;
+    }
+    probeRange(pending.data(), static_cast<int32_t>(pending.size()));
+    for (auto row : pending) {
+      const auto key = keys[row];
+      auto& entry = memo[probeMemoIndex(key)];
+      entry.key = key;
+      entry.group = hits[row];
+    }
+    pending.clear();
+  };
+
+  for (int32_t i = 0; i < numProbes; ++i) {
+    const auto row = allRows[i];
+    const auto key = keys[row];
+    const auto& entry = memo[probeMemoIndex(key)];
+    if (entry.group != nullptr && entry.key == key) {
+      hits[row] = entry.group;
+      ++memoHits;
+      continue;
+    }
+    ++memoMisses;
+    pending.push_back(row);
+    if (pending.size() >= kProbeMemoChunk) {
+      flushPending();
+    }
+  }
+  flushPending();
+
+  if (ProbeMemoMode::kAdaptive == memoMode && !probeMemoGate_.decided) {
+    probeMemoGate_.rows += numProbes;
+    probeMemoGate_.hits += memoHits;
+    if (probeMemoGate_.rows >= kProbeMemoTrialRows) {
+      probeMemoGate_.decided = true;
+      probeMemoGate_.enabled = probeMemoGate_.hits * 100 >=
+          kProbeMemoMinHitRatePct * probeMemoGate_.rows;
+    }
+  }
+
+  if (hashProbeStatsEnabled()) {
+    auto& stats = hashProbeStats();
+    stats.memoBatches.fetch_add(1, std::memory_order_relaxed);
+    stats.memoRows.fetch_add(numProbes, std::memory_order_relaxed);
+    stats.memoHits.fetch_add(memoHits, std::memory_order_relaxed);
+    stats.memoMisses.fetch_add(memoMisses, std::memory_order_relaxed);
   }
 }
 
