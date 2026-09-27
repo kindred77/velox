@@ -15,6 +15,8 @@
  */
 #include "velox/expression/ConstantExpr.h"
 
+#include "velox/expression/ConstantMaterialize.h"
+
 namespace facebook::velox::exec {
 
 void ConstantExpr::evalSpecialForm(
@@ -37,6 +39,13 @@ void ConstantExpr::evalSpecialForm(
     // be unique the next time this expression is evaluated.
     sharedConstantValue_ =
         BaseVector::wrapInConstant(rows.end(), 0, sharedConstantValue_);
+  }
+
+  // [Win] 20260923 P3-B3: merge the constant into a partially populated result
+  // in a single masked pass instead of copy-on-write + masked copy, two scalar
+  // loops that always iterate the selection bit by bit.
+  if (materializeConstantOverRows(sharedConstantValue_, rows, context, result)) {
+    return;
   }
 
   context.moveOrCopyResult(sharedConstantValue_, rows, result);

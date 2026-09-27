@@ -85,6 +85,7 @@ velox_add_library(
   ConjunctExpr.h
   ConjunctRewrite.h
   ConstantExpr.h
+  ConstantMaterialize.h
   DecodedArgs.h
   EvalCtx.h
   Expr.h

@@ -14,8 +14,13 @@
  * limitations under the License.
  */
 #include "velox/vector/DecodedVector.h"
+
+#include <atomic>
+#include <cstdlib>
+
 #include "velox/buffer/Buffer.h"
 #include "velox/common/base/BitUtil.h"
+#include "velox/common/base/SimdUtil.h"
 #include "velox/vector/BaseVector.h"
 #include "velox/vector/LazyVector.h"
 
@@ -47,6 +52,114 @@ const VectorPtr& getValueVector(const VectorPtr& vector) {
 
 const BaseVector* getValueVector(const BaseVector* vector) {
   return vector->valueVector().get();
+}
+
+/// my_gporca prototype (2026-09-27, [Win] 20260923 P3 candidate B2):
+/// `DecodedVector::setFlatNulls` merges the nulls of the wrappers with the
+/// nulls of the leaf vector by traversing the selected rows.  When the leaf has
+/// no nulls - the common case for dictionary-encoded scan columns, where the
+/// nulls sit on the dictionary wrapper - that traversal cannot set any bit and
+/// is pure overhead (PerfView, Q620: `setFlatNulls <- combineWrappers <-
+/// decodeImpl` held 7.3% of process CPU).  Enabled by default; set
+/// GPORCA_DECODE_NULLS_FAST=0 for the historical traversal.
+bool decodeNullsMergeFastEnabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("GPORCA_DECODE_NULLS_FAST");
+    if (value != nullptr && *value != '\0') {
+      return std::atoi(value) != 0;
+    }
+    return true;
+  }();
+  return enabled;
+}
+
+/// my_gporca switch (2026-09-27 evening, [Win] 20260923): index translation
+/// fast path of applyDictionaryWrapper() - 0 = historical loop with the
+/// per-row null tests, 1 = plain translation loop, 2 = plain translation loop
+/// plus a SIMD gather for the full-row case (default).
+int dictMergeFastMode() {
+  static const int mode = [] {
+    const char* value = std::getenv("GPORCA_DICT_MERGE_FAST");
+    if (value != nullptr && *value != '\0') {
+      return std::atoi(value);
+    }
+    return 2;
+  }();
+  return mode;
+}
+
+/// Diagnostic counters for the same study; enabled with
+/// GPORCA_DECODE_NULLS_STATS=1 (default off, two stderr lines at exit).
+struct DecodeNullsStats {
+  std::atomic<uint64_t> calls{0};
+  std::atomic<uint64_t> extraNullCalls{0};
+  std::atomic<uint64_t> leafNullCalls{0};
+  std::atomic<uint64_t> mergeRows{0};
+  std::atomic<uint64_t> mergedNulls{0};
+  std::atomic<uint64_t> plainCalls{0};
+  std::atomic<uint64_t> baseNullsCopyCalls{0};
+  std::atomic<uint64_t> baseNullsCopyRows{0};
+  std::atomic<uint64_t> dictMergeCalls{0};
+  std::atomic<uint64_t> dictMergeRows{0};
+  std::atomic<uint64_t> dictMergeNullFreeRows{0};
+  std::atomic<uint64_t> dictMergeWrappedNullRows{0};
+  std::atomic<uint64_t> dictMergeCurrentNullRows{0};
+  std::atomic<uint64_t> dictMergeFullRows{0};
+  std::atomic<uint64_t> dictMergePartialRows{0};
+  std::atomic<uint64_t> dictMergeSizeRows{0};
+};
+
+DecodeNullsStats& decodeNullsStats() {
+  static DecodeNullsStats stats;
+  return stats;
+}
+
+void reportDecodeNullsStats() {
+  const auto& stats = decodeNullsStats();
+  if (stats.calls.load() == 0 && stats.dictMergeCalls.load() == 0 &&
+      stats.baseNullsCopyCalls.load() == 0 && stats.plainCalls.load() == 0) {
+    return;
+  }
+  ::fprintf(
+      stderr,
+      "[decodenulls] calls=%llu extra_nulls=%llu leaf_nulls=%llu"
+      " merge_rows=%llu merged_nulls=%llu\n",
+      static_cast<unsigned long long>(stats.calls.load()),
+      static_cast<unsigned long long>(stats.extraNullCalls.load()),
+      static_cast<unsigned long long>(stats.leafNullCalls.load()),
+      static_cast<unsigned long long>(stats.mergeRows.load()),
+      static_cast<unsigned long long>(stats.mergedNulls.load()));
+  ::fprintf(
+      stderr,
+      "[decodenulls] plain_calls=%llu base_nulls_copy=%llu(%llu rows)"
+      " dict_merge=%llu(%llu rows: null_free=%llu wrapped_nulls=%llu"
+      " current_nulls=%llu; all_rows=%llu selected_rows=%llu size_rows=%llu)\n",
+      static_cast<unsigned long long>(stats.plainCalls.load()),
+      static_cast<unsigned long long>(stats.baseNullsCopyCalls.load()),
+      static_cast<unsigned long long>(stats.baseNullsCopyRows.load()),
+      static_cast<unsigned long long>(stats.dictMergeCalls.load()),
+      static_cast<unsigned long long>(stats.dictMergeRows.load()),
+      static_cast<unsigned long long>(stats.dictMergeNullFreeRows.load()),
+      static_cast<unsigned long long>(stats.dictMergeWrappedNullRows.load()),
+      static_cast<unsigned long long>(stats.dictMergeCurrentNullRows.load()),
+      static_cast<unsigned long long>(stats.dictMergeFullRows.load()),
+      static_cast<unsigned long long>(stats.dictMergePartialRows.load()),
+      static_cast<unsigned long long>(stats.dictMergeSizeRows.load()));
+}
+
+bool decodeNullsStatsEnabled() {
+  static const bool enabled =
+      std::getenv("GPORCA_DECODE_NULLS_STATS") != nullptr;
+  return enabled;
+}
+
+DecodeNullsStats& decodeNullsStatsForUse() {
+  auto& stats = decodeNullsStats();
+  static std::atomic<bool> registered{false};
+  if (!registered.exchange(true, std::memory_order_relaxed)) {
+    std::atexit(reportDecodeNullsStats);
+  }
+  return stats;
 }
 
 } // namespace
@@ -256,6 +369,20 @@ void DecodedVector::applyDictionaryWrapper(
     // No further processing is needed.
     return;
   }
+  if (decodeNullsStatsEnabled()) {
+    auto& stats = decodeNullsStatsForUse();
+    const auto mergeRows =
+        static_cast<uint64_t>(rows ? rows->countSelected() : size_);
+    stats.dictMergeCalls.fetch_add(1, std::memory_order_relaxed);
+    stats.dictMergeRows.fetch_add(mergeRows, std::memory_order_relaxed);
+    stats.dictMergeSizeRows.fetch_add(
+        static_cast<uint64_t>(size_), std::memory_order_relaxed);
+    if (rows == nullptr) {
+      stats.dictMergeFullRows.fetch_add(mergeRows, std::memory_order_relaxed);
+    } else {
+      stats.dictMergePartialRows.fetch_add(mergeRows, std::memory_order_relaxed);
+    }
+  }
 
   auto newIndices = dictionaryVector.wrapInfo()->as<vector_size_t>();
   auto newNulls = dictionaryVector.rawNulls();
@@ -275,7 +402,57 @@ void DecodedVector::applyDictionaryWrapper(
     copiedIndices_.resize(size_);
     indices_ = copiedIndices_.data();
   }
-
+  if (decodeNullsStatsEnabled()) {
+    // Sizing for the "pure index translation" variant (no nulls at either
+    // level); probe only, does not change behavior.
+    auto& stats = decodeNullsStatsForUse();
+    const auto mergeRows =
+        static_cast<uint64_t>(rows ? rows->countSelected() : size_);
+    if (newNulls == nullptr && nulls_ == nullptr) {
+      stats.dictMergeNullFreeRows.fetch_add(
+          mergeRows, std::memory_order_relaxed);
+    } else if (newNulls != nullptr) {
+      stats.dictMergeWrappedNullRows.fetch_add(
+          mergeRows, std::memory_order_relaxed);
+    } else {
+      stats.dictMergeCurrentNullRows.fetch_add(
+          mergeRows, std::memory_order_relaxed);
+    }
+  }
+  // [Win] 20260923 (2026-09-27 evening): when neither this level nor the
+  // wrapped level carries nulls the merge degenerates to a pure index
+  // translation - the dominant case for scan dictionaries (probe: Q653 1.50e9
+  // rows, Q524/Q655/Q657/Q634/Q635 2-8e8 rows, all null-free).  Keep the
+  // per-row null tests out of the loop; the full-row case (no selection) also
+  // gets a SIMD gather.
+  const int mergeMode = dictMergeFastMode();
+  if (mergeMode > 0 && newNulls == nullptr && nulls_ == nullptr) {
+    auto* translated = copiedIndices_.data();
+    const auto* source = currentIndices;
+    // The SIMD variant translates every row (the mapping is correct for
+    // unselected rows as well), the scalar one only the selected rows, which is
+    // better when the selection is sparse.
+    if (mergeMode > 1) {
+      constexpr int32_t kLanes = xsimd::batch<int32_t>::size;
+      int32_t row = 0;
+      for (; row + kLanes <= size_; row += kLanes) {
+        simd::gather<int32_t, int32_t>(newIndices, source + row)
+            .store_unaligned(translated + row);
+      }
+      for (; row < size_; ++row) {
+        translated[row] = newIndices[source[row]];
+      }
+    } else if (rows == nullptr) {
+      for (int32_t row = 0; row < size_; ++row) {
+        translated[row] = newIndices[source[row]];
+      }
+    } else {
+      applyToRows(rows, [&](vector_size_t row) {
+        translated[row] = newIndices[source[row]];
+      });
+    }
+    return;
+  }
   applyToRows(rows, [&](vector_size_t row) {
     if (!nulls_ || !bits::isBitNull(nulls_, row)) {
       auto wrappedIndex = currentIndices[row];
@@ -328,19 +505,42 @@ void DecodedVector::setFlatNulls(
     const BaseVector& vector,
     const SelectivityVector* rows) {
   if (hasExtraNulls_) {
+    const bool statsEnabled = decodeNullsStatsEnabled();
+    DecodeNullsStats* stats =
+        statsEnabled ? &decodeNullsStatsForUse() : nullptr;
+    const auto leafNulls = vector.rawNulls();
+    if (stats != nullptr) {
+      stats->calls.fetch_add(1, std::memory_order_relaxed);
+      stats->extraNullCalls.fetch_add(1, std::memory_order_relaxed);
+      if (leafNulls != nullptr) {
+        stats->leafNullCalls.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
     if (nullsNotCopied()) {
       copyNulls(end(rows));
     }
-    auto leafNulls = vector.rawNulls();
-    auto copiedNulls = &copiedNulls_[0];
-    applyToRows(rows, [&](vector_size_t row) {
-      if (!bits::isBitNull(nulls_, row) &&
-          (leafNulls && bits::isBitNull(leafNulls, indices_[row]))) {
-        bits::setNull(copiedNulls, row);
-      }
-    });
+    // With a null-free leaf the merge below cannot set any null bit, so the
+    // traversal is skipped (GPORCA_DECODE_NULLS_FAST=0 restores it).
+    if (leafNulls != nullptr || !decodeNullsMergeFastEnabled()) {
+      auto copiedNulls = &copiedNulls_[0];
+      applyToRows(rows, [&](vector_size_t row) {
+        if (stats != nullptr) {
+          stats->mergeRows.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (!bits::isBitNull(nulls_, row) &&
+            (leafNulls && bits::isBitNull(leafNulls, indices_[row]))) {
+          bits::setNull(copiedNulls, row);
+          if (stats != nullptr) {
+            stats->mergedNulls.fetch_add(1, std::memory_order_relaxed);
+          }
+        }
+      });
+    }
     nulls_ = &copiedNulls_[0];
   } else {
+    if (decodeNullsStatsEnabled()) {
+      decodeNullsStatsForUse().plainCalls.fetch_add(1, std::memory_order_relaxed);
+    }
     nulls_ = vector.rawNulls();
     mayHaveNulls_ = nulls_ != nullptr;
   }
@@ -516,6 +716,13 @@ const uint64_t* DecodedVector::nulls(const SelectivityVector* rows) {
         VELOX_CHECK_LE(rows->end(), size_);
       }
       VELOX_DEBUG_ONLY const auto baseSize = baseVector_->size();
+      if (decodeNullsStatsEnabled()) {
+        auto& stats = decodeNullsStatsForUse();
+        stats.baseNullsCopyCalls.fetch_add(1, std::memory_order_relaxed);
+        stats.baseNullsCopyRows.fetch_add(
+            static_cast<uint64_t>(rows ? rows->countSelected() : size_),
+            std::memory_order_relaxed);
+      }
       applyToRows(rows, [&](auto i) {
         VELOX_DCHECK_LT(indices_[i], baseSize);
         bits::setNull(rawCopiedNulls, i, bits::isBitNull(nulls_, indices_[i]));
