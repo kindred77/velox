@@ -19,6 +19,8 @@
 #include "velox/exec/Spiller.h"
 
 #include <cstdlib>
+#include <iostream>
+#include <atomic>
 
 namespace facebook::velox::exec {
 
@@ -34,6 +36,41 @@ bool sortRowBulkAlloc() {
     return value != nullptr && std::atoi(value) != 0;
   }();
   return enabled;
+}
+
+/// my_gporca prototype: keys-only compact sort (see KeysOnlySort.h). Default
+/// on; set GPORCA_SORT_KEYS_ONLY=0 for the one-line rollback to the regular
+/// (row container + row pointer) sort.
+bool keysOnlySortEnv() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("GPORCA_SORT_KEYS_ONLY");
+    return value == nullptr || std::atoi(value) != 0;
+  }();
+  return enabled;
+}
+
+/// Diagnostic probe (default off, zero overhead unless enabled): counts how
+/// many SortBuffers take the keys-only fast path and how many rows they encode
+/// in this process; printed once at exit. GPORCA_SORT_KEYS_ONLY_STATS=1.
+struct KeysOnlySortStats {
+  std::atomic<uint64_t> buffers{0};
+  std::atomic<uint64_t> rows{0};
+  const bool enabled = [] {
+    const char* value = std::getenv("GPORCA_SORT_KEYS_ONLY_STATS");
+    return value != nullptr && std::atoi(value) != 0;
+  }();
+
+  ~KeysOnlySortStats() {
+    if (enabled) {
+      std::cerr << "[sortkeysonly] sortBuffers=" << buffers.load()
+                << " rows=" << rows.load() << "\n";
+    }
+  }
+};
+
+KeysOnlySortStats& keysOnlySortStats() {
+  static KeysOnlySortStats stats;
+  return stats;
 }
 
 } // namespace
@@ -95,6 +132,54 @@ SortBuffer::SortBuffer(
       sortedColumnTypes, nonSortedColumnTypes, /*useListRowIndex=*/true, pool_);
   spillerStoreType_ =
       ROW(std::move(sortedSpillColumnNames), std::move(sortedSpillColumnTypes));
+
+  // Keys-only compact sort eligibility: env on, spilling disabled, every input
+  // column is a sort key and all key types are fixed-width integers.
+  keysOnlyEligible_ = keysOnlySortEnv() && spillConfig_ == nullptr &&
+      input_->size() == sortColumnIndices.size();
+  if (keysOnlyEligible_) {
+    std::vector<TypePtr> keyTypes;
+    keyTypes.reserve(sortColumnIndices.size());
+    for (const auto index : sortColumnIndices) {
+      const auto& type = input_->childAt(index);
+      if (!keysonly::supportedKind(type->kind())) {
+        keysOnlyEligible_ = false;
+        break;
+      }
+      keyTypes.emplace_back(type);
+    }
+    if (keysOnlyEligible_) {
+      const std::vector<bool> columnHasNulls(keyTypes.size(), false);
+      const std::vector<std::optional<uint32_t>> maxStringLengths(
+          keyTypes.size(), std::nullopt);
+      std::vector<TypeKind> keyKinds;
+      keyKinds.reserve(keyTypes.size());
+      for (const auto& type : keyTypes) {
+        keyKinds.emplace_back(type->kind());
+      }
+      keysOnlyPlan_.emplace(keysonly::KeysOnlyPlan{
+          PrefixSortLayout::generate(
+              keyTypes,
+              columnHasNulls,
+              sortCompareFlags_,
+              prefixSortConfig_.maxNormalizedKeyBytes,
+              prefixSortConfig_.maxStringPrefixLength,
+              maxStringLengths),
+          std::move(keyKinds)});
+      // Only the all-normalized form is supported by the prototype.
+      if (!keysOnlyPlan_->layout.hasNormalizedKeys ||
+          keysOnlyPlan_->layout.hasNonNormalizedKey ||
+          keysOnlyPlan_->layout.numNormalizedKeys !=
+              keysOnlyPlan_->keyKinds.size()) {
+        keysOnlyPlan_.reset();
+        keysOnlyEligible_ = false;
+      }
+    }
+  }
+}
+
+bool SortBuffer::keysOnlyEnabled() const {
+  return keysOnlyEligible_ && keysOnlyPlan_.has_value();
 }
 
 SortBuffer::~SortBuffer() {
@@ -108,6 +193,32 @@ void SortBuffer::addInput(const VectorPtr& input) {
   VELOX_CHECK(!noMoreInput_);
   ensureInputFits(input);
 
+  if (keysOnlyEnabled()) {
+    if (keysOnlyActive_) {
+      if (keysOnlyAddInput(input)) {
+        numInputRows_ += input->size();
+        return;
+      }
+      // The batch cannot be encoded (nulls); rewrite what we have into rows and
+      // continue on the regular path.
+      keysOnlyFallback();
+    } else if (keysOnlyAddInput(input)) {
+      keysOnlyActive_ = true;
+      numInputRows_ += input->size();
+      return;
+    } else {
+      // The first batch cannot use the fast path; keep the regular one for the
+      // whole sort.
+      keysOnlyEligible_ = false;
+    }
+  }
+
+  storeRows(input);
+  numInputRows_ += input->size();
+}
+
+// Stores one batch of rows in 'data_'. The caller accounts the row count.
+void SortBuffer::storeRows(const VectorPtr& input) {
   const SelectivityVector allRows(input->size());
   const auto numRows = input->size();
   std::vector<char*> rows(numRows);
@@ -133,7 +244,142 @@ void SortBuffer::addInput(const VectorPtr& input) {
         folly::Range(rows.data(), input->size()),
         columnProjection.inputChannel);
   }
-  numInputRows_ += allRows.size();
+}
+
+bool SortBuffer::keysOnlyAddInput(const VectorPtr& input) {
+  const auto* inputRow = input->as<RowVector>();
+  const vector_size_t numRows = input->size();
+  if (numRows == 0) {
+    return true;
+  }
+  // The prototype layout reserves no null bytes; refuse batches with nulls so
+  // the caller can fall back to the regular path.
+  const auto numColumns = inputRow->children().size();
+  for (column_index_t i = 0; i < numColumns; ++i) {
+    if (inputRow->childAt(i)->mayHaveNulls()) {
+      return false;
+    }
+  }
+  const auto stride = keysOnlyPlan_->layout.normalizedBufferSize;
+  auto chunk = AlignedBuffer::allocate<char>(
+      static_cast<uint64_t>(numRows) * stride, pool_);
+  char* entries = chunk->asMutable<char>();
+
+  const SelectivityVector allRows(numRows);
+  std::vector<std::unique_ptr<DecodedVector>> decoded;
+  std::vector<const DecodedVector*> keyViews;
+  decoded.reserve(columnMap_.size());
+  keyViews.reserve(columnMap_.size());
+  // Sort key i is input column columnMap_[i].outputChannel; keys-only shapes
+  // have no non-sorted columns so columnMap_ covers every input column.
+  for (const auto& columnProjection : columnMap_) {
+    decoded.emplace_back(std::make_unique<DecodedVector>(
+        *inputRow->childAt(columnProjection.outputChannel), allRows));
+    keyViews.emplace_back(decoded.back().get());
+  }
+  for (vector_size_t row = 0; row < numRows; ++row) {
+    keysonly::encodeRow(
+        *keysOnlyPlan_,
+        keyViews,
+        row,
+        entries + static_cast<uint64_t>(row) * stride);
+  }
+  keysOnlyChunks_.emplace_back(std::move(chunk));
+  keysOnlyEntriesBytes_ += static_cast<uint64_t>(numRows) * stride;
+  auto& stats = keysOnlySortStats();
+  if (stats.enabled) {
+    if (keysOnlyChunks_.size() == 1) {
+      ++stats.buffers;
+    }
+    stats.rows += numRows;
+  }
+  return true;
+}
+
+void SortBuffer::keysOnlyNoMoreInput() {
+  const auto stride = keysOnlyPlan_->layout.normalizedBufferSize;
+  const uint64_t totalBytes = numInputRows_ * stride;
+  VELOX_CHECK_EQ(keysOnlyEntriesBytes_, totalBytes);
+  const auto numPages = memory::AllocationTraits::numPages(totalBytes);
+  pool_->allocateContiguous(numPages, keysOnlyEntries_);
+  char* buffer = keysOnlyEntries_.data<char>();
+  uint64_t offset = 0;
+  for (const auto& chunk : keysOnlyChunks_) {
+    std::memcpy(buffer + offset, chunk->as<char>(), chunk->size());
+    offset += chunk->size();
+  }
+  VELOX_CHECK_EQ(offset, totalBytes);
+  keysOnlyChunks_.clear();
+  keysOnlyEntriesBytes_ = 0;
+  updateEstimatedOutputRowSize();
+
+  auto swapBuffer = AlignedBuffer::allocate<char>(stride, pool_);
+  prefixsort::PrefixSortRunner sortRunner(
+      stride, swapBuffer->asMutable<char>());
+  sortRunner.quickSort(
+      buffer,
+      buffer + totalBytes,
+      [&](const char* left, const char* right) {
+        // PrefixSortRunner uses a three-way comparator (-1/0/1).
+        return keysonly::compareEntries(*keysOnlyPlan_, left, right);
+      });
+}
+
+void SortBuffer::keysOnlyGetOutput() {
+  const auto stride = keysOnlyPlan_->layout.normalizedBufferSize;
+  const char* entries = keysOnlyEntries_.data<char>();
+  // Sort key i lives in input column columnMap_[i].outputChannel and is
+  // returned in that same output child (see the columnMap_ construction).
+  std::vector<VectorPtr> outputs;
+  outputs.reserve(columnMap_.size());
+  for (const auto& columnProjection : columnMap_) {
+    outputs.emplace_back(output_->childAt(columnProjection.outputChannel));
+  }
+  const auto batchRows = output_->size();
+  for (vector_size_t row = 0; row < batchRows; ++row) {
+    keysonly::decodeEntry(
+        *keysOnlyPlan_,
+        entries + (numOutputRows_ + row) * stride,
+        outputs,
+        row);
+  }
+  numOutputRows_ += batchRows;
+}
+
+void SortBuffer::keysOnlyFallback() {
+  const auto stride = keysOnlyPlan_->layout.normalizedBufferSize;
+  // Entries still live in 'keysOnlyChunks_'; stage them in one buffer so the
+  // decode loop can index rows directly.
+  std::vector<char> staged(keysOnlyEntriesBytes_);
+  uint64_t offset = 0;
+  for (const auto& chunk : keysOnlyChunks_) {
+    std::memcpy(staged.data() + offset, chunk->as<char>(), chunk->size());
+    offset += chunk->size();
+  }
+  const char* entries = staged.data();
+
+  constexpr uint64_t kBatchRows = 1024;
+  for (uint64_t row = 0; row < numInputRows_; row += kBatchRows) {
+    const auto batchRows = static_cast<vector_size_t>(
+        std::min<uint64_t>(kBatchRows, numInputRows_ - row));
+    auto batch = BaseVector::create(input_, batchRows, pool_);
+    auto* batchRow = batch->as<RowVector>();
+    std::vector<VectorPtr> outputs;
+    outputs.reserve(columnMap_.size());
+    for (const auto& columnProjection : columnMap_) {
+      outputs.emplace_back(
+          batchRow->childAt(columnProjection.outputChannel));
+    }
+    for (vector_size_t i = 0; i < batchRows; ++i) {
+      keysonly::decodeEntry(
+          *keysOnlyPlan_, entries + (row + i) * stride, outputs, i);
+    }
+    storeRows(batch);
+  }
+  keysOnlyChunks_.clear();
+  keysOnlyEntriesBytes_ = 0;
+  keysOnlyActive_ = false;
+  keysOnlyEligible_ = false;
 }
 
 void SortBuffer::noMoreInput() {
@@ -149,6 +395,11 @@ void SortBuffer::noMoreInput() {
 
   // No data.
   if (numInputRows_ == 0) {
+    return;
+  }
+
+  if (keysOnlyActive_) {
+    keysOnlyNoMoreInput();
     return;
   }
 
@@ -436,6 +687,10 @@ void SortBuffer::prepareOutput(vector_size_t batchSize) {
 }
 
 void SortBuffer::getOutputWithoutSpill() {
+  if (keysOnlyActive_) {
+    keysOnlyGetOutput();
+    return;
+  }
   VELOX_DCHECK_EQ(numInputRows_, sortedRows_.size());
   for (const auto& columnProjection : columnMap_) {
     data_->extractColumn(

@@ -17,6 +17,7 @@
 #pragma once
 
 #include "velox/exec/ContainerRowSerde.h"
+#include "velox/exec/KeysOnlySort.h"
 #include "velox/exec/Operator.h"
 #include "velox/exec/OperatorUtils.h"
 #include "velox/exec/PrefixSort.h"
@@ -170,5 +171,40 @@ class SortBuffer {
 
   // The number of rows that has been returned.
   uint64_t numOutputRows_{0};
+
+  // ==== my_gporca prototype: keys-only compact sort ========================
+  // When every input column is a sort key and all key types are fixed-width
+  // integers, sort normalized key entries directly instead of materializing
+  // (row + key + row pointer) per row. Gated by GPORCA_SORT_KEYS_ONLY=1 and
+  // only used when spilling is disabled; falls back to the regular path as
+  // soon as an input batch carries nulls or the env is off. See KeysOnlySort.h
+  // and SortBuffer.cpp for the mechanics.
+  bool keysOnlyEligible_{false};
+  bool keysOnlyActive_{false};
+  std::optional<keysonly::KeysOnlyPlan> keysOnlyPlan_{};
+  std::vector<BufferPtr> keysOnlyChunks_;
+  memory::ContiguousAllocation keysOnlyEntries_;
+  uint64_t keysOnlyEntriesBytes_{0};
+
+  // Returns true when the keys-only fast path is enabled for this sort buffer
+  // (env + shape check).
+  bool keysOnlyEnabled() const;
+
+  // Appends one batch of encoded key entries. Returns false when the batch
+  // cannot be encoded (nulls present).
+  bool keysOnlyAddInput(const VectorPtr& input);
+
+  // Sorts the accumulated key entries.
+  void keysOnlyNoMoreInput();
+
+  // Decodes the next batch of sorted entries into 'output_'.
+  void keysOnlyGetOutput();
+
+  // Rewrites every accumulated entry back into 'data_' rows and disables the
+  // fast path; used when a later batch cannot be encoded.
+  void keysOnlyFallback();
+
+  // Stores one input batch in 'data_' (regular path).
+  void storeRows(const VectorPtr& input);
 };
 } // namespace facebook::velox::exec
