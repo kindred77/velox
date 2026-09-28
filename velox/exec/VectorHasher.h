@@ -406,6 +406,7 @@ class VectorHasher {
     flatValues_.clear();
     uniqueValuesStorage_.clear();
     clearShortValueIdCache();
+    clearIntValueIdCache();
   }
 
   // Sets 'this' to range mode and adds 'reservePct' values to the
@@ -661,14 +662,42 @@ class VectorHasher {
     }
 
     if constexpr (std::is_integral_v<T>) {
+      // my_gporca: direct-mapped hit path for wide-range integer keys whose
+      // ids come from the value-id map (see 'intValueIdCache_'). Only the
+      // flat map branch is cached; the generic map path below is unchanged.
+      const bool cacheEnabled = intValueIdCacheEnabled();
+      uint32_t cacheSlot = 0;
+      const bool cacheActive = cacheEnabled &&
+          intValueIdCacheState_ != IntValueIdCacheState::kDisabled;
+      if (cacheActive) {
+        cacheSlot = intValueIdCacheSlot(int64Value);
+        const auto& entry = intValueIdCache_[cacheSlot];
+        if (entry.valid && entry.key == int64Value) {
+          ++intValueIdCacheHits_;
+          updateIntValueIdCacheState();
+          return entry.id;
+        }
+        ++intValueIdCacheMisses_;
+        updateIntValueIdCacheState();
+      }
       if (useFlatValueIds_) {
         const auto id = flatValues_.insert(int64Value);
         if (!id.second) {
+          if (cacheActive &&
+              intValueIdCacheState_ != IntValueIdCacheState::kDisabled) {
+            intValueIdCache_[cacheSlot] = IntValueIdCacheEntry{
+                int64Value, static_cast<uint64_t>(id.first), true};
+          }
           return id.first;
         }
         updateRange(int64Value);
         if (flatValues_.size() >= rangeSize_) {
           return kUnmappable;
+        }
+        if (cacheActive &&
+            intValueIdCacheState_ != IntValueIdCacheState::kDisabled) {
+          intValueIdCache_[cacheSlot] = IntValueIdCacheEntry{
+              int64Value, static_cast<uint64_t>(id.first), true};
         }
         return id.first;
       }
@@ -709,6 +738,10 @@ class VectorHasher {
       return int64Value - min_ + 1;
     }
     if constexpr (std::is_integral_v<T>) {
+      // my_gporca: the direct-mapped cache is only used on the id-assigning
+      // path ('valueId'); read-only lookups (join probe side) keep the
+      // original map probe. Caching lookups measurably regressed probe-heavy
+      // queries (Q528 +60..85%) without a corresponding win.
       if (useFlatValueIds_) {
         const uint64_t id = flatValues_.find(int64Value);
         return id == 0 ? kUnmappable : id;
@@ -848,6 +881,85 @@ class VectorHasher {
     for (auto& entry : shortValueIdCache_) {
       entry.size = kEmptyShortValueIdCacheSize;
     }
+  }
+
+  // ==== my_gporca: integer value-id cache (env GPORCA_HASHER_INT_CACHE) ====
+  // Wide-range integer keys (values that cannot be range-mapped, e.g.
+  // clicks.user_id: 15,868 distinct values over a 45M span) assign ids from
+  // 'flatValues_'/'uniqueValues_' with a map probe per row. This direct-mapped
+  // cache mirrors 'shortValueIdCache_' for that path: a hit is one indexed
+  // load instead of a hash map probe. Entries are only valid while the map
+  // keeps assigning the same ids, so every path that clears or replaces the
+  // map must clear the cache too.
+  static constexpr uint32_t kIntValueIdCacheSize = 1024;
+  static constexpr uint32_t kIntValueIdCacheShift =
+      64 - 10; // log2(kIntValueIdCacheSize)
+
+  struct IntValueIdCacheEntry {
+    int64_t key{0};
+    uint64_t id{0};
+    bool valid{false};
+  };
+
+  mutable std::array<IntValueIdCacheEntry, kIntValueIdCacheSize>
+      intValueIdCache_{};
+
+  // Adaptive gate counters (per hasher; basis of the enable/disable decision
+  // below, also handy under a debugger).
+  mutable uint64_t intValueIdCacheHits_{0};
+  mutable uint64_t intValueIdCacheMisses_{0};
+
+  // Adaptive gate: the cache only pays off when the key's working set is
+  // small (low cardinality or a hot subset). Start probing; after
+  // 'kIntValueIdCacheProbeRows' rows keep the cache only when the hit rate is
+  // at least 'kIntValueIdCacheMinHitPct', otherwise switch it off for the
+  // rest of the stream so high-cardinality keys (e.g. a 100M-distinct join
+  // probe key) pay the extra probe for a bounded number of rows only.
+  static constexpr uint64_t kIntValueIdCacheProbeRows = 8192;
+  static constexpr uint64_t kIntValueIdCacheMinHitPct = 50;
+  enum class IntValueIdCacheState : uint8_t {
+    kProbing = 0,
+    kEnabled = 1,
+    kDisabled = 2,
+  };
+  mutable IntValueIdCacheState intValueIdCacheState_{
+      IntValueIdCacheState::kProbing};
+
+  void clearIntValueIdCache() {
+    for (auto& entry : intValueIdCache_) {
+      entry.valid = false;
+    }
+    intValueIdCacheState_ = IntValueIdCacheState::kProbing;
+    intValueIdCacheHits_ = 0;
+    intValueIdCacheMisses_ = 0;
+  }
+
+  FOLLY_ALWAYS_INLINE void updateIntValueIdCacheState() const {
+    if (intValueIdCacheState_ == IntValueIdCacheState::kProbing &&
+        intValueIdCacheHits_ + intValueIdCacheMisses_ >=
+            kIntValueIdCacheProbeRows) {
+      intValueIdCacheState_ =
+          100 * intValueIdCacheHits_ >=
+              kIntValueIdCacheMinHitPct *
+                  (intValueIdCacheHits_ + intValueIdCacheMisses_)
+          ? IntValueIdCacheState::kEnabled
+          : IntValueIdCacheState::kDisabled;
+    }
+  }
+
+  FOLLY_ALWAYS_INLINE static uint32_t intValueIdCacheSlot(int64_t value) {
+    const auto hash = static_cast<uint64_t>(value) * 0x9E3779B97F4A7C15ULL;
+    return static_cast<uint32_t>(hash >> kIntValueIdCacheShift);
+  }
+
+  // Read once by 'intValueIdCacheEnabled()'. Kept out of line so the per-row
+  // check below inlines to a load of the cached answer (a real call per row
+  // measurably regressed probe-heavy queries, P8 #19).
+  static bool intValueIdCacheEnabledByEnv();
+
+  FOLLY_ALWAYS_INLINE static bool intValueIdCacheEnabled() {
+    static const bool enabled = intValueIdCacheEnabledByEnv();
+    return enabled;
   }
 
   // Probes 'shortValueIdCache_' for a non-range string key and returns its id,

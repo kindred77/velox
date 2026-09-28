@@ -1181,6 +1181,20 @@ void VectorHasher::setDistinctOverflow() {
   uniqueValuesStorage_.clear();
   distinctStringsBytes_ = 0;
   clearShortValueIdCache();
+  clearIntValueIdCache();
+}
+
+// my_gporca: env gate for the wide-range integer value-id cache (default on;
+// GPORCA_HASHER_INT_CACHE=0 is the one-line rollback to the map probe per
+// row). The cache self-disables after a bounded probe window when the key's
+// hit rate is too low (see VectorHasher.h), so high-cardinality keys are not
+// penalized.
+bool VectorHasher::intValueIdCacheEnabledByEnv() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("GPORCA_HASHER_INT_CACHE");
+    return value == nullptr || std::atoi(value) != 0;
+  }();
+  return enabled;
 }
 
 void VectorHasher::setRangeOverflow() {
@@ -1403,6 +1417,7 @@ void VectorHasher::copyStatsFrom(const VectorHasher& other) {
   flatValues_ = other.flatValues_;
   // The copied value ids may differ from the cached ones.
   clearShortValueIdCache();
+  clearIntValueIdCache();
 }
 
 void VectorHasher::merge(const VectorHasher& other, size_t maxNumDistinct) {
