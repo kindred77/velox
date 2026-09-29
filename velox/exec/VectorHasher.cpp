@@ -1184,7 +1184,7 @@ void VectorHasher::setDistinctOverflow() {
   clearIntValueIdCache();
 }
 
-// my_gporca: env gate for the wide-range integer value-id cache (default on;
+// yihudb: env gate for the wide-range integer value-id cache (default on;
 // GPORCA_HASHER_INT_CACHE=0 is the one-line rollback to the map probe per
 // row). The cache self-disables after a bounded probe window when the key's
 // hit rate is too low (see VectorHasher.h), so high-cardinality keys are not

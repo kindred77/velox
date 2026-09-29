@@ -38,7 +38,7 @@ bool sortRowBulkAlloc() {
   return enabled;
 }
 
-/// my_gporca prototype: keys-only compact sort (see KeysOnlySort.h). Default
+/// yihudb prototype: keys-only compact sort (see KeysOnlySort.h). Default
 /// on; set GPORCA_SORT_KEYS_ONLY=0 for the one-line rollback to the regular
 /// (row container + row pointer) sort.
 bool keysOnlySortEnv() {

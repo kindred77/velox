@@ -22,7 +22,7 @@
 #include "velox/vector/DecodedVector.h"
 #include "velox/vector/FlatVector.h"
 
-// Keys-only compact sort helpers (my_gporca prototype, env
+// Keys-only compact sort helpers (yihudb prototype, env
 // GPORCA_SORT_KEYS_ONLY=1, default off; see SortBuffer.*).
 //
 // When every input column of a sort is one of its sort keys and all key types

@@ -180,7 +180,7 @@ class SimpleNumericAggregate : public exec::Aggregate {
           // group.  Mirroring updateGroups, let the LazyVector accumulate
           // directly during decode instead of materializing the column; a
           // per-row group array pointing at the single group is safe for any
-          // row numbering (my_gporca scalar-aggregate pushdown, 2026-08-24).
+          // row numbering (yihudb scalar-aggregate pushdown, 2026-08-24).
           std::vector<char*> groups(arg->size(), group);
           velox::aggregate::SimpleCallableHook<TData, UpdateSingle> hook(
               exec::Aggregate::offset_,

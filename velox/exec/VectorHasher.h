@@ -662,7 +662,7 @@ class VectorHasher {
     }
 
     if constexpr (std::is_integral_v<T>) {
-      // my_gporca: direct-mapped hit path for wide-range integer keys whose
+      // yihudb: direct-mapped hit path for wide-range integer keys whose
       // ids come from the value-id map (see 'intValueIdCache_'). Only the
       // flat map branch is cached; the generic map path below is unchanged.
       const bool cacheEnabled = intValueIdCacheEnabled();
@@ -738,7 +738,7 @@ class VectorHasher {
       return int64Value - min_ + 1;
     }
     if constexpr (std::is_integral_v<T>) {
-      // my_gporca: the direct-mapped cache is only used on the id-assigning
+      // yihudb: the direct-mapped cache is only used on the id-assigning
       // path ('valueId'); read-only lookups (join probe side) keep the
       // original map probe. Caching lookups measurably regressed probe-heavy
       // queries (Q528 +60..85%) without a corresponding win.
@@ -883,7 +883,7 @@ class VectorHasher {
     }
   }
 
-  // ==== my_gporca: integer value-id cache (env GPORCA_HASHER_INT_CACHE) ====
+  // ==== yihudb: integer value-id cache (env GPORCA_HASHER_INT_CACHE) ====
   // Wide-range integer keys (values that cannot be range-mapped, e.g.
   // clicks.user_id: 15,868 distinct values over a 45M span) assign ids from
   // 'flatValues_'/'uniqueValues_' with a map probe per row. This direct-mapped

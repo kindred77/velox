@@ -21,7 +21,7 @@ namespace facebook::velox::exec {
 
 namespace {
 
-/// my_gporca prototype (2026-09-26, [Win] 20260923 section 18, candidate C2):
+/// yihudb prototype (2026-09-26, [Win] 20260923 section 18, candidate C2):
 /// batch the per-row bit gather of dictionary-encoded booleans. `getFlatBool`
 /// held 21% of Q638 (called once per AND child); the helper below packs 8 rows
 /// into one byte for dense selections and drops the per-row null test when the
@@ -164,7 +164,7 @@ BooleanMix getFlatBool(
       auto values = decoded.data<uint64_t>();
       auto nulls = decoded.nulls(&activeRows);
       auto indices = decoded.indices();
-      // my_gporca prototype (C2, default off): with no base nulls the per-row
+      // yihudb prototype (C2, default off): with no base nulls the per-row
       // null test and the per-bit read-modify-write collapse into one
       // byte-batched gather (8 rows per byte for dense selections).
       if (useBatchedBoolGather() && nulls == nullptr && values != nullptr &&

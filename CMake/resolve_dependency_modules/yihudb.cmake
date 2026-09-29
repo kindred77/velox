@@ -13,15 +13,15 @@
 # limitations under the License.
 include_guard(GLOBAL)
 
-#velox_resolve_dependency_url(MYGPORCA)
+#velox_resolve_dependency_url(YIHUDB)
 
-message(STATUS "Building my_gporca from source")
+message(STATUS "Building yihudb from source")
 
 FetchContent_Declare(
-  my_gporca
-  SOURCE_DIR ${CMAKE_BINARY_DIR}/../third_libs/mygporca
+  yihudb
+  SOURCE_DIR ${CMAKE_BINARY_DIR}/../third_libs/yihudb
   #URL ${VELOX_SIMDJSON_SOURCE_URL}
   #URL_HASH ${VELOX_SIMDJSON_BUILD_SHA256_CHECKSUM}
 )
 
-FetchContent_MakeAvailable(my_gporca)
+FetchContent_MakeAvailable(yihudb)

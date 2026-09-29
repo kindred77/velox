@@ -54,7 +54,7 @@ const BaseVector* getValueVector(const BaseVector* vector) {
   return vector->valueVector().get();
 }
 
-/// my_gporca prototype (2026-09-27, [Win] 20260923 P3 candidate B2):
+/// yihudb prototype (2026-09-27, [Win] 20260923 P3 candidate B2):
 /// `DecodedVector::setFlatNulls` merges the nulls of the wrappers with the
 /// nulls of the leaf vector by traversing the selected rows.  When the leaf has
 /// no nulls - the common case for dictionary-encoded scan columns, where the
@@ -73,7 +73,7 @@ bool decodeNullsMergeFastEnabled() {
   return enabled;
 }
 
-/// my_gporca switch (2026-09-27 evening, [Win] 20260923): index translation
+/// yihudb switch (2026-09-27 evening, [Win] 20260923): index translation
 /// fast path of applyDictionaryWrapper() - 0 = historical loop with the
 /// per-row null tests, 1 = plain translation loop, 2 = plain translation loop
 /// plus a SIMD gather for the full-row case (default).

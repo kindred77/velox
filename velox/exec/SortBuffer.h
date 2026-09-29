@@ -172,7 +172,7 @@ class SortBuffer {
   // The number of rows that has been returned.
   uint64_t numOutputRows_{0};
 
-  // ==== my_gporca prototype: keys-only compact sort ========================
+  // ==== yihudb prototype: keys-only compact sort ========================
   // When every input column is a sort key and all key types are fixed-width
   // integers, sort normalized key entries directly instead of materializing
   // (row + key + row pointer) per row. Gated by GPORCA_SORT_KEYS_ONLY=1 and

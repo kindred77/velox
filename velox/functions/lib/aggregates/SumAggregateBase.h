@@ -86,7 +86,7 @@ class SumAggregateBase
       const SelectivityVector& rows,
       const std::vector<VectorPtr>& args,
       bool mayPushdown) override {
-    // my_gporca prototype (P3-A1, default off): batch-accumulate the
+    // yihudb prototype (P3-A1, default off): batch-accumulate the
     // single-group input with one overflow range check per batch. Falls through
     // to the canonical per-row path for every shape it cannot prove safe.
     if (sumOverflowBatchAccumulateEnabled() &&
@@ -164,7 +164,7 @@ private:
     velox::aggregate::SumHook<TData, Overflow>::add(result, value);
   }
 
-  /// my_gporca prototype (P3-A2, default off): the same overflow check without
+  /// yihudb prototype (P3-A2, default off): the same overflow check without
   /// the short-circuit branch of windows::builtin_add_overflow. Picked once per
   /// update call so the per-row loop has no extra flag test.
   template <typename TData>
@@ -190,7 +190,7 @@ private:
     return &updateSingleValue<TData>;
   }
 
-  /// my_gporca prototype (P3-A1, default off): accumulate the whole
+  /// yihudb prototype (P3-A1, default off): accumulate the whole
   /// single-group batch in registers with wraparound arithmetic, prove that no
   /// prefix of the batch can overflow through the positive/negative partial
   /// sums, then commit once. Anything that is not provably safe (or not a
