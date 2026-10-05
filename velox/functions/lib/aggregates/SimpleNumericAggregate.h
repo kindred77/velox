@@ -99,7 +99,12 @@ class SimpleNumericAggregate : public exec::Aggregate {
       const VectorPtr& arg,
       UpdateSingleValue updateSingleValue,
       bool mayPushdown) {
-    DecodedVector decoded(*arg, rows, !mayPushdown);
+    // Types without an aggregation hook must always materialize lazy input.
+    // Callers can request pushdown for the operator as a whole even when a
+    // particular aggregate type (e.g. Timestamp or int128_t) does not support
+    // it.
+    DecodedVector decoded(
+        *arg, rows, !mayPushdown || !kMayPushdown<TData>);
     if constexpr (kMayPushdown<TData>) {
       if (mayPushdown &&
           decoded.base()->encoding() == VectorEncoding::Simple::LAZY &&
@@ -169,7 +174,10 @@ class SimpleNumericAggregate : public exec::Aggregate {
       UpdateDuplicate updateDuplicateValues,
       bool mayPushdown,
       TData initialValue) {
-    DecodedVector decoded(*arg, rows, !mayPushdown);
+    // See updateGroups: unsupported hook types cannot leave a LazyVector
+    // undecoded even if the operator enables aggregate pushdown.
+    DecodedVector decoded(
+        *arg, rows, !mayPushdown || !kMayPushdown<TData>);
     if constexpr (kMayPushdown<TData>) {
       if (mayPushdown &&
           decoded.base()->encoding() == VectorEncoding::Simple::LAZY &&

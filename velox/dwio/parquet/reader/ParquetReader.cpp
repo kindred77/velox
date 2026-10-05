@@ -1071,6 +1071,15 @@ TypePtr ReaderBase::convertType(
             "TIMESTAMP",
             requestedType->toString(),
             *schemaElement.name());
+        // Modern writers may emit both the legacy converted type and the
+        // logical TIMESTAMP annotation. Prefer the latter because it is the
+        // only place that distinguishes a local timestamp from an instant.
+        if (schemaElement.logicalType() &&
+            schemaElement.logicalType()->getType() ==
+                thrift::LogicalType::Type::TIMESTAMP &&
+            *schemaElement.logicalType()->get_TIMESTAMP().isAdjustedToUTC()) {
+          return TIMESTAMP_UTC();
+        }
         return TIMESTAMP();
 
       case thrift::ConvertedType::DECIMAL: {
@@ -1247,7 +1256,15 @@ TypePtr ReaderBase::convertType(
               "TIMESTAMP",
               requestedType->toString(),
               *schemaElement.name());
-          return TIMESTAMP();
+          // Parquet distinguishes local timestamps from instants using
+          // isAdjustedToUTC. Preserve that logical distinction in the
+          // inferred schema; TIMESTAMP_UTC has the same physical Timestamp
+          // representation and requested TIMESTAMP schemas remain compatible.
+          return *schemaElement.logicalType()
+                         ->get_TIMESTAMP()
+                         .isAdjustedToUTC()
+              ? TIMESTAMP_UTC()
+              : TIMESTAMP();
         }
         VELOX_CHECK(
             !requestedType ||

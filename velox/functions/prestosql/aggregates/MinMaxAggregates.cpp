@@ -584,13 +584,15 @@ std::vector<exec::AggregateRegistrationResult> registerMinMax(
             auto factory = getMinFunctionFactory(
                 name,
                 CompareFlags::NullHandlingMode::kNullAsIndeterminate,
-                TimestampPrecision::kMilliseconds);
+                // yihudb exposes PostgreSQL timestamp semantics, whose stored
+                // precision is microseconds rather than Presto milliseconds.
+                TimestampPrecision::kMicroseconds);
             return factory(step, argTypes, resultType, config);
           } else {
             auto factory = getMaxFunctionFactory(
                 name,
                 CompareFlags::NullHandlingMode::kNullAsIndeterminate,
-                TimestampPrecision::kMilliseconds);
+                TimestampPrecision::kMicroseconds);
             return factory(step, argTypes, resultType, config);
           }
         }
