@@ -687,18 +687,22 @@ if(CMAKE_SYSTEM_NAME MATCHES "Darwin")
 endif()
 
 velox_set_source(ICU)
+# The 'tu' (tools utility) component only exists when ICU is built with the
+# tools feature (missing for ARM64 cross-compilation, and for vcpkg static ICU
+# installs without the tools feature). Velox never links ICU::tu, so do not
+# require it.
 set(VELOX_ICU_COMPONENTS data i18n io uc)
-# The 'tu' (tools utility) component is only available when ICU is built with tools
-# feature. For ARM64 cross-compilation, tu is not built for the target. On
-# Windows the vcpkg static ICU port does not ship icutu either, and Velox never
-# links ICU::tu, so the component is not required there.
-if(NOT VELOX_TARGET_IS_ARM64 AND NOT WIN32)
-  list(APPEND VELOX_ICU_COMPONENTS tu)
-endif()
 velox_resolve_dependency(
   ICU
   COMPONENTS ${VELOX_ICU_COMPONENTS}
 )
+
+# FindICU does not model libicuuc's dependency on libicudata. With a static ICU
+# (e.g. vcpkg) libicuuc.a references the icudt*_dat symbols defined in
+# libicudata.a, so make the dependency explicit for consumers of ICU::uc.
+if(TARGET ICU::uc AND TARGET ICU::data)
+  set_property(TARGET ICU::uc APPEND PROPERTY INTERFACE_LINK_LIBRARIES ICU::data)
+endif()
 
 set(
   BOOST_COMPONENTS
