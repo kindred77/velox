@@ -50,4 +50,14 @@ if(NOT TARGET glog::glog)
       # with both system and vcpkg glog on all platforms.
       INTERFACE_COMPILE_DEFINITIONS "GLOG_USE_GLOG_EXPORT;GLOG_USE_GFLAGS"
   )
+  # glog is built with GLOG_USE_GFLAGS: its flags.cc.o (pulled for the glog
+  # flags it defines, e.g. FLAGS_v) references the FlagRegisterer template
+  # instantiations defined in gflags' flags.cc.o. Without this dependency edge
+  # CMake emits libgflags.a BEFORE libglog.a, so targets that pull glog's
+  # flags.cc.o without also pulling gflags' flags.cc.o earlier fail with
+  # "undefined reference to google::FlagRegisterer<...>". vcpkg's glog-config
+  # declares the same dependency in glog-targets.cmake.
+  if(TARGET gflags::gflags)
+    set_property(TARGET glog::glog APPEND PROPERTY INTERFACE_LINK_LIBRARIES gflags::gflags)
+  endif()
 endif()
