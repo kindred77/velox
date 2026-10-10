@@ -107,6 +107,17 @@ else()
   message(STATUS "Java not found - some features may be disabled")
 endif()
 
+# No source in this tree uses JNI (no <jni.h>/JNIEnv), but upstream links
+# ${JNI_LIBRARIES} (JVM + AWT) into velox_functions_lib on non-Windows
+# platforms, which bakes a JDK runtime dependency (AWT pulls in X11) into
+# every consumer binary. Keep it opt-in; enable with -DVELOX_ENABLE_JNI=ON
+# when a consumer actually needs JNI.
+option(
+  VELOX_ENABLE_JNI
+  "Link JNI (jvm/awt) into velox_functions_lib; requires a JDK"
+  OFF
+)
+
 # If we are in an active conda env disable search in system paths and add env to
 # prefix path
 if(DEFINED ENV{CONDA_PREFIX})

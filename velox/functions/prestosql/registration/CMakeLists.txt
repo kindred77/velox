@@ -12,10 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-if(WIN32)
-  find_package(Java QUIET)
-  find_package(JNI QUIET)
-else()
+# See VELOX_ENABLE_JNI: JNI is unused in this tree and must not require a JDK.
+if(VELOX_ENABLE_JNI)
   find_package(Java REQUIRED)
   find_package(JNI REQUIRED)
 endif()
@@ -135,7 +133,7 @@ if(VELOX_ENABLE_FAISS)
   )
 endif()
 
-if(NOT WIN32 AND JNI_FOUND)
+if(NOT WIN32 AND VELOX_ENABLE_JNI AND JNI_FOUND)
   velox_include_directories(velox_functions_prestosql PRIVATE ${JNI_INCLUDE_DIRS})
 endif()
 

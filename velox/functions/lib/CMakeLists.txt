@@ -41,10 +41,10 @@ velox_add_library(
 
 velox_link_libraries(velox_functions_lib_date_time_formatter velox_type_tz)
 
-if(WIN32)
-  find_package(Java QUIET)
-  find_package(JNI QUIET)
-else()
+# JNI is unused in this tree (no <jni.h>/JNIEnv users); linking it on Linux
+# drags the JDK (JVM + AWT -> X11) into every consumer binary. Windows never
+# linked it for the same reason. Opt in via VELOX_ENABLE_JNI (default OFF).
+if(VELOX_ENABLE_JNI)
   find_package(Java REQUIRED)
   find_package(JNI REQUIRED)
 endif()
@@ -100,10 +100,7 @@ velox_add_library(
   ZetaDistribution.h
 )
 
-if(WIN32)
-  # Windows: Never use JNI (removes jvm.lib dependency)
-  # Java/JNI not needed for Windows builds
-else()
+if(NOT WIN32 AND VELOX_ENABLE_JNI AND JNI_FOUND)
   velox_include_directories(velox_functions_lib PRIVATE ${JNI_INCLUDE_DIRS})
 endif()
 
@@ -118,7 +115,7 @@ velox_link_libraries(
   Folly::folly
 )
 
-if(NOT WIN32 AND JNI_FOUND)
+if(NOT WIN32 AND VELOX_ENABLE_JNI AND JNI_FOUND)
   velox_link_libraries(velox_functions_lib ${JNI_LIBRARIES})
 endif()
 
