@@ -20,6 +20,7 @@
 #include "velox/common/memory/MallocAllocator.h"
 #include "velox/common/memory/MmapAllocator.h"
 #include "velox/common/memory/MmapArena.h"
+#include "velox/common/memory/PageMapping.h"
 #include "velox/common/memory/SharedArbitrator.h"
 #include "velox/common/testutil/TestValue.h"
 
@@ -34,6 +35,10 @@
 #include <fstream>
 #endif // linux
 
+#ifdef _WIN32
+#include <Windows.h>
+#endif
+
 DECLARE_bool(velox_memory_leak_check_enabled);
 
 using namespace facebook::velox::common::testutil;
@@ -46,6 +51,41 @@ struct ProcessSize {
   int64_t rss;
 };
 } // namespace
+
+TEST(PageMappingTest, lifecycle) {
+  constexpr size_t kPages = 4;
+  constexpr size_t kBytes = kPages * AllocationTraits::kPageSize;
+  auto* address = static_cast<uint8_t*>(PageMapping::reserve(kBytes));
+  ASSERT_NE(address, nullptr);
+
+#ifdef _WIN32
+  MEMORY_BASIC_INFORMATION info{};
+  ASSERT_EQ(::VirtualQuery(address, &info, sizeof(info)), sizeof(info));
+  EXPECT_EQ(info.State, MEM_RESERVE);
+#endif
+
+  auto* middle = address + AllocationTraits::kPageSize;
+  constexpr size_t kMiddleBytes = 2 * AllocationTraits::kPageSize;
+  ASSERT_TRUE(PageMapping::commit(middle, kMiddleBytes));
+  middle[0] = 17;
+  middle[kMiddleBytes - 1] = 29;
+
+#ifdef _WIN32
+  ASSERT_EQ(::VirtualQuery(middle, &info, sizeof(info)), sizeof(info));
+  EXPECT_EQ(info.State, MEM_COMMIT);
+#endif
+
+  ASSERT_TRUE(PageMapping::discard(middle, kMiddleBytes));
+#ifdef _WIN32
+  ASSERT_EQ(::VirtualQuery(middle, &info, sizeof(info)), sizeof(info));
+  EXPECT_EQ(info.State, MEM_RESERVE);
+#endif
+
+  ASSERT_TRUE(PageMapping::commit(middle, kMiddleBytes));
+  middle[0] = 31;
+  EXPECT_EQ(middle[0], 31);
+  EXPECT_TRUE(PageMapping::release(address, kBytes));
+}
 
 static constexpr uint64_t kCapacityBytes = 1ULL << 30;
 static constexpr MachinePageCount kCapacityPages =

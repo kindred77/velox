@@ -55,6 +55,10 @@ std::shared_ptr<MemoryAllocator> createAllocator(
     allocatorOptions.smallAllocationReservePct =
         options.smallAllocationReservePct;
     allocatorOptions.maxMallocBytes = options.maxMallocBytes;
+    allocatorOptions.mmapMaxCachedBytes = options.mmapMaxCachedBytes;
+    allocatorOptions.mmapMaxSubPageBytes = options.mmapMaxSubPageBytes;
+    allocatorOptions.mmapTrackAllocationPeaks =
+        options.mmapTrackAllocationPeaks;
     return std::make_shared<MmapAllocator>(allocatorOptions);
   } else {
     allocatorOptions.reservationByteLimit =

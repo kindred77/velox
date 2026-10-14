@@ -18,9 +18,10 @@
 #include "velox/exec/MemoryReclaimer.h"
 #include "velox/exec/Spiller.h"
 
+#include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <iostream>
-#include <atomic>
 
 namespace facebook::velox::exec {
 
@@ -49,12 +50,27 @@ bool keysOnlySortEnv() {
   return enabled;
 }
 
+/// Packs keys-only entries into geometric slabs, sorts each slab in place and
+/// merges the sorted runs during output. Default off while the memory and wall
+/// clock trade-off is measured; set GPORCA_SORT_KEYS_ONLY_SLAB=1 to enable.
+bool keysOnlySortSlabEnv() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("GPORCA_SORT_KEYS_ONLY_SLAB");
+    return value != nullptr && std::atoi(value) != 0;
+  }();
+  return enabled;
+}
+
+constexpr uint64_t kKeysOnlyMinSlabBytes = 64ULL << 10;
+constexpr uint64_t kKeysOnlyMaxSlabBytes = 16ULL << 20;
+
 /// Diagnostic probe (default off, zero overhead unless enabled): counts how
 /// many SortBuffers take the keys-only fast path and how many rows they encode
 /// in this process; printed once at exit. GPORCA_SORT_KEYS_ONLY_STATS=1.
 struct KeysOnlySortStats {
   std::atomic<uint64_t> buffers{0};
   std::atomic<uint64_t> rows{0};
+  std::atomic<uint64_t> slabs{0};
   const bool enabled = [] {
     const char* value = std::getenv("GPORCA_SORT_KEYS_ONLY_STATS");
     return value != nullptr && std::atoi(value) != 0;
@@ -63,7 +79,7 @@ struct KeysOnlySortStats {
   ~KeysOnlySortStats() {
     if (enabled) {
       std::cerr << "[sortkeysonly] sortBuffers=" << buffers.load()
-                << " rows=" << rows.load() << "\n";
+                << " rows=" << rows.load() << " slabs=" << slabs.load() << "\n";
     }
   }
 };
@@ -157,15 +173,16 @@ SortBuffer::SortBuffer(
       for (const auto& type : keyTypes) {
         keyKinds.emplace_back(type->kind());
       }
-      keysOnlyPlan_.emplace(keysonly::KeysOnlyPlan{
-          PrefixSortLayout::generate(
-              keyTypes,
-              columnHasNulls,
-              sortCompareFlags_,
-              prefixSortConfig_.maxNormalizedKeyBytes,
-              prefixSortConfig_.maxStringPrefixLength,
-              maxStringLengths),
-          std::move(keyKinds)});
+      keysOnlyPlan_.emplace(
+          keysonly::KeysOnlyPlan{
+              PrefixSortLayout::generate(
+                  keyTypes,
+                  columnHasNulls,
+                  sortCompareFlags_,
+                  prefixSortConfig_.maxNormalizedKeyBytes,
+                  prefixSortConfig_.maxStringPrefixLength,
+                  maxStringLengths),
+              std::move(keyKinds)});
       // Only the all-normalized form is supported by the prototype.
       if (!keysOnlyPlan_->layout.hasNormalizedKeys ||
           keysOnlyPlan_->layout.hasNonNormalizedKey ||
@@ -176,6 +193,8 @@ SortBuffer::SortBuffer(
       }
     }
   }
+  keysOnlySlabEnabled_ = keysOnlyEligible_ && keysOnlySortSlabEnv();
+  keysOnlyNextSlabBytes_ = kKeysOnlyMinSlabBytes;
 }
 
 bool SortBuffer::keysOnlyEnabled() const {
@@ -261,9 +280,7 @@ bool SortBuffer::keysOnlyAddInput(const VectorPtr& input) {
     }
   }
   const auto stride = keysOnlyPlan_->layout.normalizedBufferSize;
-  auto chunk = AlignedBuffer::allocate<char>(
-      static_cast<uint64_t>(numRows) * stride, pool_);
-  char* entries = chunk->asMutable<char>();
+  const bool firstKeysOnlyBatch = keysOnlyEntriesBytes_ == 0;
 
   const SelectivityVector allRows(numRows);
   std::vector<std::unique_ptr<DecodedVector>> decoded;
@@ -273,22 +290,51 @@ bool SortBuffer::keysOnlyAddInput(const VectorPtr& input) {
   // Sort key i is input column columnMap_[i].outputChannel; keys-only shapes
   // have no non-sorted columns so columnMap_ covers every input column.
   for (const auto& columnProjection : columnMap_) {
-    decoded.emplace_back(std::make_unique<DecodedVector>(
-        *inputRow->childAt(columnProjection.outputChannel), allRows));
+    decoded.emplace_back(
+        std::make_unique<DecodedVector>(
+            *inputRow->childAt(columnProjection.outputChannel), allRows));
     keyViews.emplace_back(decoded.back().get());
   }
-  for (vector_size_t row = 0; row < numRows; ++row) {
-    keysonly::encodeRow(
-        *keysOnlyPlan_,
-        keyViews,
-        row,
-        entries + static_cast<uint64_t>(row) * stride);
+  if (keysOnlySlabEnabled_) {
+    for (vector_size_t row = 0; row < numRows; ++row) {
+      if (keysOnlyChunks_.empty() ||
+          keysOnlyChunks_.back()->size() + stride >
+              keysOnlyChunks_.back()->capacity()) {
+        const auto requestedBytes = std::max<uint64_t>(
+            stride, keysOnlyNextSlabBytes_ / stride * stride);
+        auto slab = AlignedBuffer::allocate<char>(requestedBytes, pool_);
+        slab->setSize(0);
+        keysOnlyChunks_.emplace_back(std::move(slab));
+        keysOnlyNextSlabBytes_ = std::min<uint64_t>(
+            kKeysOnlyMaxSlabBytes, keysOnlyNextSlabBytes_ * 2);
+        auto& stats = keysOnlySortStats();
+        if (stats.enabled) {
+          ++stats.slabs;
+        }
+      }
+      auto& slab = keysOnlyChunks_.back();
+      const auto offset = slab->size();
+      keysonly::encodeRow(
+          *keysOnlyPlan_, keyViews, row, slab->asMutable<char>() + offset);
+      slab->setSize(offset + stride);
+    }
+  } else {
+    auto chunk = AlignedBuffer::allocate<char>(
+        static_cast<uint64_t>(numRows) * stride, pool_);
+    char* entries = chunk->asMutable<char>();
+    for (vector_size_t row = 0; row < numRows; ++row) {
+      keysonly::encodeRow(
+          *keysOnlyPlan_,
+          keyViews,
+          row,
+          entries + static_cast<uint64_t>(row) * stride);
+    }
+    keysOnlyChunks_.emplace_back(std::move(chunk));
   }
-  keysOnlyChunks_.emplace_back(std::move(chunk));
   keysOnlyEntriesBytes_ += static_cast<uint64_t>(numRows) * stride;
   auto& stats = keysOnlySortStats();
   if (stats.enabled) {
-    if (keysOnlyChunks_.size() == 1) {
+    if (firstKeysOnlyBatch) {
       ++stats.buffers;
     }
     stats.rows += numRows;
@@ -300,6 +346,38 @@ void SortBuffer::keysOnlyNoMoreInput() {
   const auto stride = keysOnlyPlan_->layout.normalizedBufferSize;
   const uint64_t totalBytes = numInputRows_ * stride;
   VELOX_CHECK_EQ(keysOnlyEntriesBytes_, totalBytes);
+  updateEstimatedOutputRowSize();
+
+  auto swapBuffer = AlignedBuffer::allocate<char>(stride, pool_);
+  prefixsort::PrefixSortRunner sortRunner(
+      stride, swapBuffer->asMutable<char>());
+  const auto compareEntries = [&](const char* left, const char* right) {
+    return keysonly::compareEntries(*keysOnlyPlan_, left, right);
+  };
+
+  if (keysOnlySlabEnabled_) {
+    keysOnlyRunOffsets_.assign(keysOnlyChunks_.size(), 0);
+    keysOnlyMergeHeap_.reserve(keysOnlyChunks_.size());
+    for (uint32_t index = 0; index < keysOnlyChunks_.size(); ++index) {
+      auto& chunk = keysOnlyChunks_[index];
+      VELOX_CHECK_GT(chunk->size(), 0);
+      VELOX_CHECK_EQ(chunk->size() % stride, 0);
+      char* begin = chunk->asMutable<char>();
+      sortRunner.quickSort(begin, begin + chunk->size(), compareEntries);
+      keysOnlyMergeHeap_.push_back(index);
+    }
+    const auto runAfter = [&](uint32_t left, uint32_t right) {
+      const auto* leftEntry =
+          keysOnlyChunks_[left]->as<char>() + keysOnlyRunOffsets_[left];
+      const auto* rightEntry =
+          keysOnlyChunks_[right]->as<char>() + keysOnlyRunOffsets_[right];
+      return compareEntries(leftEntry, rightEntry) > 0;
+    };
+    std::make_heap(
+        keysOnlyMergeHeap_.begin(), keysOnlyMergeHeap_.end(), runAfter);
+    return;
+  }
+
   const auto numPages = memory::AllocationTraits::numPages(totalBytes);
   pool_->allocateContiguous(numPages, keysOnlyEntries_);
   char* buffer = keysOnlyEntries_.data<char>();
@@ -311,23 +389,11 @@ void SortBuffer::keysOnlyNoMoreInput() {
   VELOX_CHECK_EQ(offset, totalBytes);
   keysOnlyChunks_.clear();
   keysOnlyEntriesBytes_ = 0;
-  updateEstimatedOutputRowSize();
-
-  auto swapBuffer = AlignedBuffer::allocate<char>(stride, pool_);
-  prefixsort::PrefixSortRunner sortRunner(
-      stride, swapBuffer->asMutable<char>());
-  sortRunner.quickSort(
-      buffer,
-      buffer + totalBytes,
-      [&](const char* left, const char* right) {
-        // PrefixSortRunner uses a three-way comparator (-1/0/1).
-        return keysonly::compareEntries(*keysOnlyPlan_, left, right);
-      });
+  sortRunner.quickSort(buffer, buffer + totalBytes, compareEntries);
 }
 
 void SortBuffer::keysOnlyGetOutput() {
   const auto stride = keysOnlyPlan_->layout.normalizedBufferSize;
-  const char* entries = keysOnlyEntries_.data<char>();
   // Sort key i lives in input column columnMap_[i].outputChannel and is
   // returned in that same output child (see the columnMap_ construction).
   std::vector<VectorPtr> outputs;
@@ -336,6 +402,41 @@ void SortBuffer::keysOnlyGetOutput() {
     outputs.emplace_back(output_->childAt(columnProjection.outputChannel));
   }
   const auto batchRows = output_->size();
+  if (keysOnlySlabEnabled_) {
+    const auto runAfter = [&](uint32_t left, uint32_t right) {
+      const auto* leftEntry =
+          keysOnlyChunks_[left]->as<char>() + keysOnlyRunOffsets_[left];
+      const auto* rightEntry =
+          keysOnlyChunks_[right]->as<char>() + keysOnlyRunOffsets_[right];
+      return keysonly::compareEntries(*keysOnlyPlan_, leftEntry, rightEntry) >
+          0;
+    };
+    for (vector_size_t row = 0; row < batchRows; ++row) {
+      VELOX_CHECK(!keysOnlyMergeHeap_.empty());
+      std::pop_heap(
+          keysOnlyMergeHeap_.begin(), keysOnlyMergeHeap_.end(), runAfter);
+      const auto run = keysOnlyMergeHeap_.back();
+      keysOnlyMergeHeap_.pop_back();
+      const auto offset = keysOnlyRunOffsets_[run];
+      keysonly::decodeEntry(
+          *keysOnlyPlan_,
+          keysOnlyChunks_[run]->as<char>() + offset,
+          outputs,
+          row);
+      keysOnlyRunOffsets_[run] += stride;
+      if (keysOnlyRunOffsets_[run] < keysOnlyChunks_[run]->size()) {
+        keysOnlyMergeHeap_.push_back(run);
+        std::push_heap(
+            keysOnlyMergeHeap_.begin(), keysOnlyMergeHeap_.end(), runAfter);
+      } else {
+        keysOnlyChunks_[run].reset();
+      }
+    }
+    numOutputRows_ += batchRows;
+    return;
+  }
+
+  const char* entries = keysOnlyEntries_.data<char>();
   for (vector_size_t row = 0; row < batchRows; ++row) {
     keysonly::decodeEntry(
         *keysOnlyPlan_,
@@ -348,16 +449,8 @@ void SortBuffer::keysOnlyGetOutput() {
 
 void SortBuffer::keysOnlyFallback() {
   const auto stride = keysOnlyPlan_->layout.normalizedBufferSize;
-  // Entries still live in 'keysOnlyChunks_'; stage them in one buffer so the
-  // decode loop can index rows directly.
-  std::vector<char> staged(keysOnlyEntriesBytes_);
-  uint64_t offset = 0;
-  for (const auto& chunk : keysOnlyChunks_) {
-    std::memcpy(staged.data() + offset, chunk->as<char>(), chunk->size());
-    offset += chunk->size();
-  }
-  const char* entries = staged.data();
-
+  uint32_t chunkIndex = 0;
+  uint64_t chunkOffset = 0;
   constexpr uint64_t kBatchRows = 1024;
   for (uint64_t row = 0; row < numInputRows_; row += kBatchRows) {
     const auto batchRows = static_cast<vector_size_t>(
@@ -367,16 +460,28 @@ void SortBuffer::keysOnlyFallback() {
     std::vector<VectorPtr> outputs;
     outputs.reserve(columnMap_.size());
     for (const auto& columnProjection : columnMap_) {
-      outputs.emplace_back(
-          batchRow->childAt(columnProjection.outputChannel));
+      outputs.emplace_back(batchRow->childAt(columnProjection.outputChannel));
     }
     for (vector_size_t i = 0; i < batchRows; ++i) {
+      VELOX_CHECK_LT(chunkIndex, keysOnlyChunks_.size());
+      auto& chunk = keysOnlyChunks_[chunkIndex];
+      VELOX_CHECK_NOT_NULL(chunk);
       keysonly::decodeEntry(
-          *keysOnlyPlan_, entries + (row + i) * stride, outputs, i);
+          *keysOnlyPlan_, chunk->as<char>() + chunkOffset, outputs, i);
+      chunkOffset += stride;
+      if (chunkOffset == chunk->size()) {
+        chunk.reset();
+        ++chunkIndex;
+        chunkOffset = 0;
+      }
     }
     storeRows(batch);
   }
+  VELOX_CHECK_EQ(chunkIndex, keysOnlyChunks_.size());
+  VELOX_CHECK_EQ(chunkOffset, 0);
   keysOnlyChunks_.clear();
+  keysOnlyRunOffsets_.clear();
+  keysOnlyMergeHeap_.clear();
   keysOnlyEntriesBytes_ = 0;
   keysOnlyActive_ = false;
   keysOnlyEligible_ = false;

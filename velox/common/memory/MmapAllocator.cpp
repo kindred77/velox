@@ -19,7 +19,8 @@
 #ifndef _WIN32
 #include <sys/mman.h>
 #else
-// Windows compatibility - provides posix_* wrapper functions for aligned allocations
+// Windows compatibility - provides posix_* wrapper functions for aligned
+// allocations
 #include "velox/common/memory/windows/PosixMemoryCompat.h"
 #endif
 
@@ -27,6 +28,8 @@
 #include "velox/common/base/Portability.h"
 #include "velox/common/base/StatsReporter.h"
 #include "velox/common/memory/Memory.h"
+#include "velox/common/memory/PageMapping.h"
+#include "velox/common/memory/SubPageAllocator.h"
 
 #if defined(_MSC_VER)
 #include "velox/common/base/Builtins.h"
@@ -46,9 +49,21 @@ MmapAllocator::MmapAllocator(const Options& options)
           bits::roundUp(
               AllocationTraits::numPages(
                   options.capacity - mallocReservedBytes_),
-              64 * sizeClassSizes_.back())) {
+              64 * sizeClassSizes_.back())),
+      maxCachedPages_(
+          options.mmapMaxCachedBytes == std::numeric_limits<uint64_t>::max()
+              ? std::numeric_limits<MachinePageCount>::max()
+              : AllocationTraits::numPages(options.mmapMaxCachedBytes)) {
   for (const auto& size : sizeClassSizes_) {
-    sizeClasses_.push_back(std::make_unique<SizeClass>(capacity_ / size, size));
+    sizeClasses_.push_back(std::make_unique<SizeClass>(
+        capacity_ / size, size, options.mmapTrackAllocationPeaks));
+  }
+
+  if (options.mmapMaxSubPageBytes > 0) {
+    subPageAllocator_ = std::make_unique<SubPageAllocator>(
+        *this,
+        options.mmapMaxSubPageBytes,
+        options.mmapTrackAllocationPeaks);
   }
 
   if (useMmapArena_) {
@@ -61,6 +76,7 @@ MmapAllocator::MmapAllocator(const Options& options)
 }
 
 MmapAllocator::~MmapAllocator() {
+  subPageAllocator_.reset();
 #ifdef _WIN32
   if ((numAllocated_ != 0) || (numExternalMapped_ != 0)) {
     VELOX_MEM_LOG(ERROR) << "Memory leak in MmapAllocator destructor: "
@@ -144,6 +160,17 @@ bool MmapAllocator::allocateNonContiguousWithoutRetry(
     return true;
   }
   if (ensureEnoughMappedPages(newMapsNeeded)) {
+    if (!commit(out)) {
+      numMapped_.fetch_sub(newMapsNeeded);
+      const std::string errorMsg = fmt::format(
+          "Could not commit {} pages for allocation of {} pages",
+          newMapsNeeded,
+          sizeMix.totalPages);
+      VELOX_MEM_LOG(WARNING) << errorMsg;
+      setAllocatorFailureMessage(errorMsg);
+      freeNonContiguous(out);
+      return false;
+    }
     markAllMapped(out);
     return true;
   }
@@ -184,6 +211,7 @@ bool MmapAllocator::ensureEnoughMappedPages(int32_t newMappedNeeded) {
 int64_t MmapAllocator::freeNonContiguous(Allocation& allocation) {
   const auto numFreed = freeNonContiguousInternal(allocation);
   numAllocated_.fetch_sub(numFreed);
+  trimCacheIfNeeded();
   return AllocationTraits::pageBytes(numFreed);
 }
 
@@ -457,11 +485,12 @@ void* MmapAllocator::allocateBytesWithoutRetry(
     // See MallocAllocator::allocateBytesWithoutRetry: on Windows every pointer
     // released by posix_free() must come from the posix_* family (the fast path
     // stores its own header in front of the returned pointer).
-    auto* result = alignment > kMinAlignment ? ::posix_aligned_alloc(alignment, bytes)
-                                              : ::posix_malloc(bytes);
+    auto* result = alignment > kMinAlignment
+        ? ::posix_aligned_alloc(alignment, bytes)
+        : ::posix_malloc(bytes);
 #else
     auto* result = alignment > kMinAlignment ? ::aligned_alloc(alignment, bytes)
-                                              : ::malloc(bytes);
+                                             : ::malloc(bytes);
 #endif
     if (FOLLY_UNLIKELY(result == nullptr)) {
       VELOX_MEM_LOG(ERROR) << "Failed to allocateBytes " << bytes
@@ -470,6 +499,11 @@ void* MmapAllocator::allocateBytesWithoutRetry(
       numMallocBytes_ += bytes;
     }
     return result;
+  }
+
+  if (subPageAllocator_ != nullptr &&
+      subPageAllocator_->handles(bytes, alignment)) {
+    return subPageAllocator_->allocate(bytes, alignment);
   }
 
   if (bytes <= AllocationTraits::pageBytes(sizeClassSizes_.back())) {
@@ -502,11 +536,18 @@ void* MmapAllocator::allocateBytesWithoutRetry(
 void MmapAllocator::freeBytes(void* p, uint64_t bytes) noexcept {
   if (useMalloc(bytes)) {
 #ifdef _WIN32
-    ::posix_free(p); // Use smart wrapper on Windows for aligned allocation tracking
+    ::posix_free(
+        p); // Use smart wrapper on Windows for aligned allocation tracking
 #else
     ::free(p); // NOLINT
 #endif
     numMallocBytes_ -= bytes;
+    return;
+  }
+
+  if (subPageAllocator_ != nullptr &&
+      subPageAllocator_->handles(bytes, kMinAlignment)) {
+    subPageAllocator_->free(p);
     return;
   }
 
@@ -529,6 +570,54 @@ void MmapAllocator::markAllMapped(const Allocation& allocation) {
   }
 }
 
+bool MmapAllocator::commit(const Allocation& allocation) {
+  std::vector<PageRange> ranges;
+  for (const auto& sizeClass : sizeClasses_) {
+    sizeClass->appendUnmappedRanges(allocation, ranges);
+  }
+
+  size_t committed = 0;
+  for (; committed < ranges.size(); ++committed) {
+    if (!PageMapping::commit(
+            ranges[committed].address, ranges[committed].bytes)) {
+      break;
+    }
+  }
+  if (committed == ranges.size()) {
+    return true;
+  }
+
+  // No range is visible to the caller until all commits succeed. Roll back
+  // only the newly committed ranges and leave previously mapped free entries
+  // intact.
+  while (committed > 0) {
+    --committed;
+    PageMapping::discard(ranges[committed].address, ranges[committed].bytes);
+  }
+  return false;
+}
+
+void MmapAllocator::trimCacheIfNeeded() {
+  if (maxCachedPages_ == std::numeric_limits<MachinePageCount>::max()) {
+    return;
+  }
+
+  const auto mapped = numMapped_.load(std::memory_order_relaxed);
+  const auto allocated = numAllocated_.load(std::memory_order_relaxed);
+  if (mapped <= allocated || mapped - allocated <= maxCachedPages_) {
+    return;
+  }
+  std::lock_guard<std::mutex> trimLock(cacheTrimMutex_);
+
+  const auto currentMapped = numMapped_.load(std::memory_order_relaxed);
+  const auto currentAllocated = numAllocated_.load(std::memory_order_relaxed);
+  const auto cached =
+      currentMapped > currentAllocated ? currentMapped - currentAllocated : 0;
+  if (cached > maxCachedPages_) {
+    unmap(cached - maxCachedPages_ / 2);
+  }
+}
+
 MachinePageCount MmapAllocator::adviseAway(MachinePageCount target) {
   MachinePageCount numAway = 0;
   for (int32_t i = sizeClasses_.size() - 1; i >= 0; --i) {
@@ -541,9 +630,13 @@ MachinePageCount MmapAllocator::adviseAway(MachinePageCount target) {
   return numAway;
 }
 
-MmapAllocator::SizeClass::SizeClass(size_t capacity, MachinePageCount unitSize)
+MmapAllocator::SizeClass::SizeClass(
+    size_t capacity,
+    MachinePageCount unitSize,
+    bool trackAllocationPeaks)
     : capacity_(capacity),
       unitSize_(unitSize),
+      trackAllocationPeaks_(trackAllocationPeaks),
       byteSize_(AllocationTraits::pageBytes(capacity_ * unitSize_)),
       pageBitmapSize_(capacity_ / 64),
       // Min 8 words + 1 bit for every 512 bits in 'pageAllocated_'.
@@ -555,17 +648,10 @@ MmapAllocator::SizeClass::SizeClass(size_t capacity, MachinePageCount unitSize)
       0,
       "Sizeclass {} must have a multiple of 64 capacity",
       unitSize_);
-  void* ptr = mmap(
-      nullptr,
-      AllocationTraits::pageBytes(capacity_ * unitSize_),
-      PROT_READ | PROT_WRITE,
-      MAP_PRIVATE | MAP_ANONYMOUS,
-      -1,
-      0);
-  if (ptr == MAP_FAILED || ptr == nullptr) {
+  void* ptr = PageMapping::reserve(byteSize_);
+  if (ptr == nullptr) {
     VELOX_FAIL(
-        "Could not allocate working memory "
-        "mmap failed with {} for sizeClass {}",
+        "Could not reserve working memory: platform error {} for sizeClass {}",
         folly::errnoStr(errno),
         unitSize_);
   }
@@ -573,7 +659,11 @@ MmapAllocator::SizeClass::SizeClass(size_t capacity, MachinePageCount unitSize)
 }
 
 MmapAllocator::SizeClass::~SizeClass() {
-  munmap(address_, byteSize_);
+  if (!PageMapping::release(address_, byteSize_)) {
+    VELOX_MEM_LOG(ERROR) << "Failed to release size-class address range at "
+                         << static_cast<void*>(address_) << " of " << byteSize_
+                         << " bytes";
+  }
 }
 ClassPageCount MmapAllocator::SizeClass::checkConsistency(
     ClassPageCount& numMapped,
@@ -617,6 +707,13 @@ ClassPageCount MmapAllocator::SizeClass::checkConsistency(
         << " vs recorded= " << numMappedFreePages_
         << ". Total mapped=" << mappedCount;
   }
+  if (trackAllocationPeaks_ && count != currentAllocatedUnits_) {
+    ++numErrors;
+    VELOX_MEM_LOG(WARNING)
+        << "Mismatched live units in size class " << unitSize_
+        << ". Actual=" << count << " vs recorded="
+        << currentAllocatedUnits_;
+  }
   numMapped = mappedCount;
   return count;
 }
@@ -636,7 +733,9 @@ std::string MmapAllocator::SizeClass::toString() const {
     }
     auto mb = (AllocationTraits::pageBytes(count * unitSize_)) >> 20;
     out << "[size " << unitSize_ << ": " << count << "(" << mb
-        << "MB) allocated " << mappedCount << " mapped";
+        << "MB) allocated " << mappedCount << " mapped peak-units "
+        << peakAllocatedUnits_ << " peak-bytes "
+        << AllocationTraits::pageBytes(peakAllocatedUnits_ * unitSize_);
     if (mappedFreeCount != numMappedFreePages_) {
       out << "Mismatched count of mapped free pages "
           << ". Actual= " << mappedFreeCount
@@ -653,7 +752,16 @@ bool MmapAllocator::SizeClass::allocate(
     MachinePageCount& numUnmapped,
     Allocation& out) {
   std::lock_guard<std::mutex> l(mutex_);
-  return allocateLocked(numPages, &numUnmapped, out);
+  const auto previousPages = out.numPages();
+  const bool success = allocateLocked(numPages, &numUnmapped, out);
+  const auto allocatedUnits =
+      (out.numPages() - previousPages) / unitSize_;
+  if (trackAllocationPeaks_) {
+    currentAllocatedUnits_ += allocatedUnits;
+    peakAllocatedUnits_ =
+        std::max(peakAllocatedUnits_, currentAllocatedUnits_);
+  }
+  return success;
 }
 
 bool MmapAllocator::SizeClass::allocateLocked(
@@ -818,6 +926,12 @@ MachinePageCount MmapAllocator::SizeClass::adviseAway(
     target = std::min(target, numMappedFreePages_);
     allocateLocked(target, nullptr, allocation);
     VELOX_CHECK_EQ(allocation.numPages(), target * unitSize_);
+    // free() below uses the same live-unit accounting as caller-visible
+    // allocations. Balance this internal temporary without treating cache
+    // trimming as a user allocation peak.
+    if (trackAllocationPeaks_) {
+      currentAllocatedUnits_ += target;
+    }
     numAllocatedMapped_ -= target;
     numAdvisedAway_ += target;
   }
@@ -858,11 +972,10 @@ void MmapAllocator::SizeClass::adviseAway(const Allocation& allocation) {
     if (!isInRange(run.data())) {
       continue;
     }
-    if (::madvise(
-            run.data(),
-            AllocationTraits::pageBytes(run.numPages()),
-            MADV_DONTNEED) < 0) {
-      VELOX_MEM_LOG(ERROR) << "madvise got errno " << folly::errnoStr(errno);
+    if (!PageMapping::discard(
+            run.data(), AllocationTraits::pageBytes(run.numPages()))) {
+      VELOX_MEM_LOG(ERROR) << "Failed to discard " << run.numPages()
+                           << " pages at " << static_cast<void*>(run.data());
     } else {
       std::lock_guard<std::mutex> l(mutex_);
       setMappedBits(run, false);
@@ -883,6 +996,39 @@ void MmapAllocator::SizeClass::setMappedBits(
   const auto numPages = run.numPages() / unitSize_;
   for (int32_t page = firstBit; page < firstBit + numPages; ++page) {
     bits::setBit(pageMapped_.data(), page, value);
+  }
+}
+
+void MmapAllocator::SizeClass::appendUnmappedRanges(
+    const Allocation& allocation,
+    std::vector<PageRange>& ranges) const {
+  std::lock_guard<std::mutex> l(mutex_);
+  const auto classBytes = AllocationTraits::pageBytes(unitSize_);
+  for (int32_t runIndex = 0; runIndex < allocation.numRuns(); ++runIndex) {
+    const auto run = allocation.runAt(runIndex);
+    if (!isInRange(run.data())) {
+      continue;
+    }
+    const auto firstBit = (run.data() - address_) / classBytes;
+    const auto numClassPages = run.numPages() / unitSize_;
+    int32_t rangeStart = -1;
+    for (int32_t offset = 0; offset < numClassPages; ++offset) {
+      const bool mapped = bits::isBitSet(pageMapped_.data(), firstBit + offset);
+      if (!mapped && rangeStart == -1) {
+        rangeStart = offset;
+      }
+      if (mapped && rangeStart != -1) {
+        ranges.push_back(
+            {run.data() + rangeStart * classBytes,
+             static_cast<size_t>(offset - rangeStart) * classBytes});
+        rangeStart = -1;
+      }
+    }
+    if (rangeStart != -1) {
+      ranges.push_back(
+          {run.data() + rangeStart * classBytes,
+           static_cast<size_t>(numClassPages - rangeStart) * classBytes});
+    }
   }
 }
 
@@ -925,6 +1071,11 @@ MachinePageCount MmapAllocator::SizeClass::free(Allocation& allocation) {
       bits::clearBit(pageAllocated_.data(), page);
       numFreed += unitSize_;
     }
+  }
+  if (trackAllocationPeaks_) {
+    const auto freedUnits = numFreed / unitSize_;
+    VELOX_DCHECK_LE(freedUnits, currentAllocatedUnits_);
+    currentAllocatedUnits_ -= freedUnits;
   }
   return numFreed;
 }
@@ -986,6 +1137,27 @@ bool MmapAllocator::useMalloc(uint64_t bytes) {
   return (maxMallocBytes_ != 0) && (bytes <= maxMallocBytes_);
 }
 
+uint8_t* MmapAllocator::allocateSubPageSlab() {
+  constexpr MachinePageCount kSlabPages = 16;
+  Allocation allocation;
+  if (!allocateNonContiguousWithoutRetry(
+          allocationSize(kSlabPages, kSlabPages), allocation)) {
+    return nullptr;
+  }
+  VELOX_CHECK_EQ(allocation.numRuns(), 1);
+  VELOX_CHECK_EQ(allocation.numPages(), kSlabPages);
+  auto* address = allocation.runAt(0).data();
+  allocation.clear();
+  return address;
+}
+
+void MmapAllocator::freeSubPageSlab(void* address) noexcept {
+  constexpr MachinePageCount kSlabPages = 16;
+  Allocation allocation;
+  allocation.append(static_cast<uint8_t*>(address), kSlabPages);
+  freeNonContiguous(allocation);
+}
+
 std::string MmapAllocator::toString() const {
   std::stringstream out;
   out << "Memory Allocator[" << kindString(kind_) << " total capacity "
@@ -999,6 +1171,9 @@ std::string MmapAllocator::toString() const {
       << " external mapped pages " << numExternalMapped_ << std::endl;
   for (auto& sizeClass : sizeClasses_) {
     out << sizeClass->toString() << std::endl;
+  }
+  if (subPageAllocator_ != nullptr) {
+    out << subPageAllocator_->toString();
   }
   out << "]";
   return out.str();

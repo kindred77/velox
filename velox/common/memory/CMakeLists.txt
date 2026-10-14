@@ -37,8 +37,10 @@ velox_add_library(
   MemoryPool.cpp
   MmapAllocator.cpp
   MmapArena.cpp
+  PageMapping.cpp
   RawVector.cpp
   SharedArbitrator.cpp
+  SubPageAllocator.cpp
   StreamArena.cpp
   ${WINDOWS_MEMORY_SOURCES}
   HEADERS
@@ -57,9 +59,11 @@ velox_add_library(
   MemoryPool.h
   MmapAllocator.h
   MmapArena.h
+  PageMapping.h
   RawVector.h
   Scratch.h
   SharedArbitrator.h
+  SubPageAllocator.h
   StreamArena.h
 )
 

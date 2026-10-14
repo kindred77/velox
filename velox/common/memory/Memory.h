@@ -50,13 +50,13 @@ namespace facebook::velox::memory {
 #define VELOX_MEM_LOG_EVERY_MS(severity, ms) \
   FB_LOG_EVERY_MS(severity, ms) << VELOX_MEM_LOG_PREFIX
 
-#define VELOX_MEM_ALLOC_ERROR(errorMessage)                         \
-  _VELOX_THROW(                                                     \
-      ::facebook::velox::VeloxRuntimeError,                         \
+#define VELOX_MEM_ALLOC_ERROR(errorMessage)                 \
+  _VELOX_THROW(                                             \
+      ::facebook::velox::VeloxRuntimeError,                 \
       ::facebook::velox::error_source::kErrorSourceRuntime, \
       ::facebook::velox::error_code::kMemAllocError,        \
-      /* isRetriable */ true,                                       \
-      "{}",                                                         \
+      /* isRetriable */ true,                               \
+      "{}",                                                 \
       errorMessage);
 
 /// 'MemoryManager' is responsible for creating allocator, arbitrator and
@@ -128,6 +128,17 @@ class MemoryManager {
     ///
     /// NOTE: this only applies for MmapAllocator.
     int32_t maxMallocBytes{3072};
+
+    /// Maximum mapped bytes retained in free MmapAllocator size-class pages.
+    /// Default unlimited preserves the existing allocator behavior.
+    uint64_t mmapMaxCachedBytes{std::numeric_limits<uint64_t>::max()};
+
+    /// Maximum request size served by page-backed sub-page slabs.
+    /// Default zero preserves the existing allocator behavior.
+    uint32_t mmapMaxSubPageBytes{0};
+
+    /// Tracks per-size-class allocation peaks for opt-in diagnostics.
+    bool mmapTrackAllocationPeaks{false};
 
     /// The memory allocations with size smaller than this threshold check the
     /// capacity with local sharded counter to reduce the lock contention on the

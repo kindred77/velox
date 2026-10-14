@@ -22,8 +22,8 @@
 #include "velox/vector/DecodedVector.h"
 #include "velox/vector/FlatVector.h"
 
-// Keys-only compact sort helpers (yihudb prototype, env
-// GPORCA_SORT_KEYS_ONLY=1, default off; see SortBuffer.*).
+// Keys-only compact sort helpers (yihudb extension, default on with
+// GPORCA_SORT_KEYS_ONLY=0 as rollback; see SortBuffer.*).
 //
 // When every input column of a sort is one of its sort keys and all key types
 // are fixed-width integers, the SortBuffer can sort normalized key entries

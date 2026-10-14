@@ -172,19 +172,26 @@ class SortBuffer {
   // The number of rows that has been returned.
   uint64_t numOutputRows_{0};
 
-  // ==== yihudb prototype: keys-only compact sort ========================
+  // ==== yihudb: keys-only compact sort ==================================
   // When every input column is a sort key and all key types are fixed-width
   // integers, sort normalized key entries directly instead of materializing
-  // (row + key + row pointer) per row. Gated by GPORCA_SORT_KEYS_ONLY=1 and
-  // only used when spilling is disabled; falls back to the regular path as
-  // soon as an input batch carries nulls or the env is off. See KeysOnlySort.h
-  // and SortBuffer.cpp for the mechanics.
+  // (row + key + row pointer) per row. Enabled by default with
+  // GPORCA_SORT_KEYS_ONLY=0 as rollback, and only used when spilling is
+  // disabled; falls back to the regular path as soon as an input batch carries
+  // nulls or the env is off. The optional
+  // GPORCA_SORT_KEYS_ONLY_SLAB path packs entries into bounded sorted runs and
+  // merges them during output, avoiding the old full-size copy at sort start.
+  // See KeysOnlySort.h and SortBuffer.cpp for the mechanics.
   bool keysOnlyEligible_{false};
   bool keysOnlyActive_{false};
+  bool keysOnlySlabEnabled_{false};
   std::optional<keysonly::KeysOnlyPlan> keysOnlyPlan_{};
   std::vector<BufferPtr> keysOnlyChunks_;
   memory::ContiguousAllocation keysOnlyEntries_;
   uint64_t keysOnlyEntriesBytes_{0};
+  uint64_t keysOnlyNextSlabBytes_{0};
+  std::vector<uint64_t> keysOnlyRunOffsets_;
+  std::vector<uint32_t> keysOnlyMergeHeap_;
 
   // Returns true when the keys-only fast path is enabled for this sort buffer
   // (env + shape check).

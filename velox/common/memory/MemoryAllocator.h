@@ -249,6 +249,18 @@ class MemoryAllocator : public std::enable_shared_from_this<MemoryAllocator> {
     /// to std::malloc(). If zero, no allocations are delegated to malloc
     /// and 'smallAllocationReservePct' is automatically set to 0.
     int32_t maxMallocBytes{3072};
+
+    /// Maximum number of bytes retained as mapped, unused size-class pages.
+    /// The default preserves the existing unbounded cache behavior. A finite
+    /// value trims back to half of this watermark after frees.
+    uint64_t mmapMaxCachedBytes{std::numeric_limits<uint64_t>::max()};
+
+    /// Maximum request size served by page-backed sub-page slabs. Zero keeps
+    /// the existing one-page minimum allocation behavior.
+    uint32_t mmapMaxSubPageBytes{0};
+
+    /// Tracks per-size-class allocation peaks for opt-in diagnostics.
+    bool mmapTrackAllocationPeaks{false};
   };
 
   /// Defines the memory allocator kinds.

@@ -33,6 +33,8 @@
 
 namespace facebook::velox::memory {
 
+class SubPageAllocator;
+
 /// Denotes a number of pages of one size class, i.e. one page consists
 /// of a size class dependent number of consecutive machine pages.
 using ClassPageCount = int32_t;
@@ -131,13 +133,23 @@ class MmapAllocator : public MemoryAllocator {
   std::string toString() const override;
 
  private:
+  friend class SubPageAllocator;
+
   static constexpr uint64_t kAllSet = 0xffffffffffffffff;
+
+  struct PageRange {
+    void* address;
+    size_t bytes;
+  };
 
   // Represents a range of virtual addresses used for allocating entries of
   // 'unitSize_' machine pages.
   class SizeClass {
    public:
-    SizeClass(size_t capacity, MachinePageCount unitSize);
+    SizeClass(
+        size_t capacity,
+        MachinePageCount unitSize,
+        bool trackAllocationPeaks);
 
     ~SizeClass();
 
@@ -173,6 +185,13 @@ class MmapAllocator : public MemoryAllocator {
 
     // Sets the mapped flag for the class pages in 'run' to 'value'
     void setMappedBits(const Allocation::PageRun run, bool value);
+
+    // Appends ranges in 'allocation' that do not currently have physical
+    // backing. The allocation bits keep these ranges exclusively owned while
+    // the OS commit happens outside the size-class lock.
+    void appendUnmappedRanges(
+        const Allocation& allocation,
+        std::vector<PageRange>& ranges) const;
 
     // True if 'ptr' is in the address range of 'this'. Checks that ptr is at a
     // size class page boundary.
@@ -242,6 +261,8 @@ class MmapAllocator : public MemoryAllocator {
     // Size of one size class page in machine pages.
     const MachinePageCount unitSize_;
 
+    const bool trackAllocationPeaks_;
+
     // Size in bytes of the address range.
     const size_t byteSize_;
 
@@ -285,6 +306,11 @@ class MmapAllocator : public MemoryAllocator {
 
     // Cumulative count of madvise for pages of 'this'
     uint64_t numAdvisedAway_ = 0;
+
+    // Live and peak allocated size-class units. Updated under mutex_ and used
+    // only by the opt-in allocator layout diagnostic.
+    uint64_t currentAllocatedUnits_ = 0;
+    uint64_t peakAllocatedUnits_ = 0;
   };
 
   bool allocateNonContiguousWithoutRetry(
@@ -334,11 +360,19 @@ class MmapAllocator : public MemoryAllocator {
 
   void markAllMapped(const Allocation& allocation);
 
+  bool commit(const Allocation& allocation);
+
+  void trimCacheIfNeeded();
+
   // Finds at least  'target' unallocated pages in different size classes and
   // advises them away. Returns the number of pages advised away.
   MachinePageCount adviseAway(MachinePageCount target);
 
   bool useMalloc(uint64_t bytes);
+
+  uint8_t* allocateSubPageSlab();
+
+  void freeSubPageSlab(void* address) noexcept;
 
   const Kind kind_;
 
@@ -368,7 +402,16 @@ class MmapAllocator : public MemoryAllocator {
   // to std::malloc().
   const MachinePageCount capacity_ = 0;
 
+  // High watermark for mapped free size-class pages. Trimming returns pages
+  // to the OS until half of this watermark remains cached.
+  const MachinePageCount maxCachedPages_ = 0;
+  std::mutex cacheTrimMutex_;
+
   std::vector<std::unique_ptr<SizeClass>> sizeClasses_;
+
+  // Optional page-backed allocator for byte requests smaller than one page.
+  // Declared after sizeClasses_ so it is destroyed first.
+  std::unique_ptr<SubPageAllocator> subPageAllocator_;
 
   // Statistics.
   std::atomic<uint64_t> numAllocations_ = 0;
