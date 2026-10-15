@@ -17,11 +17,68 @@
 #include "velox/exec/window/PartitionStreamingWindowBuild.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
+#include <iostream>
 
 namespace facebook::velox::exec::window {
 
 namespace {
+
+struct PartitionStreamingBuildStats {
+  std::atomic<uint64_t> calls{0};
+  std::atomic<uint64_t> rows{0};
+  std::atomic<uint64_t> partitions{0};
+  std::atomic<uint64_t> decodeNanos{0};
+  std::atomic<uint64_t> combinedNanos{0};
+  std::atomic<uint64_t> sampledMidRows{0};
+  std::atomic<uint64_t> sampledMidPartitionNanos{0};
+  std::atomic<uint64_t> sampledMidAllocateNanos{0};
+  std::atomic<uint64_t> storeNanos{0};
+  std::atomic<uint64_t> bookkeepingNanos{0};
+  std::atomic<uint64_t> builds{0};
+  std::atomic<uint64_t> sortedRowsCapacityBytes{0};
+  std::atomic<uint64_t> inputRowsCapacityBytes{0};
+  std::atomic<uint64_t> partitionStartsCapacityBytes{0};
+  const bool enabled = [] {
+    const char* value = std::getenv("GPORCA_WINDOW_PARTITION_STATS");
+    return value != nullptr && std::atoi(value) != 0;
+  }();
+
+  ~PartitionStreamingBuildStats() {
+    if (enabled) {
+      std::cerr << "[window-partition-build] calls=" << calls.load()
+                << " rows=" << rows.load()
+                << " partitions=" << partitions.load()
+                << " decode_ns=" << decodeNanos.load()
+                << " combined_ns=" << combinedNanos.load()
+                << " sampled_mid_rows=" << sampledMidRows.load()
+                << " sampled_mid_partition_ns="
+                << sampledMidPartitionNanos.load()
+                << " sampled_mid_allocate_ns=" << sampledMidAllocateNanos.load()
+                << " store_ns=" << storeNanos.load()
+                << " bookkeeping_ns=" << bookkeepingNanos.load()
+                << " builds=" << builds.load()
+                << " sorted_rows_capacity_bytes="
+                << sortedRowsCapacityBytes.load()
+                << " input_rows_capacity_bytes=" << inputRowsCapacityBytes.load()
+                << " partition_starts_capacity_bytes="
+                << partitionStartsCapacityBytes.load() << "\n";
+    }
+  }
+};
+
+PartitionStreamingBuildStats& partitionStreamingBuildStats() {
+  static PartitionStreamingBuildStats stats;
+  return stats;
+}
+
+uint64_t elapsedNanos(std::chrono::steady_clock::time_point start) {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now() - start)
+      .count();
+}
 
 // Maps the reordered partition-key descriptors to original input channels.
 std::vector<column_index_t> extractPartitionChannels(
@@ -70,6 +127,14 @@ bool windowBatchStore() {
   return enabled;
 }
 
+bool stealPartitionRows() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("GPORCA_WINDOW_STEAL_PARTITION_ROWS");
+    return value != nullptr && std::atoi(value) != 0;
+  }();
+  return enabled;
+}
+
 } // namespace
 
 PartitionStreamingWindowBuild::PartitionStreamingWindowBuild(
@@ -79,7 +144,8 @@ PartitionStreamingWindowBuild::PartitionStreamingWindowBuild(
     tsan_atomic<bool>* nonReclaimableSection)
     : WindowBuild(windowNode, pool, spillConfig, nonReclaimableSection),
       previousPartitionKeyValues_(
-          extractPartitionChannels(partitionKeyInfo_, inputChannels_), pool),
+          extractPartitionChannels(partitionKeyInfo_, inputChannels_),
+          pool),
       partitionKeyChannels_(
           extractPartitionChannels(partitionKeyInfo_, inputChannels_)) {
   initializeRowContainer(pool);
@@ -88,36 +154,92 @@ PartitionStreamingWindowBuild::PartitionStreamingWindowBuild(
 
 void PartitionStreamingWindowBuild::buildNextPartition() {
   partitionStartRows_.push_back(sortedRowsBase_ + sortedRows_.size());
+  if (stealPartitionRows() && sortedRows_.empty()) {
+    sortedRows_.swap(inputRows_);
+    // inputRows_ now owns any empty retained buffer from sortedRows_. It cannot
+    // help grow the next partition, so release it instead of carrying two
+    // pointer buffers through output.
+    std::vector<char*>().swap(inputRows_);
+    return;
+  }
   sortedRows_.insert(sortedRows_.end(), inputRows_.begin(), inputRows_.end());
   inputRows_.clear();
 }
 
 void PartitionStreamingWindowBuild::addInput(RowVectorPtr input) {
+  auto& stats = partitionStreamingBuildStats();
+  const auto decodeStart = stats.enabled
+      ? std::chrono::steady_clock::now()
+      : std::chrono::steady_clock::time_point{};
   for (const auto channel : partitionKeyChannels_) {
     input->childAt(channel)->loadedVector();
   }
   for (auto i = 0; i < inputChannels_.size(); ++i) {
     decodedInputVectors_[i].decode(*input->childAt(inputChannels_[i]));
   }
+  if (stats.enabled) {
+    ++stats.calls;
+    stats.rows += input->size();
+    stats.decodeNanos += elapsedNanos(decodeStart);
+  }
 
   if (windowBatchStore() && input->size() > 0) {
     std::vector<char*> newRows(input->size());
     std::vector<vector_size_t> partitionStarts;
+    const auto combinedStart = stats.enabled
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
+    uint64_t sampledMidRows = 0;
+    uint64_t sampledMidPartitionNanos = 0;
+    uint64_t sampledMidAllocateNanos = 0;
+    const auto sampledMidRow = input->size() / 2;
     for (vector_size_t row = 0; row < input->size(); ++row) {
-      if (isNewPartition(
-              input, row, previousPartitionKeyValues_, partitionKeyChannels_)) {
+      bool startsPartition;
+      if (stats.enabled && row == sampledMidRow) {
+        const auto start = std::chrono::steady_clock::now();
+        startsPartition = isNewPartition(
+            input, row, previousPartitionKeyValues_, partitionKeyChannels_);
+        sampledMidPartitionNanos += elapsedNanos(start);
+      } else {
+        startsPartition = isNewPartition(
+            input, row, previousPartitionKeyValues_, partitionKeyChannels_);
+      }
+      if (startsPartition) {
         partitionStarts.push_back(row);
       }
-      newRows[row] = data_->newRow();
+      if (stats.enabled && row == sampledMidRow) {
+        const auto start = std::chrono::steady_clock::now();
+        newRows[row] = data_->newRow();
+        sampledMidAllocateNanos += elapsedNanos(start);
+        ++sampledMidRows;
+      } else {
+        newRows[row] = data_->newRow();
+      }
     }
+    if (stats.enabled) {
+      stats.partitions += partitionStarts.size();
+      stats.combinedNanos += elapsedNanos(combinedStart);
+      stats.sampledMidRows += sampledMidRows;
+      stats.sampledMidPartitionNanos += sampledMidPartitionNanos;
+      stats.sampledMidAllocateNanos += sampledMidAllocateNanos;
+    }
+    const auto storeStart = stats.enabled
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
     for (auto col = 0; col < input->childrenSize(); ++col) {
       data_->store(
           decodedInputVectors_[col],
           folly::Range<char**>(newRows.data(), newRows.size()),
           col);
     }
+    if (stats.enabled) {
+      stats.storeNanos += elapsedNanos(storeStart);
+    }
     // Rows before a partition start belong to the partition that is being
     // closed; the order of 'partitionStartRows_' is unchanged.
+    const auto bookkeepingStart = stats.enabled
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
     size_t begin = 0;
     for (const auto start : partitionStarts) {
       if (start > begin) {
@@ -129,15 +251,15 @@ void PartitionStreamingWindowBuild::addInput(RowVectorPtr input) {
     }
     inputRows_.insert(inputRows_.end(), newRows.begin() + begin, newRows.end());
     previousPartitionKeyValues_.capture(input, input->size() - 1);
+    if (stats.enabled) {
+      stats.bookkeepingNanos += elapsedNanos(bookkeepingStart);
+    }
     return;
   }
 
   for (auto row = 0; row < input->size(); ++row) {
     if (isNewPartition(
-            input,
-            row,
-            previousPartitionKeyValues_,
-            partitionKeyChannels_)) {
+            input, row, previousPartitionKeyValues_, partitionKeyChannels_)) {
       buildNextPartition();
     }
 
@@ -160,6 +282,25 @@ void PartitionStreamingWindowBuild::noMoreInput() {
 
   // Help for last partition related calculations.
   partitionStartRows_.push_back(sortedRowsBase_ + sortedRows_.size());
+
+  auto& stats = partitionStreamingBuildStats();
+  if (stats.enabled) {
+    const auto sortedRowsCapacityBytes =
+        sortedRows_.capacity() * sizeof(char*);
+    const auto inputRowsCapacityBytes = inputRows_.capacity() * sizeof(char*);
+    const auto partitionStartsCapacityBytes =
+        partitionStartRows_.capacity() * sizeof(vector_size_t);
+    ++stats.builds;
+    stats.sortedRowsCapacityBytes += sortedRowsCapacityBytes;
+    stats.inputRowsCapacityBytes += inputRowsCapacityBytes;
+    stats.partitionStartsCapacityBytes += partitionStartsCapacityBytes;
+    std::cerr << "[window-partition-capacity] sorted_rows_capacity_bytes=" +
+            std::to_string(sortedRowsCapacityBytes) +
+            " input_rows_capacity_bytes=" +
+            std::to_string(inputRowsCapacityBytes) +
+            " partition_starts_capacity_bytes=" +
+            std::to_string(partitionStartsCapacityBytes) + "\n";
+  }
 }
 
 void PartitionStreamingWindowBuild::compactConsumedRows(size_t numRows) {

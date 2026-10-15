@@ -23,13 +23,62 @@
 #include "velox/exec/window/SubPartitionedSortWindowBuild.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
+#include <iostream>
 #include <optional>
 #include <vector>
 
 namespace facebook::velox::exec {
 
 namespace {
+struct WindowOutputPhaseStats {
+  std::atomic<uint64_t> calls{0};
+  std::atomic<uint64_t> rows{0};
+  std::atomic<uint64_t> peerFrameNanos{0};
+  std::atomic<uint64_t> extractNanos{0};
+  std::atomic<uint64_t> applyNanos{0};
+  const bool enabled = [] {
+    const char* value = std::getenv("GPORCA_WINDOW_OUTPUT_STATS");
+    return value != nullptr && std::atoi(value) != 0;
+  }();
+
+  ~WindowOutputPhaseStats() {
+    if (enabled) {
+      std::cerr << "[window-output] calls=" << calls.load()
+                << " rows=" << rows.load()
+                << " peer_frame_ns=" << peerFrameNanos.load()
+                << " extract_ns=" << extractNanos.load()
+                << " apply_ns=" << applyNanos.load() << "\n";
+    }
+  }
+};
+
+WindowOutputPhaseStats& windowOutputPhaseStats() {
+  static WindowOutputPhaseStats stats;
+  return stats;
+}
+
+// A bounded-backward-lookback function reads rows by a fixed offset and does
+// not consume peer bounds. The conservative single-function ROWS eligibility
+// keeps ranking, RANGE and mixed-function windows on the existing path; 0 is
+// the one-line rollback.
+bool boundedLookbackPeerElisionEnabled() {
+  static const bool enabled = [] {
+    const char* value =
+        std::getenv("GPORCA_WINDOW_BOUNDED_LOOKBACK_SKIP_PEER");
+    return value == nullptr || std::atoi(value) != 0;
+  }();
+  return enabled;
+}
+
+uint64_t elapsedWindowNanos(std::chrono::steady_clock::time_point start) {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now() - start)
+      .count();
+}
+
 common::PrefixSortConfig makePrefixSortConfig(
     const core::QueryConfig& queryConfig) {
   return common::PrefixSortConfig{
@@ -70,10 +119,10 @@ bool forceLagRowsStreaming() {
 /// rate') above which the rows-streaming build is not chosen. Peers are
 /// computed row by row over retained input vectors while the container build
 /// compares materialized rows, so a repetitive ORDER BY key reverses the
-/// trade-off: measured 2026-09-22, `lag` over clicks (single ORDER BY key, ~3.1k
-/// rows per peer group, sampled rate ~1.0) lost 46% with the rows-streaming
-/// build, while the orders family (ORDER BY key includes a unique column,
-/// sampled rate 0) gained 5-8%.
+/// trade-off: measured 2026-09-22, `lag` over clicks (single ORDER BY key,
+/// ~3.1k rows per peer group, sampled rate ~1.0) lost 46% with the
+/// rows-streaming build, while the orders family (ORDER BY key includes a
+/// unique column, sampled rate 0) gained 5-8%.
 constexpr double kMaxStreamingPeerRate = 0.25;
 
 /// Sampled adjacent pairs required before the rows-streaming build may be
@@ -370,8 +419,7 @@ bool Window::supportRowsStreaming() {
         exec::WindowFunction::ProcessMode::kRows) {
       // A function that only looks a bounded, constant number of rows back can
       // still be streamed when the build retains those rows.
-      const auto lookback =
-          windowFunctionMetadata.boundedBackwardLookback &&
+      const auto lookback = windowFunctionMetadata.boundedBackwardLookback &&
               lagRowsStreamingEnabled()
           ? boundedBackwardLookbackRows(windowFunction)
           : std::nullopt;
@@ -496,10 +544,9 @@ void Window::resolveRowsStreamingGate(bool useRowsStreaming) {
     lockedStats->addRuntimeStat(
         "windowLagSampledPeerRatePpm",
         RuntimeCounter(
-            gateSampledPairs_ == 0
-                ? 0
-                : static_cast<int64_t>(gateEqualPairs_) * 1000000 /
-                    gateSampledPairs_));
+            gateSampledPairs_ == 0 ? 0
+                                   : static_cast<int64_t>(gateEqualPairs_) *
+                    1000000 / gateSampledPairs_));
   }
 
   gateBufferedInputs_.clear();
@@ -799,8 +846,23 @@ void Window::computePeerAndFrameBuffers(
   auto* rawPeerStarts = peerStartBuffer_->asMutable<vector_size_t>();
   auto* rawPeerEnds = peerEndBuffer_->asMutable<vector_size_t>();
 
-  std::tie(peerStartRow_, peerEndRow_) = currentPartition_->computePeerBuffers(
-      startRow, endRow, peerStartRow_, peerEndRow_, rawPeerStarts, rawPeerEnds);
+  const bool skipPeerComputation =
+      boundedLookbackPeerElisionEnabled() && windowFunctions_.size() == 1 &&
+      lookbackRows_ > 0 &&
+      std::all_of(
+          windowFrames_.begin(), windowFrames_.end(), [](const auto& frame) {
+            return frame.type == core::WindowNode::WindowType::kRows;
+          });
+  if (!skipPeerComputation) {
+    std::tie(peerStartRow_, peerEndRow_) =
+        currentPartition_->computePeerBuffers(
+            startRow,
+            endRow,
+            peerStartRow_,
+            peerEndRow_,
+            rawPeerStarts,
+            rawPeerEnds);
+  }
 
   for (auto i = 0; i < numFuncs; ++i) {
     // Frame buffer pointers are only needed within this loop; hoisting them
@@ -870,10 +932,28 @@ void Window::callApplyForPartitionRows(
   // processed rows (used for peer group comparison) will be deleted by
   // computePeerAndFrameBuffers after peer group comparison. Hence we need to
   // call getInputColumns after computePeerAndFrameBuffers.
+  auto& stats = windowOutputPhaseStats();
+  const auto peerFrameStart = stats.enabled
+      ? std::chrono::steady_clock::now()
+      : std::chrono::steady_clock::time_point{};
   computePeerAndFrameBuffers(startRow, endRow);
+  if (stats.enabled) {
+    ++stats.calls;
+    stats.rows += endRow - startRow;
+    stats.peerFrameNanos += elapsedWindowNanos(peerFrameStart);
+  }
 
+  const auto extractStart = stats.enabled
+      ? std::chrono::steady_clock::now()
+      : std::chrono::steady_clock::time_point{};
   getInputColumns(startRow, endRow, resultOffset, result);
+  if (stats.enabled) {
+    stats.extractNanos += elapsedWindowNanos(extractStart);
+  }
   vector_size_t numFuncs = windowFunctions_.size();
+  const auto applyStart = stats.enabled
+      ? std::chrono::steady_clock::now()
+      : std::chrono::steady_clock::time_point{};
   for (auto i = 0; i < numFuncs; ++i) {
     windowFunctions_[i]->apply(
         peerStartBuffer_,
@@ -884,6 +964,9 @@ void Window::callApplyForPartitionRows(
         resultOffset,
         result->childAt(numInputColumns_ + i));
   }
+  if (stats.enabled) {
+    stats.applyNanos += elapsedWindowNanos(applyStart);
+  }
 
   const vector_size_t numRows = endRow - startRow;
   numProcessedRows_ += numRows;
@@ -892,8 +975,7 @@ void Window::callApplyForPartitionRows(
   if (currentPartition_->partial()) {
     // Keep the rows a bounded-backward function (lag) still has to read. The
     // lookback is the total retention of the partition, not a per-block budget.
-    currentPartition_->removeProcessedRows(
-        numRows, lookbackRows_);
+    currentPartition_->removeProcessedRows(numRows, lookbackRows_);
   }
 }
 
