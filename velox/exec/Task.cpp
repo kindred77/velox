@@ -1797,6 +1797,7 @@ void Task::addSplitLocked(
       !barrierRequested_, "Can't add new split under barrier processing");
 
   ++taskStats_.numTotalSplits;
+  progressTotalSplits_.fetch_add(1, std::memory_order_relaxed);
   ++taskStats_.numQueuedSplits;
 
   if (split.hasConnectorSplit()) {
@@ -2224,6 +2225,7 @@ void Task::addScaledScanControllerLocked(
 void Task::splitFinished(bool fromTableScan, int64_t splitWeight) {
   std::lock_guard<std::timed_mutex> l(mutex_);
   ++taskStats_.numFinishedSplits;
+  progressFinishedSplits_.fetch_add(1, std::memory_order_relaxed);
   --taskStats_.numRunningSplits;
   if (fromTableScan) {
     --taskStats_.numRunningTableScanSplits;
@@ -2237,6 +2239,7 @@ void Task::multipleSplitsFinished(
     int64_t splitsWeight) {
   std::lock_guard<std::timed_mutex> l(mutex_);
   taskStats_.numFinishedSplits += numSplits;
+  progressFinishedSplits_.fetch_add(numSplits, std::memory_order_relaxed);
   taskStats_.numRunningSplits -= numSplits;
   if (fromTableScan) {
     taskStats_.numRunningTableScanSplits -= numSplits;
@@ -3011,6 +3014,29 @@ TaskStats Task::taskStats() const {
     taskStats.outputBufferStats = bufferManager->stats(taskId_);
   }
   return taskStats;
+}
+
+Task::ProgressSnapshot Task::progressSnapshot() const noexcept {
+  ProgressSnapshot snapshot;
+  snapshot.numTotalSplits =
+      progressTotalSplits_.load(std::memory_order_relaxed);
+  snapshot.numFinishedSplits = std::min(
+      snapshot.numTotalSplits,
+      progressFinishedSplits_.load(std::memory_order_relaxed));
+  snapshot.tableScanInputPositions =
+      progressTableScanInputPositions_.load(std::memory_order_relaxed);
+  snapshot.hasTableScan =
+      progressHasTableScan_.load(std::memory_order_relaxed);
+  return snapshot;
+}
+
+void Task::registerTableScanForProgress() noexcept {
+  progressHasTableScan_.store(true, std::memory_order_relaxed);
+}
+
+void Task::addTableScanInputPositionsForProgress(int64_t positions) noexcept {
+  progressTableScanInputPositions_.fetch_add(
+      positions, std::memory_order_relaxed);
 }
 
 bool Task::getLongRunningOpCalls(

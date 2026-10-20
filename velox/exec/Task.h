@@ -15,6 +15,8 @@
  */
 #pragma once
 
+#include <atomic>
+
 #include <folly/container/IntrusiveList.h>
 
 #include "velox/common/base/SkewedPartitionBalancer.h"
@@ -338,6 +340,21 @@ class Task : public std::enable_shared_from_this<Task> {
   /// Returns Task Stats by copy as other threads might be updating the
   /// structure.
   TaskStats taskStats() const;
+
+  /// Lightweight, lock-free counters for user-facing progress reporting.
+  /// Unlike taskStats(), this does not copy operator stats or visit drivers.
+  struct ProgressSnapshot {
+    int32_t numTotalSplits{0};
+    int32_t numFinishedSplits{0};
+    int64_t tableScanInputPositions{0};
+    bool hasTableScan{false};
+  };
+
+  ProgressSnapshot progressSnapshot() const noexcept;
+
+  /// Internal hooks used by TableScan to maintain the lightweight snapshot.
+  void registerTableScanForProgress() noexcept;
+  void addTableScanInputPositionsForProgress(int64_t positions) noexcept;
 
   /// Information about an operator call that helps debugging stuck calls.
   struct OpCallInfo {
@@ -1482,6 +1499,13 @@ class Task : public std::enable_shared_from_this<Task> {
   std::vector<ContinuePromise> stateChangePromises_;
 
   TaskStats taskStats_;
+
+  // Monotonic mirrors for progress reporting. They deliberately stay outside
+  // mutex_: progress is observational and must not contend with task execution.
+  std::atomic<int32_t> progressTotalSplits_{0};
+  std::atomic<int32_t> progressFinishedSplits_{0};
+  std::atomic<int64_t> progressTableScanInputPositions_{0};
+  std::atomic<bool> progressHasTableScan_{false};
 
   // Per-pipeline driver lifecycle timing accumulator. For each pipeline, holds
   // a vector of per-driver timing indexed by driver index within the pipeline.

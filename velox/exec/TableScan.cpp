@@ -120,6 +120,7 @@ TableScan::TableScan(
       scaledController_(driverCtx_->task->getScaledScanControllerLocked(
           driverCtx_->splitGroupId,
           planNodeId())) {
+  driverCtx_->task->registerTableScanForProgress();
   readBatchSize_ = driverCtx_->queryConfig().preferredOutputBatchRows();
 }
 
@@ -249,6 +250,7 @@ RowVectorPtr TableScan::getOutput() {
             flatSize = data->estimateFlatSize();
           }
           lockedStats->addInputVector(flatSize, data->size());
+          driverCtx_->task->addTableScanInputPositionsForProgress(data->size());
           const auto completedRowsDelta =
               dataSource_->getCompletedRows() - prevCompletedRows;
           if (completedRowsDelta > 0) {
