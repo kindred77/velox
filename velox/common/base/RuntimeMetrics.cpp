@@ -34,13 +34,10 @@ void RuntimeMetric::aggregate() {
   min = max = sum;
 }
 
-void RuntimeMetric::merge(const RuntimeMetric& other)
-#if defined(__has_feature)
-#if __has_feature(__address_sanitizer__)
-    __attribute__((__no_sanitize__("signed-integer-overflow")))
+#if defined(FOLLY_DISABLE_UNDEFINED_BEHAVIOR_SANITIZER)
+FOLLY_DISABLE_UNDEFINED_BEHAVIOR_SANITIZER("signed-integer-overflow")
 #endif
-#endif
-{
+void RuntimeMetric::merge(const RuntimeMetric& other) {
   VELOX_CHECK_EQ(unit, other.unit);
   sum += other.sum;
   count += other.count;

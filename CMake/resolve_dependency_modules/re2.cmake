@@ -42,6 +42,19 @@ velox_set_source(absl)
 velox_resolve_dependency(absl)
 
 FetchContent_MakeAvailable(re2)
+
+# GCC 15 cannot constant-evaluate Abseil's type-erased hash callbacks after
+# UBSAN instruments them. Keep the bundled third-party RE2 boundary
+# uninstrumented; yihudb and Velox targets retain the top-level sanitizer
+# flags, and ASAN remains enabled for RE2.
+if(
+  VELOX_ENABLE_ASAN_UBSAN_SANITIZERS
+  AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU"
+  AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 15
+)
+  target_compile_options(re2 PRIVATE -fno-sanitize=undefined)
+endif()
+
 if("${absl_SOURCE}" STREQUAL "SYSTEM")
   if(DEFINED absl_VERSION AND "${absl_VERSION}" VERSION_LESS "20240116")
     message(FATAL_ERROR "Abseil 20240116 or later is required for bundled RE2: ${absl_VERSION}")
