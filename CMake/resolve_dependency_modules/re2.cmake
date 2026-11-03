@@ -43,16 +43,19 @@ velox_resolve_dependency(absl)
 
 FetchContent_MakeAvailable(re2)
 
-# GCC 15 cannot constant-evaluate Abseil's type-erased hash callbacks after
-# UBSAN instruments them. Keep the bundled third-party RE2 boundary
-# uninstrumented; yihudb and Velox targets retain the top-level sanitizer
-# flags, and ASAN remains enabled for RE2.
-if(
-  VELOX_ENABLE_ASAN_UBSAN_SANITIZERS
-  AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU"
-  AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 15
-)
-  target_compile_options(re2 PRIVATE -fno-sanitize=undefined)
+# A system Abseil is normally built without ASAN. Instrumenting only RE2 then
+# changes Abseil raw_hash_set's generation-enabled layout at this boundary and
+# corrupts the DFA cache. Keep this third-party pair ABI-consistent. yihudb and
+# Velox targets retain the top-level sanitizer flags.
+if(VELOX_ENABLE_ASAN_UBSAN_SANITIZERS AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  if("${absl_SOURCE}" STREQUAL "SYSTEM")
+    target_compile_options(re2 PRIVATE -fno-sanitize=address,undefined)
+  elseif(CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 15)
+    # GCC 15 cannot constant-evaluate Abseil's type-erased hash callbacks
+    # after UBSAN instruments them. Bundled Abseil is ASAN-compatible, so only
+    # disable UBSAN in this configuration.
+    target_compile_options(re2 PRIVATE -fno-sanitize=undefined)
+  endif()
 endif()
 
 if("${absl_SOURCE}" STREQUAL "SYSTEM")

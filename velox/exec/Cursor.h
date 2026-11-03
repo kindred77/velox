@@ -24,6 +24,11 @@ namespace facebook::velox::exec {
 
 /// Parameters for initializing a TaskCursor or RowCursor.
 struct CursorParameters {
+  /// Optional externally assigned task identity. Empty preserves the cursor's
+  /// historical generated test_cursor_N identity. Distributed runners use a
+  /// routable URI so ExchangeSource factories can select a transport.
+  std::string taskId;
+
   /// Root node of the plan tree
   std::shared_ptr<const core::PlanNode> planNode;
 

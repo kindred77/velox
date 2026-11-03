@@ -105,7 +105,12 @@ FOLLY_ALWAYS_INLINE __m256i gather8Sparse(
   auto data = as8x32(_mm256_i32gather_epi32(
       reinterpret_cast<const int*>(bits), as256i(byteIndices), 1));
   if (width % 8 != 0) {
-    data = (data * multipliers) >> 8;
+    // Vector-extension signed multiplication is still subject to C++ signed
+    // overflow UB. This operation intentionally needs the AVX2 wraparound
+    // semantics before the arithmetic shift, so express both steps as
+    // intrinsics (as the MSVC path below already does).
+    data = as8x32(_mm256_srai_epi32(
+        _mm256_mullo_epi32(as256i(data), as256i(multipliers)), 8));
   }
   return as256i(data & masks);
 #else
