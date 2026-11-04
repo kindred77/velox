@@ -75,11 +75,34 @@ class CountIfAggregate : public exec::Aggregate {
         }
       });
     } else {
-      rows.applyToSelected([&](vector_size_t i) {
-        if (decoded.valueAt<bool>(i)) {
-          addToGroup(groups[i], 1);
+      // An unpredictable boolean branch is more expensive than adding zero
+      // for mixed predicates, while sparse or dense predicates benefit from
+      // skipping/predicting the update. Sample a bounded prefix to select the
+      // loop shape without scanning the vector twice.
+      vector_size_t sampled = 0;
+      vector_size_t trueCount = 0;
+      for (vector_size_t i = rows.begin();
+           i < rows.end() && sampled < 64;
+           ++i) {
+        if (!rows.isValid(i)) {
+          continue;
         }
-      });
+        ++sampled;
+        trueCount += decoded.valueAt<bool>(i);
+      }
+      const bool mixed = trueCount * 8 >= sampled &&
+          trueCount * 8 <= sampled * 7;
+      if (mixed) {
+        rows.applyToSelected([&](vector_size_t i) {
+          addToGroup(groups[i], decoded.valueAt<bool>(i));
+        });
+      } else {
+        rows.applyToSelected([&](vector_size_t i) {
+          if (decoded.valueAt<bool>(i)) {
+            addToGroup(groups[i], 1);
+          }
+        });
+      }
     }
   }
 
