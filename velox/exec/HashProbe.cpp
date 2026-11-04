@@ -49,6 +49,11 @@ bool residualFilterBatchRowsEnabled() {
   return env == nullptr || 0 != std::atoi(env);
 }
 
+bool adaptiveOutputBatchRowsEnabled() {
+  const char* env = std::getenv("GPORCA_HASH_PROBE_ADAPTIVE_BATCH");
+  return env != nullptr && 0 != std::atoi(env);
+}
+
 vector_size_t hashProbeOutputBatchRows(
     DriverCtx* driverCtx,
     const core::HashJoinNode& joinNode) {
@@ -160,6 +165,11 @@ HashProbe::HashProbe(
               ? driverCtx->makeSpillConfig(operatorId, OperatorType::kHashProbe)
               : std::nullopt),
       outputBatchSize_{hashProbeOutputBatchRows(driverCtx, *joinNode)},
+      initialOutputBatchSize_{outputBatchSize_},
+      adaptiveOutputBatchEligible_{
+          adaptiveOutputBatchRowsEnabled() &&
+          isInnerJoin(joinNode->joinType()) && joinNode->filter() == nullptr &&
+          joinNode->postJoinFilter() == nullptr},
       joinNode_(std::move(joinNode)),
       joinType_{joinNode_->joinType()},
       nullAware_{joinNode_->isNullAware()},
@@ -933,6 +943,51 @@ void HashProbe::fillOutput(vector_size_t size) {
   }
 }
 
+void HashProbe::maybeAdaptOutputBatchSize() {
+  if (!adaptiveOutputBatchEligible_ || adaptiveOutputBatchSampled_ ||
+      output_ == nullptr || output_->size() == 0) {
+    return;
+  }
+
+  // A probe payload may remain lazy when the join iterator is already at end.
+  // Estimating such an output would count the unloaded column as zero bytes
+  // and can grossly inflate the next input batch. Do not load data solely for
+  // calibration; a later, naturally materialized output may still be sampled.
+  if (output_->containsLazyNotLoaded()) {
+    return;
+  }
+
+  adaptiveOutputBatchSampled_ = true;
+  const auto sampleRows = static_cast<uint64_t>(output_->size());
+  const auto sampleBytes = output_->estimateFlatSize();
+  if (sampleBytes == 0) {
+    return;
+  }
+
+  const auto averageRowBytes =
+      sampleBytes / sampleRows + (sampleBytes % sampleRows != 0);
+  if (averageRowBytes == 0) {
+    return;
+  }
+
+  // Keep adaptive growth incremental. The byte-derived target may jump from
+  // the default 1K rows to the global 10K maximum for narrow rows, creating a
+  // measurable per-driver peak-memory step. Shrinking remains unrestricted;
+  // growth is bounded to 2x the already validated starting target.
+  outputBatchSize_ = std::min(
+      outputBatchRows(averageRowBytes), initialOutputBatchSize_ * 2);
+  addRuntimeStat(
+      "adaptiveOutputBatchInitialRows",
+      RuntimeCounter(initialOutputBatchSize_));
+  addRuntimeStat(
+      "adaptiveOutputBatchSampleRows", RuntimeCounter(sampleRows));
+  addRuntimeStat(
+      "adaptiveOutputBatchSampleBytes",
+      RuntimeCounter(sampleBytes, RuntimeCounter::Unit::kBytes));
+  addRuntimeStat(
+      "adaptiveOutputBatchSelectedRows", RuntimeCounter(outputBatchSize_));
+}
+
 RowVectorPtr HashProbe::getBuildSideOutput() {
   if (buildSideOutputRowContainerId_ == -1) {
     buildSideOutputRowContainerId_ =
@@ -1364,6 +1419,9 @@ RowVectorPtr HashProbe::getOutputInternal(bool toSpillOutput) {
     }
 
     fillOutput(numOut);
+    if (!toSpillOutput) {
+      maybeAdaptOutputBatchSize();
+    }
 
     if (isLeftSemiOrAntiJoinNoFilter || emptyBuildSide) {
       input_ = nullptr;

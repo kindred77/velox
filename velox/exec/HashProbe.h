@@ -164,6 +164,10 @@ class HashProbe : public Operator {
   // Populate output columns.
   void fillOutput(vector_size_t size);
 
+  // Uses the first materialized output to size subsequent no-filter inner
+  // join batches against the query's existing preferred-byte budget.
+  void maybeAdaptOutputBatchSize();
+
   // Populate 'match' output column for the left semi join project,
   void fillLeftSemiProjectMatchColumn(vector_size_t size);
 
@@ -405,7 +409,13 @@ class HashProbe : public Operator {
   // use their own row target to amortize per-batch filtering costs. The query's
   // max row count remains a hard bound; preferred bytes may stop normal join
   // result listing earlier.
-  const vector_size_t outputBatchSize_;
+  vector_size_t outputBatchSize_;
+
+  const vector_size_t initialOutputBatchSize_;
+
+  const bool adaptiveOutputBatchEligible_;
+
+  bool adaptiveOutputBatchSampled_{false};
 
   const std::shared_ptr<const core::HashJoinNode> joinNode_;
 
