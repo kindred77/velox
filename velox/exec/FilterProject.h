@@ -108,6 +108,8 @@ class FilterProject : public Operator {
 
   const bool lazyDereference_;
 
+  const bool reuseResults_;
+
   // Cached filter and project node for lazy initialization. After
   // initialization, they will be reset, and initialized_ will be set to true.
   std::shared_ptr<const core::ProjectNode> project_;

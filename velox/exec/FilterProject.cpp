@@ -22,6 +22,11 @@
 
 namespace facebook::velox::exec {
 namespace {
+
+bool filterProjectResultReuseEnabled() {
+  const char* env = std::getenv("GPORCA_FILTER_PROJECT_RESULT_REUSE");
+  return env != nullptr && 0 != std::atoi(env);
+}
 bool checkAddIdentityProjection(
     const core::TypedExprPtr& projection,
     const RowTypePtr& inputType,
@@ -111,6 +116,7 @@ FilterProject::FilterProject(
       lazyDereference_(
           dynamic_cast<const core::LazyDereferenceNode*>(project.get()) !=
           nullptr),
+      reuseResults_(filterProjectResultReuseEnabled()),
       project_(project),
       filter_(filter) {
   VELOX_CHECK(!(lazyDereference_ && filter));
@@ -213,6 +219,10 @@ RowVectorPtr FilterProject::getOutput() {
   EvalCtx evalCtx(
       operatorCtx_->execCtx(), exprs_.get(), input_.get(), lazyDereference_);
 
+  if (reuseResults_) {
+    addRuntimeStat("filterProjectResultReuseBatches", RuntimeCounter(1));
+  }
+
   if (!lazyDereference_) {
     // Pre-load lazy vectors which are referenced by both expressions and
     // identity projections.
@@ -261,6 +271,12 @@ RowVectorPtr FilterProject::getOutput() {
 std::vector<VectorPtr> FilterProject::project(
     const SelectivityVector& rows,
     EvalCtx& evalCtx) {
+  if (reuseResults_) {
+    exprs_->eval(
+        hasFilter_ ? 1 : 0, numExprs_, !hasFilter_, rows, evalCtx, results_);
+    return results_;
+  }
+
   std::vector<VectorPtr> results;
   exprs_->eval(
       hasFilter_ ? 1 : 0, numExprs_, !hasFilter_, rows, evalCtx, results);
@@ -270,6 +286,12 @@ std::vector<VectorPtr> FilterProject::project(
 vector_size_t FilterProject::filter(
     EvalCtx& evalCtx,
     const SelectivityVector& allRows) {
+  if (reuseResults_) {
+    exprs_->eval(0, 1, true, allRows, evalCtx, results_);
+    return processFilterResults(
+        results_[0], allRows, filterEvalCtx_, pool());
+  }
+
   std::vector<VectorPtr> results;
   exprs_->eval(0, 1, true, allRows, evalCtx, results);
   return processFilterResults(results[0], allRows, filterEvalCtx_, pool());
