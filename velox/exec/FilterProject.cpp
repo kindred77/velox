@@ -25,7 +25,7 @@ namespace {
 
 bool filterProjectResultReuseEnabled() {
   const char* env = std::getenv("GPORCA_FILTER_PROJECT_RESULT_REUSE");
-  return env != nullptr && 0 != std::atoi(env);
+  return env == nullptr || 0 != std::atoi(env);
 }
 bool checkAddIdentityProjection(
     const core::TypedExprPtr& projection,

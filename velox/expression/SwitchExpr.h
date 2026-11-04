@@ -55,6 +55,7 @@ class SwitchExpr : public SpecialForm {
   void clearCache() override {
     Expr::clearCache();
     tempValues_.reset();
+    condition_.reset();
   }
 
  private:
@@ -62,7 +63,9 @@ class SwitchExpr : public SpecialForm {
 
   const size_t numCases_;
   const bool hasElseClause_;
+  const bool reuseCondition_;
   BufferPtr tempValues_;
+  VectorPtr condition_;
 };
 
 class SwitchCallToSpecialForm : public FunctionCallToSpecialForm {

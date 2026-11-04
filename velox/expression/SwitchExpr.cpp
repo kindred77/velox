@@ -14,6 +14,9 @@
  * limitations under the License.
  */
 #include "velox/expression/SwitchExpr.h"
+
+#include <cstdlib>
+
 #include "velox/expression/BooleanMix.h"
 #include "velox/expression/ExprConstants.h"
 #include "velox/expression/FieldReference.h"
@@ -22,6 +25,11 @@
 namespace facebook::velox::exec {
 
 namespace {
+bool filterProjectResultReuseEnabled() {
+  const char* env = std::getenv("GPORCA_FILTER_PROJECT_RESULT_REUSE");
+  return env == nullptr || 0 != std::atoi(env);
+}
+
 bool hasElseClause(const std::vector<ExprPtr>& inputs) {
   return inputs.size() % 2 == 1;
 }
@@ -50,7 +58,8 @@ SwitchExpr::SwitchExpr(
           hasElseClause(inputs) && inputsSupportFlatNoNullsFastPath,
           false /* trackCpuUsage */),
       numCases_{inputs_.size() / 2},
-      hasElseClause_{hasElseClause(inputs_)} {
+      hasElseClause_{hasElseClause(inputs_)},
+      reuseCondition_{filterProjectResultReuseEnabled()} {
   std::vector<TypePtr> inputTypes;
   inputTypes.reserve(inputs_.size());
   std::transform(
@@ -99,11 +108,14 @@ void SwitchExpr::evalSpecialForm(
     }
   }
 
-  VectorPtr condition;
+  VectorPtr localCondition;
+  auto& condition = reuseCondition_ ? condition_ : localCondition;
   const uint64_t* values;
 
   for (auto i = 0; i < numCases_; i++) {
-    context.releaseVector(condition);
+    if (!reuseCondition_) {
+      context.releaseVector(condition);
+    }
 
     if (!remainingRows.get()->hasSelections()) {
       break;
