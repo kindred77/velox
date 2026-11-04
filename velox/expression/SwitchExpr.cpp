@@ -82,7 +82,8 @@ void SwitchExpr::evalSpecialForm(
     EvalCtx& context,
     VectorPtr& finalResult) {
   VectorPtr localResult;
-  if (!context.resultShouldBePreserved(finalResult, rows)) {
+  if (reuseCondition_ &&
+      !context.resultShouldBePreserved(finalResult, rows)) {
     localResult = std::move(finalResult);
   }
   LocalSelectivityVector remainingRows(context, rows);
