@@ -142,6 +142,17 @@ TEST(TypeCoercerTest, decimalDecimalLeastCommonSuperType) {
       DECIMAL(10, 2));
 }
 
+TEST(TypeCoercerTest, decimalCommonDomainOverflow) {
+  for (const auto& [a, b] : std::vector<std::pair<TypePtr, TypePtr>>{
+           {DECIMAL(38, 0), DECIMAL(38, 20)},
+           {DECIMAL(38, 20), DECIMAL(38, 0)}}) {
+    EXPECT_EQ(TypeCoercer::defaults().leastCommonSuperType(a, b), nullptr);
+    EXPECT_EQ(
+        TypeCoercer::defaults().leastCommonSuperType(ARRAY(a), ARRAY(b)),
+        nullptr);
+  }
+}
+
 TEST(TypeCoercerTest, decimalLeastCommonSuperType) {
   VELOX_ASSERT_EQ_TYPES(
       TypeCoercer::defaults().leastCommonSuperType(DECIMAL(10, 2), DOUBLE()),

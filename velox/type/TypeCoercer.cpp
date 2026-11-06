@@ -293,6 +293,11 @@ TypePtr TypeCoercer::leastCommonSuperType(const TypePtr& a, const TypePtr& b)
       if (auto result = LongDecimalType::commonSuperType(a, b)) {
         return result;
       }
+      // Same-name coercion cannot recover a decimal domain that needs more
+      // than 38 digits: choosing either operand would discard range or scale.
+      if (a->isDecimal() && b->isDecimal()) {
+        return nullptr;
+      }
     }
 
     if (coerceTypeBase(a, b)) {
