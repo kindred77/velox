@@ -1047,6 +1047,40 @@ struct MillisecondFunction : public TimestampWithTimezoneSupport<T> {
 };
 
 template <typename T>
+struct MicrosecondFunction : public TimestampWithTimezoneSupport<T> {
+  VELOX_DEFINE_FUNCTION_TYPES(T);
+
+  FOLLY_ALWAYS_INLINE void call(
+      int64_t& result,
+      const arg_type<Timestamp>& timestamp) {
+    result = timestamp.getNanos() / Timestamp::kNanosecondsInMicrosecond;
+  }
+
+  FOLLY_ALWAYS_INLINE void call(
+      int64_t& result,
+      const arg_type<Date>& /*date*/) {
+    // Dates do not have sub-second granularity.
+    result = 0;
+  }
+
+  FOLLY_ALWAYS_INLINE void call(
+      int64_t& result,
+      const arg_type<TimestampWithTimezone>& timestampWithTimezone) {
+    auto timestamp = this->toTimestamp(timestampWithTimezone);
+    result = timestamp.getNanos() / Timestamp::kNanosecondsInMicrosecond;
+  }
+
+  FOLLY_ALWAYS_INLINE void call(int64_t& result, const arg_type<Time>& time) {
+    VELOX_USER_CHECK(
+        time >= 0 && time < kMillisInDay,
+        "TIME value {} is out of range [0, 86400000)",
+        time);
+    // TIME is stored at millisecond granularity.
+    result = (time % kMillisInSecond) * 1000;
+  }
+};
+
+template <typename T>
 struct MillisecondFromIntervalFunction {
   VELOX_DEFINE_FUNCTION_TYPES(T);
 

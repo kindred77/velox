@@ -252,6 +252,14 @@ void registerSimpleFunctions(const std::string& prefix) {
       {prefix + "millisecond"});
   registerFunction<MillisecondFunction, int64_t, TimestampWithTimezone>(
       {prefix + "millisecond"});
+  registerFunction<MicrosecondFunction, int64_t, Timestamp>(
+      {prefix + "microsecond"});
+  registerFunction<MicrosecondFunction, int64_t, Date>(
+      {prefix + "microsecond"});
+  registerFunction<MicrosecondFunction, int64_t, TimestampWithTimezone>(
+      {prefix + "microsecond"});
+  registerFunction<MicrosecondFunction, int64_t, Time>(
+      {prefix + "microsecond"});
   registerFunction<MillisecondFunction, int64_t, Time>(
       {prefix + "millisecond"});
   registerFunction<MillisecondFromIntervalFunction, int64_t, IntervalDayTime>(
