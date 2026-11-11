@@ -80,6 +80,31 @@ struct Md5Function {
   }
 };
 
+/// md5_hex(varchar) -> varchar
+/// PostgreSQL md5(text): lowercase hexadecimal MD5 digest.  Registered under an
+/// internal name because Presto's md5(varbinary) returns the raw 16-byte digest.
+template <typename T>
+struct Md5HexFunction {
+  VELOX_DEFINE_FUNCTION_TYPES(T);
+
+  FOLLY_ALWAYS_INLINE void call(
+      out_type<Varchar>& result,
+      const arg_type<Varchar>& input) {
+    static constexpr char kHex[] = "0123456789abcdef";
+    uint8_t digest[16];
+    crypto::MD5Context md5Context;
+    md5Context.Add(
+        reinterpret_cast<const uint8_t*>(input.data()), input.size());
+    md5Context.Finish(digest);
+    result.resize(2 * sizeof(digest));
+    char* data = result.data();
+    for (size_t index = 0; index < sizeof(digest); ++index) {
+      data[2 * index] = kHex[digest[index] >> 4];
+      data[2 * index + 1] = kHex[digest[index] & 0x0F];
+    }
+  }
+};
+
 /// sha1(varbinary) -> varbinary
 template <typename T>
 struct Sha1Function {
