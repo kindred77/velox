@@ -357,6 +357,141 @@ struct EndsWithFunction {
 };
 
 /// Pad functions
+/// left(string, count) → varchar
+/// Returns the first `count` characters of string; a negative count returns
+/// all but the last |count| characters (PostgreSQL semantics).
+template <typename T>
+struct LeftFunction {
+  VELOX_DEFINE_FUNCTION_TYPES(T);
+
+  static constexpr int32_t reuse_strings_from_arg = 0;
+  static constexpr bool is_default_ascii_behavior = true;
+
+  template <typename I>
+  FOLLY_ALWAYS_INLINE void call(
+      out_type<Varchar>& result,
+      const arg_type<Varchar>& input,
+      I count) {
+    doCall<false>(result, input, count);
+  }
+
+  template <typename I>
+  FOLLY_ALWAYS_INLINE void callAscii(
+      out_type<Varchar>& result,
+      const arg_type<Varchar>& input,
+      I count) {
+    doCall<true>(result, input, count);
+  }
+
+  template <bool isAscii, typename I>
+  FOLLY_ALWAYS_INLINE void doCall(
+      out_type<Varchar>& result,
+      const arg_type<Varchar>& input,
+      I count) {
+    I characters = stringImpl::length<isAscii>(input);
+    I length = count;
+    if (length < 0) {
+      length = characters + length;
+    }
+    if (length <= 0) {
+      result.setEmpty();
+      return;
+    }
+    if (length >= characters) {
+      result.setNoCopy(input);
+      return;
+    }
+    auto byteRange = stringCore::getByteRange<isAscii>(
+        input.data(), input.size(), 1, length);
+    result.setNoCopy(StringView(
+        input.data() + byteRange.first, byteRange.second - byteRange.first));
+  }
+};
+
+/// right(string, count) → varchar
+/// Returns the last `count` characters of string; a negative count returns
+/// all but the first |count| characters (PostgreSQL semantics).
+template <typename T>
+struct RightFunction {
+  VELOX_DEFINE_FUNCTION_TYPES(T);
+
+  static constexpr int32_t reuse_strings_from_arg = 0;
+  static constexpr bool is_default_ascii_behavior = true;
+
+  template <typename I>
+  FOLLY_ALWAYS_INLINE void call(
+      out_type<Varchar>& result,
+      const arg_type<Varchar>& input,
+      I count) {
+    doCall<false>(result, input, count);
+  }
+
+  template <typename I>
+  FOLLY_ALWAYS_INLINE void callAscii(
+      out_type<Varchar>& result,
+      const arg_type<Varchar>& input,
+      I count) {
+    doCall<true>(result, input, count);
+  }
+
+  template <bool isAscii, typename I>
+  FOLLY_ALWAYS_INLINE void doCall(
+      out_type<Varchar>& result,
+      const arg_type<Varchar>& input,
+      I count) {
+    I characters = stringImpl::length<isAscii>(input);
+    I start = 1;
+    if (count >= 0) {
+      if (count >= characters) {
+        result.setNoCopy(input);
+        return;
+      }
+      start = characters - count + 1;
+    } else {
+      start = -count + 1;
+      if (start > characters) {
+        result.setEmpty();
+        return;
+      }
+    }
+    auto byteRange = stringCore::getByteRange<isAscii>(
+        input.data(), input.size(), start, characters - start + 1);
+    result.setNoCopy(StringView(
+        input.data() + byteRange.first, byteRange.second - byteRange.first));
+  }
+};
+
+/// repeat(string, count) → varchar
+/// Returns string repeated `count` times; count <= 0 returns the empty string
+/// (PostgreSQL semantics).
+template <typename T>
+struct RepeatFunction {
+  VELOX_DEFINE_FUNCTION_TYPES(T);
+
+  template <typename I>
+  FOLLY_ALWAYS_INLINE void call(
+      out_type<Varchar>& result,
+      const arg_type<Varchar>& input,
+      I count) {
+    static constexpr int64_t maxSize = 1024 * 1024;
+    if (count <= 0 || input.empty()) {
+      result.setEmpty();
+      return;
+    }
+    VELOX_USER_CHECK(
+        static_cast<int64_t>(input.size()) * static_cast<int64_t>(count) <=
+            maxSize,
+        "repeat result exceeds the {} byte limit",
+        maxSize);
+    const size_t unit = input.size();
+    result.resize(unit * static_cast<size_t>(count));
+    char* data = result.data();
+    for (int64_t copy = 0; copy < static_cast<int64_t>(count); ++copy) {
+      std::memcpy(data + unit * copy, input.data(), unit);
+    }
+  }
+};
+
 /// lpad(string, size, padString) → varchar
 ///     Left pads string to size characters with padString.  If size is
 ///     less than the length of string, the result is truncated to size

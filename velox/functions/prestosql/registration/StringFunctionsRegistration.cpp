@@ -83,6 +83,22 @@ void registerSimpleFunctions(const std::string& prefix) {
   registerFunction<SubstrFunction, Varchar, Varchar, int32_t, int32_t>(
       {prefix + "substr", prefix + "substring"});
 
+  registerFunction<LeftFunction, Varchar, Varchar, int64_t>(
+      {prefix + "left"});
+  registerFunction<LeftFunction, Varchar, Varchar, int32_t>(
+      {prefix + "left"});
+  registerFunction<RightFunction, Varchar, Varchar, int64_t>(
+      {prefix + "right"});
+  registerFunction<RightFunction, Varchar, Varchar, int32_t>(
+      {prefix + "right"});
+  // PostgreSQL repeat(varchar, integer) must not collide with the Presto
+  // array-typed repeat(array, integer) registered elsewhere; expose it under
+  // an internal name and map SQL repeat to it in the translator.
+  registerFunction<RepeatFunction, Varchar, Varchar, int64_t>(
+      {prefix + "repeat_text"});
+  registerFunction<RepeatFunction, Varchar, Varchar, int32_t>(
+      {prefix + "repeat_text"});
+
   registerFunction<SubstrVarbinaryFunction, Varbinary, Varbinary, int64_t>(
       {prefix + "substr"});
   registerFunction<
