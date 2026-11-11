@@ -83,6 +83,34 @@ void registerSimpleFunctions(const std::string& prefix) {
   registerFunction<SubstrFunction, Varchar, Varchar, int32_t, int32_t>(
       {prefix + "substr", prefix + "substring"});
 
+  registerFunction<ConcatWsFunction, Varchar, Varchar, Varchar>(
+      {prefix + "concat_ws"});
+  registerFunction<ConcatWsFunction, Varchar, Varchar, Varchar, Varchar>(
+      {prefix + "concat_ws"});
+  registerFunction<
+      ConcatWsFunction,
+      Varchar,
+      Varchar,
+      Varchar,
+      Varchar,
+      Varchar>({prefix + "concat_ws"});
+  registerFunction<
+      ConcatWsFunction,
+      Varchar,
+      Varchar,
+      Varchar,
+      Varchar,
+      Varchar,
+      Varchar>({prefix + "concat_ws"});
+  registerFunction<
+      ConcatWsFunction,
+      Varchar,
+      Varchar,
+      Varchar,
+      Varchar,
+      Varchar,
+      Varchar,
+      Varchar>({prefix + "concat_ws"});
   registerFunction<LeftFunction, Varchar, Varchar, int64_t>(
       {prefix + "left"});
   registerFunction<LeftFunction, Varchar, Varchar, int32_t>(

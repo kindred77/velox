@@ -461,6 +461,102 @@ struct RightFunction {
   }
 };
 
+/// concat_ws(separator, str1, str2, ...) → varchar
+/// PostgreSQL semantics: NULL values are skipped, a NULL separator yields
+/// NULL, and all-NULL values produce the empty string.  Velox registers the
+/// fixed arities used by the PostgreSQL metadata procs instead of a
+/// Presto-style variadic signature.
+template <typename T>
+struct ConcatWsFunction {
+  VELOX_DEFINE_FUNCTION_TYPES(T);
+
+  static constexpr size_t kMaxSize = 1024 * 1024;
+
+  FOLLY_ALWAYS_INLINE bool callNullable(
+      out_type<Varchar>& result,
+      const arg_type<Varchar>* separator,
+      const arg_type<Varchar>* first) {
+    const arg_type<Varchar>* values[] = {first};
+    return doCall(result, separator, values, 1);
+  }
+
+  FOLLY_ALWAYS_INLINE bool callNullable(
+      out_type<Varchar>& result,
+      const arg_type<Varchar>* separator,
+      const arg_type<Varchar>* first,
+      const arg_type<Varchar>* second) {
+    const arg_type<Varchar>* values[] = {first, second};
+    return doCall(result, separator, values, 2);
+  }
+
+  FOLLY_ALWAYS_INLINE bool callNullable(
+      out_type<Varchar>& result,
+      const arg_type<Varchar>* separator,
+      const arg_type<Varchar>* first,
+      const arg_type<Varchar>* second,
+      const arg_type<Varchar>* third) {
+    const arg_type<Varchar>* values[] = {first, second, third};
+    return doCall(result, separator, values, 3);
+  }
+
+  FOLLY_ALWAYS_INLINE bool callNullable(
+      out_type<Varchar>& result,
+      const arg_type<Varchar>* separator,
+      const arg_type<Varchar>* first,
+      const arg_type<Varchar>* second,
+      const arg_type<Varchar>* third,
+      const arg_type<Varchar>* fourth) {
+    const arg_type<Varchar>* values[] = {first, second, third, fourth};
+    return doCall(result, separator, values, 4);
+  }
+
+  FOLLY_ALWAYS_INLINE bool callNullable(
+      out_type<Varchar>& result,
+      const arg_type<Varchar>* separator,
+      const arg_type<Varchar>* first,
+      const arg_type<Varchar>* second,
+      const arg_type<Varchar>* third,
+      const arg_type<Varchar>* fourth,
+      const arg_type<Varchar>* fifth) {
+    const arg_type<Varchar>* values[] = {first, second, third, fourth, fifth};
+    return doCall(result, separator, values, 5);
+  }
+
+ private:
+  FOLLY_ALWAYS_INLINE bool doCall(
+      out_type<Varchar>& result,
+      const arg_type<Varchar>* separator,
+      const arg_type<Varchar>* const* values,
+      size_t count) {
+    if (separator == nullptr) {
+      return false;
+    }
+    std::string joined;
+    bool hasValue = false;
+    for (size_t index = 0; index < count; ++index) {
+      const auto* value = values[index];
+      if (value == nullptr) {
+        continue;
+      }
+      if (hasValue) {
+        joined.append(separator->data(), separator->size());
+      }
+      joined.append(value->data(), value->size());
+      hasValue = true;
+      VELOX_USER_CHECK_LE(
+          joined.size(),
+          kMaxSize,
+          "concat_ws result exceeds the {} byte limit",
+          kMaxSize);
+    }
+    result.resize(joined.size());
+    if (!joined.empty()) {
+      std::memcpy(result.data(), joined.data(), joined.size());
+    }
+    return true;
+  }
+};
+
 /// repeat(string, count) → varchar
 /// Returns string repeated `count` times; count <= 0 returns the empty string
 /// (PostgreSQL semantics).
