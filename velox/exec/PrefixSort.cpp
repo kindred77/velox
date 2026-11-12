@@ -15,6 +15,10 @@
  */
 #include "velox/exec/PrefixSort.h"
 
+#include <atomic>
+#include <functional>
+#include <thread>
+
 using namespace facebook::velox::exec::prefixsort;
 
 namespace facebook::velox::exec {
@@ -309,6 +313,32 @@ void PrefixSort::extractRowAndEncodePrefixKeys(char* row, char* prefixBuffer) {
   getRowAddrFromPrefixBuffer(prefixBuffer) = row;
 }
 
+// static
+void PrefixSort::sortParallel(
+    const RowContainer* rowContainer,
+    const std::vector<CompareFlags>& compareFlags,
+    const velox::common::PrefixSortConfig& config,
+    memory::MemoryPool* pool,
+    std::vector<char*, memory::StlAllocator<char*>>& rows,
+    int32_t numThreads) {
+  const auto numRows = rowContainer->numRows();
+  // One worker per at least 1M rows keeps the merge overhead amortized.
+  const int32_t usefulThreads = static_cast<int32_t>(
+      std::min<int64_t>(numThreads, std::max<int64_t>(1, numRows >> 20)));
+  if (usefulThreads <= 1 || numRows < config.minNumRows) {
+    sort(rowContainer, compareFlags, config, pool, rows);
+    return;
+  }
+  const auto sortLayout =
+      generateSortLayout(rowContainer, compareFlags, config);
+  if (!sortLayout.hasNormalizedKeys) {
+    stdSort(rows, rowContainer, compareFlags);
+    return;
+  }
+  PrefixSort prefixSort(rowContainer, sortLayout, pool);
+  prefixSort.sortInternalParallel(rows, usefulThreads);
+}
+
 // static.
 uint64_t PrefixSort::maxRequiredBytes(
     const RowContainer* rowContainer,
@@ -355,6 +385,116 @@ uint64_t PrefixSort::maxRequiredBytes() const {
           checkedPlus<size_t>(
               sortLayout_.entrySize, AlignedBuffer::kPaddedSize)) +
       2 * pool_->alignment();
+}
+
+void PrefixSort::sortInternalParallel(
+    std::vector<char*, memory::StlAllocator<char*>>& rows,
+    int32_t numThreads) {
+  const auto numRows = rows.size();
+  const auto entrySize = sortLayout_.entrySize;
+  memory::ContiguousAllocation prefixBufferAlloc;
+  {
+    const auto numPages =
+        memory::AllocationTraits::numPages(numRows * entrySize);
+    pool_->allocateContiguous(numPages, prefixBufferAlloc);
+  }
+  char* prefixBuffer = prefixBufferAlloc.data<char>();
+  char* const bufferBegin = prefixBuffer;
+
+  if (sortLayout_.numNormalizedKeys > 0) {
+    addThreadLocalRuntimeStat(
+        PrefixSort::kNumPrefixSortKeys,
+        RuntimeCounter(
+            sortLayout_.numNormalizedKeys, RuntimeCounter::Unit::kNone));
+  }
+  addThreadLocalRuntimeStat(
+      PrefixSort::kNumPrefixSortThreads,
+      RuntimeCounter(numThreads, RuntimeCounter::Unit::kNone));
+
+  const bool comparePart =
+      sortLayout_.hasNonNormalizedKey ||
+      sortLayout_.nonPrefixSortStartIndex < sortLayout_.numNormalizedKeys;
+  const std::function<int(char*, char*)> compareKeys = comparePart
+      ? std::function<int(char*, char*)>{[this](char* lhs, char* rhs) {
+          return comparePartNormalizedKeys(lhs, rhs);
+        }}
+      : std::function<int(char*, char*)>{[this](char* lhs, char* rhs) {
+          return compareAllNormalizedKeys(lhs, rhs);
+        }};
+
+  // Memory pools are thread-affine, so the per-worker swap buffers are
+  // allocated on the driver thread before the workers start.
+  std::vector<BufferPtr> swapBuffers;
+  swapBuffers.reserve(numThreads);
+  for (int32_t worker = 0; worker < numThreads; ++worker) {
+    swapBuffers.push_back(AlignedBuffer::allocate<char>(entrySize, pool_));
+  }
+
+  const size_t chunkSize = (numRows + numThreads - 1) / numThreads;
+  std::vector<std::thread> workers;
+  workers.reserve(numThreads);
+  for (int32_t worker = 0; worker < numThreads; ++worker) {
+    workers.emplace_back([&, worker] {
+      const size_t begin = static_cast<size_t>(worker) * chunkSize;
+      if (begin >= numRows) {
+        return;
+      }
+      const size_t end = std::min(numRows, begin + chunkSize);
+      for (size_t index = begin; index < end; ++index) {
+        extractRowAndEncodePrefixKeys(
+            rows[index], bufferBegin + entrySize * index);
+      }
+      // Chunks are sorted in place with the cache-friendly prefix quick sort;
+      // only the final merge goes through a pointer array.
+      PrefixSortRunner runner(entrySize, swapBuffers[worker]->asMutable<char>());
+      runner.quickSort(
+          bufferBegin + entrySize * begin,
+          bufferBegin + entrySize * end,
+          compareKeys);
+    });
+  }
+  for (auto& worker : workers) {
+    worker.join();
+  }
+
+  std::vector<size_t> cursors(numThreads, 0);
+  std::vector<size_t> limits(numThreads, 0);
+  for (int32_t worker = 0; worker < numThreads; ++worker) {
+    cursors[worker] = static_cast<size_t>(worker) * chunkSize;
+    limits[worker] = std::min(numRows, cursors[worker] + chunkSize);
+  }
+
+  // Merge the sorted chunk runs with a k-way heap that writes the row
+  // addresses straight into the caller's rows vector.  Keeping only one
+  // cursor per chunk avoids the extra per-row pointer array that a pairwise
+  // in-place merge would need (memory stays O(worker count), not O(rows)).
+  const auto greater = [&](int32_t lhs, int32_t rhs) {
+    return compareKeys(
+               bufferBegin + entrySize * cursors[lhs],
+               bufferBegin + entrySize * cursors[rhs]) > 0;
+  };
+  std::vector<int32_t> heap;
+  heap.reserve(numThreads);
+  for (int32_t worker = 0; worker < numThreads; ++worker) {
+    if (cursors[worker] < limits[worker]) {
+      heap.push_back(worker);
+    }
+  }
+  std::make_heap(heap.begin(), heap.end(), greater);
+  size_t outputIndex = 0;
+  while (!heap.empty()) {
+    std::pop_heap(heap.begin(), heap.end(), greater);
+    const int32_t worker = heap.back();
+    heap.pop_back();
+    const size_t entryIndex = cursors[worker];
+    rows[outputIndex++] = getRowAddrFromPrefixBuffer(
+        bufferBegin + entrySize * entryIndex);
+    if (++cursors[worker] < limits[worker]) {
+      heap.push_back(worker);
+      std::push_heap(heap.begin(), heap.end(), greater);
+    }
+  }
+  VELOX_CHECK_EQ(outputIndex, numRows, "parallel prefix sort lost rows");
 }
 
 void PrefixSort::sortInternal(

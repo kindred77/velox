@@ -48,6 +48,28 @@ constexpr size_t kGroupBuildMinRows = 64 * 1024;
 // conservative fallback and needs no statistics.
 constexpr double kGroupBuildMinDistinctRatio = 1.0 / 16.0;
 
+// Window builds with a few very large partitions cannot use the hash group
+// build, and the serial prefix sort then runs on a single driver with an
+// extreme partition (skew).  Above this row count the prefix sort is split
+// across worker threads and merged; smaller builds keep the serial path so the
+// common uniform shape does not pay the merge overhead or oversubscribe CPU.
+constexpr size_t kParallelPrefixSortMinRows = 8 * 1024 * 1024;
+
+// Kill switch and worker count for the parallel prefix sort (default 8).  An
+// 8-thread build measured the best large-partition wall time on the 20-thread
+// dev host; the value is overridable per process for other topologies.
+int32_t windowPrefixSortThreads() {
+  static const int32_t threads = [] {
+    const char* flag = std::getenv("GPORCA_WINDOW_PARALLEL_SORT_THREADS");
+    if (flag == nullptr) {
+      return 8;
+    }
+    const int parsed = std::atoi(flag);
+    return parsed > 0 ? parsed : 0;
+  }();
+  return threads;
+}
+
 // Runtime stat exposing which build strategy was chosen (0 = global prefix
 // sort, 1 = hash group build) so debug task stats stay attributable.
 constexpr std::string_view kWindowBuildShape{"windowBuildShape"};
@@ -494,12 +516,21 @@ void SortWindowBuild::sortPartitions() {
     return;
   }
 
-  // This is a very inefficient but easy implementation to order the input rows
-  // by partition keys + sort keys.
-  // Sort the pointers to the rows in RowContainer (data_) instead of sorting
-  // the rows.
-  PrefixSort::sort(
-      data_.get(), compareFlags_, prefixSortConfig_, pool_, sortedRows_);
+  // Order the input rows by partition keys + sort keys.  Sort the pointers to
+  // the rows in RowContainer (data_) instead of the rows themselves.
+  const int32_t parallelThreads = windowPrefixSortThreads();
+  if (parallelThreads > 1 && numRows >= kParallelPrefixSortMinRows) {
+    PrefixSort::sortParallel(
+        data_.get(),
+        compareFlags_,
+        prefixSortConfig_,
+        pool_,
+        sortedRows_,
+        parallelThreads);
+  } else {
+    PrefixSort::sort(
+        data_.get(), compareFlags_, prefixSortConfig_, pool_, sortedRows_);
+  }
 
   computePartitionStartRows();
   recordBuildShape(kWindowBuildShapePrefixSort);

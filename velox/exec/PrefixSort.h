@@ -150,6 +150,20 @@ class PrefixSort {
     prefixSort.sortInternal(rows);
   }
 
+  /// Parallel variant of sort() used by window builds with a few very large
+  /// partitions: the prefix buffer is split into contiguous chunks that are
+  /// encoded and sorted on worker threads, then merged in place with the same
+  /// key comparator.  Ties between equal keys may be permuted (the serial path
+  /// uses an unstable quick sort as well).  Falls back to sort() when the
+  /// layout cannot be normalized or fewer than two workers are requested.
+  static void sortParallel(
+      const RowContainer* rowContainer,
+      const std::vector<CompareFlags>& compareFlags,
+      const velox::common::PrefixSortConfig& config,
+      memory::MemoryPool* pool,
+      std::vector<char*, memory::StlAllocator<char*>>& rows,
+      int32_t numThreads);
+
   /// The std::sort won't require bytes while prefix sort may require buffers
   /// such as prefix data. The logic is similar to the above function
   /// PrefixSort::sort but returns the maximum buffer the sort may need.
@@ -162,6 +176,10 @@ class PrefixSort {
   /// The runtime stats name collected for prefix sort.
   /// The number of prefix sort keys.
   static constexpr std::string_view kNumPrefixSortKeys{"numPrefixSortKeys"};
+
+  /// The number of worker threads used by sortParallel.
+  static constexpr std::string_view kNumPrefixSortThreads{
+      "numPrefixSortThreads"};
 
  private:
   /// Fallback to stdSort when prefix sort conditions such as config and memory
@@ -208,6 +226,10 @@ class PrefixSort {
   uint64_t maxRequiredBytes() const;
 
   void sortInternal(std::vector<char*, memory::StlAllocator<char*>>& rows);
+
+  void sortInternalParallel(
+      std::vector<char*, memory::StlAllocator<char*>>& rows,
+      int32_t numThreads);
 
   int compareAllNormalizedKeys(char* left, char* right);
 
