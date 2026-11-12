@@ -313,6 +313,52 @@ void PrefixSort::extractRowAndEncodePrefixKeys(char* row, char* prefixBuffer) {
   getRowAddrFromPrefixBuffer(prefixBuffer) = row;
 }
 
+namespace {
+// Concurrent window builds with several very large partitions saturate memory
+// bandwidth: 5 x 8 worker threads sorting ~55M rows each measured slower than
+// the serial quick sort.  Bound the total rows being parallel-sorted at once so
+// the mechanism keeps the win for a few large partitions (Q724-class) without
+// oversubscribing the machine for many large partitions (Q582-class).
+constexpr size_t kParallelSortInFlightRowLimit = 64 * 1024 * 1024;
+
+// A single window build above this size is dominated by window computation and
+// memory-bandwidth-bound sorting; parallel prefix sorting measured slower for
+// such builds (Q582's ~108M-row driver) while still winning for the 50M-class
+// skew of Q724.  Route the very large builds through the serial path.
+constexpr size_t kParallelSortMaxDriverRows = 64 * 1024 * 1024;
+
+std::atomic<size_t>& parallelSortInFlightRows() {
+  static std::atomic<size_t> rows{0};
+  return rows;
+}
+
+size_t parallelSortRowLimit() {
+  static const size_t limit = [] {
+    const char* flag = std::getenv("GPORCA_WINDOW_PARALLEL_SORT_BUDGET_ROWS");
+    if (flag == nullptr) {
+      return kParallelSortInFlightRowLimit;
+    }
+    const long parsed = std::atol(flag);
+    return parsed > 0 ? static_cast<size_t>(parsed)
+                      : kParallelSortInFlightRowLimit;
+  }();
+  return limit;
+}
+
+class ScopedInFlightRows {
+ public:
+  explicit ScopedInFlightRows(size_t rows) : rows_(rows) {}
+  ~ScopedInFlightRows() {
+    parallelSortInFlightRows().fetch_sub(rows_);
+  }
+  ScopedInFlightRows(const ScopedInFlightRows&) = delete;
+  ScopedInFlightRows& operator=(const ScopedInFlightRows&) = delete;
+
+ private:
+  size_t rows_;
+};
+} // namespace
+
 // static
 void PrefixSort::sortParallel(
     const RowContainer* rowContainer,
@@ -325,10 +371,19 @@ void PrefixSort::sortParallel(
   // One worker per at least 1M rows keeps the merge overhead amortized.
   const int32_t usefulThreads = static_cast<int32_t>(
       std::min<int64_t>(numThreads, std::max<int64_t>(1, numRows >> 20)));
-  if (usefulThreads <= 1 || numRows < config.minNumRows) {
+  if (usefulThreads <= 1 || numRows < config.minNumRows ||
+      numRows > kParallelSortMaxDriverRows) {
     sort(rowContainer, compareFlags, config, pool, rows);
     return;
   }
+  auto& inFlight = parallelSortInFlightRows();
+  const size_t previous = inFlight.fetch_add(numRows);
+  if (previous + numRows > parallelSortRowLimit()) {
+    inFlight.fetch_sub(numRows);
+    sort(rowContainer, compareFlags, config, pool, rows);
+    return;
+  }
+  ScopedInFlightRows scopedRows(numRows);
   const auto sortLayout =
       generateSortLayout(rowContainer, compareFlags, config);
   if (!sortLayout.hasNormalizedKeys) {
@@ -410,6 +465,9 @@ void PrefixSort::sortInternalParallel(
   addThreadLocalRuntimeStat(
       PrefixSort::kNumPrefixSortThreads,
       RuntimeCounter(numThreads, RuntimeCounter::Unit::kNone));
+  addThreadLocalRuntimeStat(
+      PrefixSort::kNumPrefixSortRows,
+      RuntimeCounter(numRows, RuntimeCounter::Unit::kNone));
 
   const bool comparePart =
       sortLayout_.hasNonNormalizedKey ||

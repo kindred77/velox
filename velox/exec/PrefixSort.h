@@ -181,6 +181,10 @@ class PrefixSort {
   static constexpr std::string_view kNumPrefixSortThreads{
       "numPrefixSortThreads"};
 
+  /// Total rows processed by sortParallel invocations (diagnostic for choosing
+  /// the per-driver thread count).
+  static constexpr std::string_view kNumPrefixSortRows{"numPrefixSortRows"};
+
  private:
   /// Fallback to stdSort when prefix sort conditions such as config and memory
   /// are not satisfied. stdSort provides >2X performance win than std::sort for

@@ -55,14 +55,16 @@ constexpr double kGroupBuildMinDistinctRatio = 1.0 / 16.0;
 // common uniform shape does not pay the merge overhead or oversubscribe CPU.
 constexpr size_t kParallelPrefixSortMinRows = 8 * 1024 * 1024;
 
-// Kill switch and worker count for the parallel prefix sort (default 8).  An
-// 8-thread build measured the best large-partition wall time on the 20-thread
-// dev host; the value is overridable per process for other topologies.
+// Worker count for the opt-in parallel prefix sort.  The mechanism remains
+// available through GPORCA_WINDOW_PARALLEL_SORT_THREADS, but repeated same-
+// session ABBA on the 20-thread dev host was not stable across machine states
+// (Q724-class gains in one session, Q582-class regressions in another), so the
+// product default stays on the serial path until a robust shape gate exists.
 int32_t windowPrefixSortThreads() {
   static const int32_t threads = [] {
     const char* flag = std::getenv("GPORCA_WINDOW_PARALLEL_SORT_THREADS");
     if (flag == nullptr) {
-      return 8;
+      return 0;
     }
     const int parsed = std::atoi(flag);
     return parsed > 0 ? parsed : 0;
