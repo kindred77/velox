@@ -31,4 +31,13 @@ using Re2RegexpReplacePresto = Re2RegexpReplace<
     prepareRegexpReplacePattern,
     prepareRegexpReplaceReplacement>;
 
+/// PostgreSQL regexp_replace(text, pattern, replacement) replaces only the
+/// first match (unlike Presto, which replaces every match).
+template <typename T>
+using Re2RegexpReplaceFirst = Re2RegexpReplace<
+    T,
+    prepareRegexpReplacePattern,
+    prepareRegexpReplaceReplacement,
+    false>;
+
 } // namespace facebook::velox::functions

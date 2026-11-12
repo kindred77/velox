@@ -160,6 +160,8 @@ void registerSimpleFunctions(const std::string& prefix) {
       {prefix + "regexp_replace"});
   registerFunction<Re2RegexpReplacePresto, Varchar, Varchar, Varchar, Varchar>(
       {prefix + "regexp_replace"});
+  registerFunction<Re2RegexpReplaceFirst, Varchar, Varchar, Varchar, Varchar>(
+      {prefix + "regexp_replace_first"});
   exec::registerStatefulVectorFunction(
       prefix + "regexp_replace",
       regexpReplaceWithLambdaSignatures(),

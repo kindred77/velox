@@ -291,7 +291,8 @@ class ReCache {
 template <
     typename T,
     std::string (*prepareRegexpPattern)(const StringView&),
-    std::string (*prepareRegexpReplacement)(const RE2&, const StringView&)>
+    std::string (*prepareRegexpReplacement)(const RE2&, const StringView&),
+    bool global = true>
 struct Re2RegexpReplace {
   Re2RegexpReplace() : cache_(0) {}
 
@@ -342,7 +343,11 @@ struct Re2RegexpReplace {
         ensureProcessedReplacement(re, replacement);
 
     result_.assign(string.data(), string.size());
-    RE2::GlobalReplace(&result_, re, processedReplacement);
+    if constexpr (global) {
+      RE2::GlobalReplace(&result_, re, processedReplacement);
+    } else {
+      RE2::Replace(&result_, re, processedReplacement);
+    }
 
     UDFOutputString::assign(out, result_);
   }
