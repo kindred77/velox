@@ -217,6 +217,8 @@ class TopN : public Operator {
   // key cannot enter); used to avoid re-publishing an unchanged bound.
   int64_t lastPublishedBound_{0};
   bool published_{false};
+  double lastPublishedDoubleBound_{0};
+  bool publishedDouble_{false};
   // Number of input rows seen so far, and how many of them broke the
   // monotonic prefix. When the disorder rate is high (disorderRows_ * count_
   // exceeds totalRows_), the O(N) worst scan on every out-of-order row costs

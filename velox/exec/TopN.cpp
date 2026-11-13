@@ -31,7 +31,8 @@ namespace {
 // a new sort-key type must be registered in both places.
 bool isRangeFilterableSortKey(const TypePtr& keyType) {
   return keyType->isBigint() || keyType->isInteger() ||
-      keyType->isSmallint() || keyType->isDate() || keyType->isVarchar();
+      keyType->isSmallint() || keyType->isDate() || keyType->isVarchar() ||
+      keyType->isReal() || keyType->isDouble();
 }
 
 // Fixed-width primitive kinds supported by the compact ring storage. The row
@@ -765,6 +766,40 @@ void TopN::publishDynamicFilter() {
           } else {
             filter = std::make_shared<common::BytesRange>(
                 kthStr, false, false, "", true, false, true);
+          }
+          return true;
+        });
+    return;
+  }
+
+  if (keyType->isReal() || keyType->isDouble()) {
+    double kth = 0;
+    if (keyType->isDouble()) {
+      memcpy(&kth, raw, sizeof(double));
+    } else {
+      float value;
+      memcpy(&value, raw, sizeof(float));
+      kth = static_cast<double>(value);
+    }
+    if (publishedDouble_ && kth == lastPublishedDoubleBound_) {
+      return;
+    }
+    lastPublishedDoubleBound_ = kth;
+    publishedDouble_ = true;
+    driver->pushdownFilters(
+        this,
+        {sortingKeyColumns_[0]},
+        [kth, ascending](column_index_t, common::FilterPtr& filter) {
+          if (ascending) {
+            filter = std::make_shared<
+                common::FloatingPointRange<double>>(
+                -std::numeric_limits<double>::infinity(), true,
+                false, kth, false, false, true);
+          } else {
+            filter = std::make_shared<
+                common::FloatingPointRange<double>>(
+                kth, false, false,
+                std::numeric_limits<double>::infinity(), true, false, true);
           }
           return true;
         });
