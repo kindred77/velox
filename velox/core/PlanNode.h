@@ -5135,6 +5135,8 @@ class ReplicateNode : public PlanNode {
 
   folly::dynamic serialize() const override;
 
+  static PlanNodePtr create(const folly::dynamic& obj, void* context);
+
  private:
   void addDetails(std::stringstream& stream) const override;
 
@@ -5272,6 +5274,8 @@ class SegmentPatchNode : public PlanNode {
   }
 
   folly::dynamic serialize() const override;
+
+  static PlanNodePtr create(const folly::dynamic& obj, void* context);
 
  private:
   void addDetails(std::stringstream& stream) const override;

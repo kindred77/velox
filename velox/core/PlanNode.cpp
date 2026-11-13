@@ -3601,7 +3601,29 @@ void SegmentPatchNode::addDetails(std::stringstream& stream) const {
 }
 
 folly::dynamic SegmentPatchNode::serialize() const {
-  return PlanNode::serialize();
+  auto obj = PlanNode::serialize();
+  obj["keyChannels"] = ISerializable::serialize(keyChannels_);
+  obj["segChannel"] = segChannel_;
+  obj["tailValueChannel"] = tailValueChannel_;
+  obj["patchChannel"] = patchChannel_;
+  return obj;
+}
+
+// static
+PlanNodePtr SegmentPatchNode::create(
+    const folly::dynamic& obj,
+    void* context) {
+  auto source = deserializeSingleSource(obj, context);
+  auto keyChannels =
+      ISerializable::deserialize<std::vector<column_index_t>>(
+          obj["keyChannels"], context);
+  return std::make_shared<SegmentPatchNode>(
+      deserializePlanNodeId(obj),
+      std::move(source),
+      std::move(keyChannels),
+      obj["segChannel"].asInt(),
+      obj["tailValueChannel"].asInt(),
+      obj["patchChannel"].asInt());
 }
 
 void EnforceSingleRowNode::addDetails(std::stringstream& /* stream */) const {
@@ -4172,6 +4194,7 @@ void PlanNode::registerSerDe() {
   registry.Register("MarkDistinctNode", MarkDistinctNode::create);
   registry.Register("MarkSortedNode", MarkSortedNode::create);
   registry.Register("OrderByNode", OrderByNode::create);
+  registry.Register("SegmentPatchNode", SegmentPatchNode::create);
   registry.Register("PartitionedOutputNode", PartitionedOutputNode::create);
   registry.Register("ProjectNode", ProjectNode::create);
   registry.Register("ParallelProjectNode", ParallelProjectNode::create);
