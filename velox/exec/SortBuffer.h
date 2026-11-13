@@ -41,7 +41,8 @@ class SortBuffer {
       tsan_atomic<bool>* nonReclaimableSection,
       common::PrefixSortConfig prefixSortConfig,
       const common::SpillConfig* spillConfig = nullptr,
-      exec::SpillStats* spillStats = nullptr);
+      exec::SpillStats* spillStats = nullptr,
+      bool preferCompactSlab = false);
 
   ~SortBuffer();
 
@@ -185,6 +186,7 @@ class SortBuffer {
   bool keysOnlyEligible_{false};
   bool keysOnlyActive_{false};
   bool keysOnlySlabEnabled_{false};
+  const bool keysOnlySlabRequested_{false};
   std::optional<keysonly::KeysOnlyPlan> keysOnlyPlan_{};
   std::vector<BufferPtr> keysOnlyChunks_;
   memory::ContiguousAllocation keysOnlyEntries_;

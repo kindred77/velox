@@ -4215,11 +4215,13 @@ class OrderByNode : public PlanNode {
       const std::vector<FieldAccessTypedExprPtr>& sortingKeys,
       const std::vector<SortOrder>& sortingOrders,
       bool isPartial,
-      const PlanNodePtr& source)
+      const PlanNodePtr& source,
+      bool preferCompactSort = false)
       : PlanNode(id),
         sortingKeys_(sortingKeys),
         sortingOrders_(sortingOrders),
         isPartial_(isPartial),
+        preferCompactSort_(preferCompactSort),
         sources_{source} {
     VELOX_USER_CHECK(!sortingKeys.empty(), "OrderBy must specify sorting keys");
     VELOX_USER_CHECK_EQ(
@@ -4246,6 +4248,7 @@ class OrderByNode : public PlanNode {
       sortingKeys_ = other.sortingKeys();
       sortingOrders_ = other.sortingOrders();
       isPartial_ = other.isPartial();
+      preferCompactSort_ = other.preferCompactSort();
       VELOX_CHECK_EQ(other.sources().size(), 1);
       source_ = other.sources()[0];
     }
@@ -4275,6 +4278,11 @@ class OrderByNode : public PlanNode {
       return *this;
     }
 
+    Builder& preferCompactSort(bool preferCompactSort) {
+      preferCompactSort_ = preferCompactSort;
+      return *this;
+    }
+
     std::shared_ptr<OrderByNode> build() const {
       VELOX_USER_CHECK(id_.has_value(), "OrderByNode id is not set");
       VELOX_USER_CHECK(
@@ -4290,7 +4298,8 @@ class OrderByNode : public PlanNode {
           sortingKeys_.value(),
           sortingOrders_.value(),
           isPartial_.value(),
-          source_.value());
+          source_.value(),
+          preferCompactSort_.value_or(false));
     }
 
    private:
@@ -4299,6 +4308,7 @@ class OrderByNode : public PlanNode {
     std::optional<std::vector<SortOrder>> sortingOrders_;
     std::optional<bool> isPartial_;
     std::optional<PlanNodePtr> source_;
+    std::optional<bool> preferCompactSort_;
   };
 
   const std::vector<FieldAccessTypedExprPtr>& sortingKeys() const {
@@ -4307,6 +4317,13 @@ class OrderByNode : public PlanNode {
 
   const std::vector<SortOrder>& sortingOrders() const {
     return sortingOrders_;
+  }
+
+  /// Hint for memory-bounded local sorts: use the slab keys-only sort path
+  /// (streams sorted runs) instead of the monolithic entry buffer.  Set by the
+  /// planner for window-local sorts; regular ORDER BY keeps the default.
+  bool preferCompactSort() const {
+    return preferCompactSort_;
   }
 
   bool canSpill(const QueryConfig& queryConfig) const override {
@@ -4349,6 +4366,7 @@ class OrderByNode : public PlanNode {
   const std::vector<FieldAccessTypedExprPtr> sortingKeys_;
   const std::vector<SortOrder> sortingOrders_;
   const bool isPartial_;
+  const bool preferCompactSort_;
   const std::vector<PlanNodePtr> sources_;
 };
 

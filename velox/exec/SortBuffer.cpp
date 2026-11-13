@@ -99,7 +99,8 @@ SortBuffer::SortBuffer(
     tsan_atomic<bool>* nonReclaimableSection,
     common::PrefixSortConfig prefixSortConfig,
     const common::SpillConfig* spillConfig,
-    exec::SpillStats* spillStats)
+    exec::SpillStats* spillStats,
+    bool preferCompactSlab)
     : input_(input),
       sortCompareFlags_(sortCompareFlags),
       pool_(pool),
@@ -107,6 +108,7 @@ SortBuffer::SortBuffer(
       prefixSortConfig_(prefixSortConfig),
       spillConfig_(spillConfig),
       spillStats_(spillStats),
+      keysOnlySlabRequested_(preferCompactSlab),
       sortedRows_(0, memory::StlAllocator<char*>(*pool)) {
   VELOX_CHECK_GE(input_->children().size(), sortCompareFlags_.size());
   VELOX_CHECK_GT(sortCompareFlags_.size(), 0);
@@ -193,7 +195,8 @@ SortBuffer::SortBuffer(
       }
     }
   }
-  keysOnlySlabEnabled_ = keysOnlyEligible_ && keysOnlySortSlabEnv();
+  keysOnlySlabEnabled_ =
+      keysOnlyEligible_ && (keysOnlySortSlabEnv() || keysOnlySlabRequested_);
   keysOnlyNextSlabBytes_ = kKeysOnlyMinSlabBytes;
 }
 

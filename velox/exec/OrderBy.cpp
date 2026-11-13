@@ -74,7 +74,8 @@ void OrderBy::initialize() {
       &nonReclaimableSection_,
       operatorCtx()->driverCtx()->prefixSortConfig(),
       spillConfig_.has_value() ? &(spillConfig_.value()) : nullptr,
-      spillStats_.get());
+      spillStats_.get(),
+      orderByNode_->preferCompactSort());
 }
 
 void OrderBy::addInput(RowVectorPtr input) {

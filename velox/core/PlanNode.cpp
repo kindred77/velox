@@ -3935,6 +3935,7 @@ folly::dynamic OrderByNode::serialize() const {
   obj["sortingKeys"] = ISerializable::serialize(sortingKeys_);
   obj["sortingOrders"] = serializeSortingOrders(sortingOrders_);
   obj["partial"] = isPartial_;
+  obj["preferCompactSort"] = preferCompactSort_;
   return obj;
 }
 
@@ -3955,7 +3956,10 @@ PlanNodePtr OrderByNode::create(const folly::dynamic& obj, void* context) {
       std::move(sortingKeys),
       std::move(sortingOrders),
       obj["partial"].asBool(),
-      std::move(source));
+      std::move(source),
+      obj.count("preferCompactSort") != 0
+          ? obj["preferCompactSort"].asBool()
+          : false);
 }
 
 void MarkDistinctNode::addDetails(std::stringstream& stream) const {
