@@ -90,7 +90,7 @@ GroupingSet::GroupingSet(
   // fixed-width integer/date key and no spilling.
   {
     const char* enabled = std::getenv("YIHUDB_KEYS_ONLY_DEDUP");
-    if (enabled != nullptr && std::atoi(enabled) != 0 && isDistinct() &&
+    if ((enabled == nullptr || std::atoi(enabled) != 0) && isDistinct() &&
         !isPartial_ && !isGlobal_ && preGroupedKeyChannels_.empty() &&
         globalGroupingSets_.empty() && !groupIdChannel_.has_value() &&
         hashers_.size() == 1) {
@@ -934,24 +934,16 @@ void GroupingSet::convertFastDistinctToTable() {
     }
   };
 
-  if (keySet->zeroPresent()) {
-    addKey(0, false);
-  }
-  if (keySet->nullPresent()) {
-    addKey(0, true);
-  }
-  for (size_t slot = 0; slot < keySet->slotCount(); ++slot) {
-    uint64_t value = 0;
-    if (keySet->keyAtSlot(slot, value)) {
-      addKey(value, false);
-    }
+  KeyOnlyDedupSet::Iterator keyIterator;
+  uint64_t value = 0;
+  bool isNull = false;
+  while (keySet->next(keyIterator, value, isNull)) {
+    addKey(value, isNull);
   }
   flush();
 
   lookup_->newGroups = std::move(savedNewGroups);
-  fastDistinctZeroEmitted_ = false;
-  fastDistinctNullEmitted_ = false;
-  fastDistinctSlotIndex_ = 0;
+  fastDistinctIterator_ = KeyOnlyDedupSet::Iterator{};
 }
 
 bool GroupingSet::getDistinctOutput(
@@ -991,22 +983,11 @@ bool GroupingSet::getDistinctOutput(
     }
     ++produced;
   };
-  if (!fastDistinctZeroEmitted_ && distinctKeySet_->zeroPresent()) {
-    emit(0, false);
-    fastDistinctZeroEmitted_ = true;
-  }
-  if (produced < rows && !fastDistinctNullEmitted_ &&
-      distinctKeySet_->nullPresent()) {
-    emit(0, true);
-    fastDistinctNullEmitted_ = true;
-  }
+  uint64_t value = 0;
+  bool isNull = false;
   while (produced < rows &&
-         fastDistinctSlotIndex_ < distinctKeySet_->slotCount()) {
-    uint64_t value = 0;
-    if (distinctKeySet_->keyAtSlot(fastDistinctSlotIndex_, value)) {
-      emit(value, false);
-    }
-    ++fastDistinctSlotIndex_;
+         distinctKeySet_->next(fastDistinctIterator_, value, isNull)) {
+    emit(value, isNull);
   }
   if (produced == 0) {
     return false;
@@ -1116,9 +1097,7 @@ void GroupingSet::extractDrainedNewGroups(const RowVectorPtr& result) {
 void GroupingSet::resetTable(bool freeTable) {
   if (distinctKeySet_ != nullptr) {
     distinctKeySet_->clear();
-    fastDistinctSlotIndex_ = 0;
-    fastDistinctZeroEmitted_ = false;
-    fastDistinctNullEmitted_ = false;
+    fastDistinctIterator_ = KeyOnlyDedupSet::Iterator{};
   }
   if (table_ != nullptr) {
     table_->clear(freeTable);

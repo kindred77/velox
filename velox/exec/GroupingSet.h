@@ -223,9 +223,7 @@ class GroupingSet {
   TypePtr fastDistinctKeyType_;
   std::string fastDistinctKeyName_;
   int64_t fastDistinctMaxBytes_{0};
-  size_t fastDistinctSlotIndex_{0};
-  bool fastDistinctZeroEmitted_{false};
-  bool fastDistinctNullEmitted_{false};
+  KeyOnlyDedupSet::Iterator fastDistinctIterator_;
 
   // Materializes the compact distinct keys into the generic hash table and
   // switches back to the row-container/spill path.
