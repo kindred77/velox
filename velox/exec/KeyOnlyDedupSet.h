@@ -223,7 +223,12 @@ class KeyOnlyDedupSet {
     if (!any) {
       return;
     }
-    const uint64_t range = maxValue - minValue + 1;
+    const uint64_t valueSpan = maxValue - minValue;
+    if (valueSpan == UINT64_MAX) {
+      promotionDisabled_ = true;
+      return;
+    }
+    const uint64_t range = valueSpan + 1;
     if (range > kMaxBitmapBits) {
       promotionDisabled_ = true;
       return;
@@ -231,6 +236,10 @@ class KeyOnlyDedupSet {
     size_t bits = 64;
     while (bits < range) {
       bits <<= 1;
+    }
+    if (minValue > UINT64_MAX - (bits - 1)) {
+      promotionDisabled_ = true;
+      return;
     }
     bitmap_.assign((bits + 63) >> 6, 0);
     bitmapMin_ = minValue;
@@ -251,13 +260,20 @@ class KeyOnlyDedupSet {
   bool growBitmap(uint64_t value) {
     uint64_t newMin = std::min(bitmapMin_, value);
     uint64_t newMax = std::max(bitmapMax_, value);
-    const uint64_t required = newMax - newMin + 1;
+    const uint64_t span = newMax - newMin;
+    if (span == UINT64_MAX) {
+      return false;
+    }
+    const uint64_t required = span + 1;
     if (required > kMaxBitmapBits) {
       return false;
     }
     size_t bits = bitmapBits_;
     while (bits < required) {
       bits <<= 1;
+    }
+    if (newMin > UINT64_MAX - (bits - 1)) {
+      return false;
     }
     if (bits == bitmapBits_ && newMin == bitmapMin_) {
       return true;
