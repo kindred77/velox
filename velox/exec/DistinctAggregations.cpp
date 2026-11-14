@@ -16,6 +16,8 @@
 #include "velox/exec/DistinctAggregations.h"
 #include "velox/exec/SetAccumulator.h"
 
+#include <cstdlib>
+
 namespace facebook::velox::exec {
 
 namespace {
@@ -500,9 +502,18 @@ std::unique_ptr<DistinctAggregations> DistinctAggregations::create(
     case TypeKind::INTEGER:
       return std::make_unique<TypedDistinctAggregations<int32_t>>(
           aggregates, inputType, std::move(nonConstantInputs), pool);
-    case TypeKind::BIGINT:
+    case TypeKind::BIGINT: {
+      const char* bitmapEnv =
+          std::getenv("YIHUDB_BITMAP_DISTINCT_ACCUMULATOR");
+      if (bitmapEnv == nullptr || std::atoi(bitmapEnv) != 0) {
+        return std::make_unique<TypedDistinctAggregations<
+            int64_t,
+            aggregate::prestosql::BitmapSetAccumulator<int64_t>>>(
+            aggregates, inputType, std::move(nonConstantInputs), pool);
+      }
       return std::make_unique<TypedDistinctAggregations<int64_t>>(
           aggregates, inputType, std::move(nonConstantInputs), pool);
+    }
     case TypeKind::HUGEINT:
       return std::make_unique<TypedDistinctAggregations<int128_t>>(
           aggregates, inputType, std::move(nonConstantInputs), pool);

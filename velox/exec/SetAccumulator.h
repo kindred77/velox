@@ -140,6 +140,237 @@ struct SetAccumulator {
   }
 };
 
+/// Distinct set for a single integral column.  Small or dense value ranges are
+/// held in a bitmap; the bitmap is grown with power-of-two capacity and falls
+/// back to the regular F14 set if the observed range becomes too wide.  This
+/// targets grouped count(distinct) over id-like columns where per-group F14
+/// insertion dominates.
+template <typename T>
+struct BitmapSetAccumulator {
+  static_assert(std::is_integral_v<T>);
+  static constexpr size_t kMaxBitmapBits = 1ULL << 24;
+  static constexpr size_t kPromoteKeys = 4096;
+
+  using Map = folly::F14FastMap<
+      T,
+      int32_t,
+      std::hash<T>,
+      std::equal_to<T>,
+      AlignedStlAllocator<std::pair<const T, vector_size_t>, 16>>;
+  using Bits = std::vector<uint64_t, AlignedStlAllocator<uint64_t, 16>>;
+
+  std::optional<vector_size_t> nullIndex;
+  Map uniqueValues;
+  Bits bits;
+  int64_t minValue{0};
+  int64_t maxValue{0};
+  size_t bitmapBits{0};
+  size_t uniqueCount{0};
+  bool bitmapMode{false};
+
+  BitmapSetAccumulator(const TypePtr& /*type*/, HashStringAllocator* allocator)
+      : uniqueValues{AlignedStlAllocator<std::pair<const T, vector_size_t>, 16>(
+            allocator)},
+        bits{AlignedStlAllocator<uint64_t, 16>(allocator)} {}
+
+  void addValue(
+      const DecodedVector& decoded,
+      vector_size_t index,
+      HashStringAllocator* allocator) {
+    if (decoded.isNullAt(index)) {
+      if (!nullIndex.has_value()) {
+        nullIndex = static_cast<vector_size_t>(size());
+      }
+      return;
+    }
+    addNonNullValue(decoded.valueAt<T>(index), allocator);
+  }
+
+  void addValues(
+      const ArrayVector& arrayVector,
+      vector_size_t index,
+      const DecodedVector& values,
+      HashStringAllocator* allocator) {
+    VELOX_DCHECK(!arrayVector.isNullAt(index));
+    const auto size = arrayVector.sizeAt(index);
+    const auto offset = arrayVector.offsetAt(index);
+    for (auto i = 0; i < size; ++i) {
+      addValue(values, offset + i, allocator);
+    }
+  }
+
+  void addNonNullValue(
+      const DecodedVector& decoded,
+      vector_size_t index,
+      HashStringAllocator* allocator) {
+    if (!decoded.isNullAt(index)) {
+      addNonNullValue(decoded.valueAt<T>(index), allocator);
+    }
+  }
+
+  void addNonNullValues(
+      const ArrayVector& arrayVector,
+      vector_size_t index,
+      const DecodedVector& values,
+      HashStringAllocator* allocator) {
+    VELOX_DCHECK(!arrayVector.isNullAt(index));
+    const auto size = arrayVector.sizeAt(index);
+    const auto offset = arrayVector.offsetAt(index);
+    for (auto i = 0; i < size; ++i) {
+      addNonNullValue(values, offset + i, allocator);
+    }
+  }
+
+  size_t size() const {
+    return (bitmapMode ? uniqueCount : uniqueValues.size()) +
+        (nullIndex.has_value() ? 1 : 0);
+  }
+
+  vector_size_t extractValues(FlatVector<T>& values, vector_size_t offset) {
+    vector_size_t written = 0;
+    if (bitmapMode) {
+      for (size_t i = 0; i < bitmapBits; ++i) {
+        if ((bits[i >> 6] >> (i & 63)) & 1ULL) {
+          values.set(
+              offset + written, static_cast<T>(minValue + static_cast<int64_t>(i)));
+          ++written;
+        }
+      }
+    } else {
+      for (const auto& entry : uniqueValues) {
+        values.set(offset + written, entry.first);
+        ++written;
+      }
+    }
+    if (nullIndex.has_value()) {
+      values.setNull(offset + (written++), true);
+    }
+    return written;
+  }
+
+  void free(HashStringAllocator& /*allocator*/) {
+    using UT = decltype(uniqueValues);
+    uniqueValues.~UT();
+    bits.~Bits();
+  }
+
+ private:
+  void addNonNullValue(T value, HashStringAllocator* /*allocator*/) {
+    if (bitmapMode) {
+      if (value < minValue ||
+          static_cast<uint64_t>(value - minValue) >= bitmapBits) {
+        if (!growBitmap(value)) {
+          convertBitmapToSet();
+          addNonNullValue(value, nullptr);
+          return;
+        }
+      }
+      if (!setBit(static_cast<uint64_t>(value - minValue))) {
+        return;
+      }
+      ++uniqueCount;
+      maxValue = std::max<int64_t>(maxValue, value);
+      return;
+    }
+    const auto oldSize = uniqueValues.size();
+    uniqueValues.insert({value, static_cast<int32_t>(oldSize)});
+    uniqueCount = uniqueValues.size();
+    if (uniqueCount >= kPromoteKeys) {
+      promoteToBitmap();
+    }
+  }
+
+  bool setBit(uint64_t index) {
+    const size_t word = index >> 6;
+    const uint64_t mask = 1ULL << (index & 63);
+    if ((bits[word] & mask) != 0) {
+      return false;
+    }
+    bits[word] |= mask;
+    return true;
+  }
+
+  void promoteToBitmap() {
+    int64_t minV = INT64_MAX;
+    int64_t maxV = INT64_MIN;
+    for (const auto& entry : uniqueValues) {
+      minV = std::min<int64_t>(minV, entry.first);
+      maxV = std::max<int64_t>(maxV, entry.first);
+    }
+    if (minV == INT64_MAX) {
+      return;
+    }
+    const uint64_t span =
+        static_cast<uint64_t>(maxV) - static_cast<uint64_t>(minV);
+    if (span >= kMaxBitmapBits) {
+      return;
+    }
+    size_t needed = 64;
+    while (needed < span + 1) {
+      needed <<= 1;
+    }
+    bits.assign((needed + 63) >> 6, 0);
+    minValue = minV;
+    maxValue = maxV;
+    bitmapBits = needed;
+    for (const auto& entry : uniqueValues) {
+      bits[(static_cast<uint64_t>(entry.first - minValue)) >> 6] |=
+          1ULL << ((static_cast<uint64_t>(entry.first - minValue)) & 63);
+    }
+    bitmapMode = true;
+    uniqueCount = uniqueValues.size();
+    uniqueValues.clear();
+  }
+
+  bool growBitmap(T value) {
+    int64_t newMin = std::min<int64_t>(minValue, value);
+    int64_t newMax = std::max<int64_t>(maxValue, value);
+    const uint64_t span =
+        static_cast<uint64_t>(newMax) - static_cast<uint64_t>(newMin);
+    if (span >= kMaxBitmapBits) {
+      return false;
+    }
+    size_t needed = std::max<size_t>(bitmapBits, 64);
+    while (needed < span + 1) {
+      needed <<= 1;
+    }
+    if (needed == bitmapBits && newMin == minValue) {
+      maxValue = newMax;
+      return true;
+    }
+    Bits grown(
+        (needed + 63) >> 6,
+        0,
+        AlignedStlAllocator<uint64_t, 16>(
+            bits.get_allocator().allocator()));
+    const uint64_t shift = static_cast<uint64_t>(minValue - newMin);
+    for (size_t i = 0; i < bitmapBits; ++i) {
+      if ((bits[i >> 6] >> (i & 63)) & 1ULL) {
+        const uint64_t target = i + shift;
+        grown[target >> 6] |= 1ULL << (target & 63);
+      }
+    }
+    bits.swap(grown);
+    minValue = newMin;
+    maxValue = newMax;
+    bitmapBits = needed;
+    return true;
+  }
+
+  void convertBitmapToSet() {
+    for (size_t i = 0; i < bitmapBits; ++i) {
+      if ((bits[i >> 6] >> (i & 63)) & 1ULL) {
+        uniqueValues.insert(
+            {static_cast<T>(minValue + static_cast<int64_t>(i)),
+             static_cast<int32_t>(uniqueValues.size())});
+      }
+    }
+    bitmapMode = false;
+    bits.clear();
+    uniqueCount = uniqueValues.size();
+  }
+};
+
 /// Maintains a set of unique strings.
 struct StringViewSetAccumulator {
   /// A set of unique StringViews pointing to storage managed by 'strings'.
@@ -432,6 +663,9 @@ struct SetAccumulatorTypeTraits<UnknownValue> {
 };
 
 } // namespace detail
+
+template <typename T>
+using BitmapSetAccumulator = detail::BitmapSetAccumulator<T>;
 
 // A wrapper around SetAccumulator that overrides hash and equal_to functions to
 // use the custom comparisons provided by a custom type.
