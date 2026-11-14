@@ -93,7 +93,7 @@ GroupingSet::GroupingSet(
     if (enabled != nullptr && std::atoi(enabled) != 0 && isDistinct() &&
         !isPartial_ && !isGlobal_ && preGroupedKeyChannels_.empty() &&
         globalGroupingSets_.empty() && !groupIdChannel_.has_value() &&
-        hashers_.size() == 1 && spillConfig_ == nullptr) {
+        hashers_.size() == 1) {
       const auto channel = hashers_[0]->channel();
       const auto& type = inputType->childAt(channel);
       if (type->isBigint() || type->isInteger() || type->isDate()) {
@@ -101,6 +101,17 @@ GroupingSet::GroupingSet(
         lookup_ = std::make_unique<HashLookup>(hashers_, pool_);
         fastDistinctKeyChannel_ = channel;
         fastDistinctKeyIsInt64_ = !type->isInteger() && !type->isDate();
+        fastDistinctKeyType_ = type;
+        fastDistinctKeyName_ = inputType->nameOf(channel);
+        const auto capacity = pool_->capacity();
+        fastDistinctMaxBytes_ = capacity > 0
+            ? std::max<int64_t>(512LL << 20, capacity / 2)
+            : 0;
+        if (const char* maxBytes =
+                std::getenv("YIHUDB_KEYS_ONLY_DEDUP_MAX_BYTES");
+            maxBytes != nullptr && *maxBytes != '\0') {
+          fastDistinctMaxBytes_ = std::atoll(maxBytes);
+        }
       }
     }
   }
@@ -332,6 +343,11 @@ void GroupingSet::addInputForActiveRows(
         lookup_->newGroups.push_back(static_cast<vector_size_t>(row));
       }
     });
+    if (fastDistinctMaxBytes_ > 0 &&
+        distinctKeySet_->allocatedBytes() >=
+            static_cast<uint64_t>(fastDistinctMaxBytes_)) {
+      convertFastDistinctToTable();
+    }
     return;
   }
   if (table_ == nullptr) {
@@ -859,6 +875,83 @@ bool GroupingSet::getOutput(
     RowVectorPtr& result) {
   VELOX_CHECK(!isDistinct());
   return getOutputInternal(maxOutputRows, maxOutputBytes, iterator, result);
+}
+
+void GroupingSet::convertFastDistinctToTable() {
+  if (distinctKeySet_ == nullptr) {
+    return;
+  }
+  auto keySet = std::move(distinctKeySet_);
+  distinctKeySet_.reset();
+  auto savedNewGroups = std::move(lookup_->newGroups);
+  lookup_->newGroups.clear();
+
+  const auto rowType = std::make_shared<RowType>(
+      std::vector<std::string>{fastDistinctKeyName_},
+      std::vector<TypePtr>{fastDistinctKeyType_});
+  std::vector<uint64_t> pendingValues;
+  std::vector<uint8_t> pendingNulls;
+  pendingValues.reserve(4096);
+  pendingNulls.reserve(4096);
+
+  auto flush = [&]() {
+    const auto size = static_cast<vector_size_t>(pendingValues.size());
+    if (size == 0) {
+      return;
+    }
+    auto keyVector =
+        BaseVector::create(fastDistinctKeyType_, size, pool_);
+    auto* flat64 = fastDistinctKeyIsInt64_
+        ? keyVector->asFlatVector<int64_t>()
+        : nullptr;
+    auto* flat32 = fastDistinctKeyIsInt64_
+        ? nullptr
+        : keyVector->asFlatVector<int32_t>();
+    for (vector_size_t i = 0; i < size; ++i) {
+      if (pendingNulls[i] != 0) {
+        keyVector->setNull(i, true);
+      } else if (flat64 != nullptr) {
+        flat64->set(i, static_cast<int64_t>(pendingValues[i]));
+      } else {
+        flat32->set(i, static_cast<int32_t>(pendingValues[i]));
+      }
+    }
+    std::vector<VectorPtr> children{keyVector};
+    auto row = std::make_shared<RowVector>(
+        pool_, rowType, nullptr, size, std::move(children));
+    activeRows_.resize(size);
+    activeRows_.setAll();
+    addInputForActiveRows(row, false);
+    pendingValues.clear();
+    pendingNulls.clear();
+  };
+
+  auto addKey = [&](uint64_t value, bool isNull) {
+    pendingValues.push_back(value);
+    pendingNulls.push_back(isNull ? 1 : 0);
+    if (pendingValues.size() >= 4096) {
+      flush();
+    }
+  };
+
+  if (keySet->zeroPresent()) {
+    addKey(0, false);
+  }
+  if (keySet->nullPresent()) {
+    addKey(0, true);
+  }
+  for (size_t slot = 0; slot < keySet->slotCount(); ++slot) {
+    uint64_t value = 0;
+    if (keySet->keyAtSlot(slot, value)) {
+      addKey(value, false);
+    }
+  }
+  flush();
+
+  lookup_->newGroups = std::move(savedNewGroups);
+  fastDistinctZeroEmitted_ = false;
+  fastDistinctNullEmitted_ = false;
+  fastDistinctSlotIndex_ = 0;
 }
 
 bool GroupingSet::getDistinctOutput(
