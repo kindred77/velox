@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 #include "velox/exec/GroupingSet.h"
+
+#include <cstdlib>
 #include "velox/common/base/BitUtil.h"
 #include "velox/common/testutil/TestValue.h"
 #include "velox/exec/OperatorUtils.h"
@@ -82,6 +84,25 @@ GroupingSet::GroupingSet(
 
   for (auto& hasher : hashers_) {
     keyChannels_.push_back(hasher->channel());
+  }
+
+  // Prototype: compact keys-only set for a final distinct aggregation with one
+  // fixed-width integer/date key and no spilling.
+  {
+    const char* enabled = std::getenv("YIHUDB_KEYS_ONLY_DEDUP");
+    if (enabled != nullptr && std::atoi(enabled) != 0 && isDistinct() &&
+        !isPartial_ && !isGlobal_ && preGroupedKeyChannels_.empty() &&
+        globalGroupingSets_.empty() && !groupIdChannel_.has_value() &&
+        hashers_.size() == 1 && spillConfig_ == nullptr) {
+      const auto channel = hashers_[0]->channel();
+      const auto& type = inputType->childAt(channel);
+      if (type->isBigint() || type->isInteger() || type->isDate()) {
+        distinctKeySet_ = std::make_unique<KeyOnlyDedupSet>();
+        lookup_ = std::make_unique<HashLookup>(hashers_, pool_);
+        fastDistinctKeyChannel_ = channel;
+        fastDistinctKeyIsInt64_ = !type->isInteger() && !type->isDate();
+      }
+    }
   }
 
   if (groupingKeyOutputProjections_.empty()) {
@@ -289,6 +310,30 @@ void GroupingSet::addInputForActiveRows(
     const RowVectorPtr& input,
     bool mayPushdown) {
   VELOX_CHECK(!isGlobal_);
+  if (distinctKeySet_ != nullptr) {
+    VELOX_DCHECK(hashers_.size() == 1);
+    const auto& keyVector = input->childAt(fastDistinctKeyChannel_);
+    DecodedVector decoded(*keyVector, activeRows_);
+    lookup_->newGroups.clear();
+    activeRows_.applyToSelected([&](auto row) {
+      bool isNew;
+      if (decoded.isNullAt(row)) {
+        isNew = distinctKeySet_->insert(0, true);
+      } else if (fastDistinctKeyIsInt64_) {
+        isNew = distinctKeySet_->insert(
+            static_cast<uint64_t>(decoded.valueAt<int64_t>(row)), false);
+      } else {
+        isNew = distinctKeySet_->insert(
+            static_cast<uint64_t>(
+                static_cast<int64_t>(decoded.valueAt<int32_t>(row))),
+            false);
+      }
+      if (isNew) {
+        lookup_->newGroups.push_back(static_cast<vector_size_t>(row));
+      }
+    });
+    return;
+  }
   if (table_ == nullptr) {
     createHashTable();
   }
@@ -822,7 +867,59 @@ bool GroupingSet::getDistinctOutput(
     RowContainerIterator& iterator,
     RowVectorPtr& result) {
   VELOX_CHECK(isDistinct());
-  return getOutputInternal(maxOutputRows, maxOutputBytes, iterator, result);
+  if (distinctKeySet_ == nullptr) {
+    return getOutputInternal(maxOutputRows, maxOutputBytes, iterator, result);
+  }
+  const size_t rows = static_cast<size_t>(
+      std::max<int32_t>(0, maxOutputRows));
+  if (rows == 0) {
+    return false;
+  }
+  result->resize(static_cast<vector_size_t>(rows));
+  auto keyVector = result->childAt(0);
+  keyVector->clearNulls(0, static_cast<vector_size_t>(rows));
+  auto* flat64 = fastDistinctKeyIsInt64_
+      ? keyVector->asFlatVector<int64_t>()
+      : nullptr;
+  auto* flat32 = fastDistinctKeyIsInt64_
+      ? nullptr
+      : keyVector->asFlatVector<int32_t>();
+  size_t produced = 0;
+  auto emit = [&](uint64_t value, bool isNull) {
+    if (produced >= rows) {
+      return;
+    }
+    if (isNull) {
+      keyVector->setNull(produced, true);
+    } else if (flat64 != nullptr) {
+      flat64->set(produced, static_cast<int64_t>(value));
+    } else {
+      flat32->set(produced, static_cast<int32_t>(value));
+    }
+    ++produced;
+  };
+  if (!fastDistinctZeroEmitted_ && distinctKeySet_->zeroPresent()) {
+    emit(0, false);
+    fastDistinctZeroEmitted_ = true;
+  }
+  if (produced < rows && !fastDistinctNullEmitted_ &&
+      distinctKeySet_->nullPresent()) {
+    emit(0, true);
+    fastDistinctNullEmitted_ = true;
+  }
+  while (produced < rows &&
+         fastDistinctSlotIndex_ < distinctKeySet_->slotCount()) {
+    uint64_t value = 0;
+    if (distinctKeySet_->keyAtSlot(fastDistinctSlotIndex_, value)) {
+      emit(value, false);
+    }
+    ++fastDistinctSlotIndex_;
+  }
+  if (produced == 0) {
+    return false;
+  }
+  result->resize(static_cast<vector_size_t>(produced));
+  return true;
 }
 
 bool GroupingSet::getOutputInternal(
@@ -924,6 +1021,12 @@ void GroupingSet::extractDrainedNewGroups(const RowVectorPtr& result) {
 }
 
 void GroupingSet::resetTable(bool freeTable) {
+  if (distinctKeySet_ != nullptr) {
+    distinctKeySet_->clear();
+    fastDistinctSlotIndex_ = 0;
+    fastDistinctZeroEmitted_ = false;
+    fastDistinctNullEmitted_ = false;
+  }
   if (table_ != nullptr) {
     table_->clear(freeTable);
   }
@@ -941,6 +1044,7 @@ void GroupingSet::resetGlobalAggregation() {
 
 bool GroupingSet::isPartialFull(int64_t maxBytes) {
   VELOX_CHECK(isPartial_);
+  VELOX_CHECK_NULL(distinctKeySet_);
   if (!table_ || allocatedBytes() <= maxBytes) {
     return false;
   }
@@ -965,6 +1069,9 @@ uint64_t GroupingSet::allocatedBytes() const {
   uint64_t totalBytes{0};
   if (sortedAggregations_ != nullptr) {
     totalBytes += sortedAggregations_->inputRowBytes();
+  }
+  if (distinctKeySet_ != nullptr) {
+    totalBytes += distinctKeySet_->allocatedBytes();
   }
   if (table_ != nullptr) {
     totalBytes += table_->allocatedBytes();

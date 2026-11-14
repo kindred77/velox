@@ -15,6 +15,8 @@
  */
 #include "velox/exec/HashAggregation.h"
 
+#include <cstdlib>
+
 #include <optional>
 #include "velox/common/testutil/TestValue.h"
 #include "velox/exec/OperatorType.h"
@@ -25,6 +27,27 @@
 using facebook::velox::common::testutil::TestValue;
 
 namespace facebook::velox::exec {
+
+namespace {
+// Prototype gate for the compact keys-only distinct path: a single int32/
+// int64/date grouping key, no aggregates, no pre-grouped/grouping-set/group-id
+// shape.  Spilling is disabled for this shape while the prototype set has no
+// spill implementation.
+bool keysOnlyDedupPrototype(
+    const std::shared_ptr<const core::AggregationNode>& node) {
+  const char* enabled = std::getenv("YIHUDB_KEYS_ONLY_DEDUP");
+  if (enabled == nullptr || std::atoi(enabled) == 0) {
+    return false;
+  }
+  if (!node->aggregates().empty() || node->groupingKeys().size() != 1 ||
+      !node->preGroupedKeys().empty() || !node->globalGroupingSets().empty() ||
+      node->groupId().has_value()) {
+    return false;
+  }
+  const auto& type = node->groupingKeys()[0]->type();
+  return type->isBigint() || type->isInteger() || type->isDate();
+}
+} // namespace
 
 HashAggregation::HashAggregation(
     int32_t operatorId,
@@ -38,7 +61,8 @@ HashAggregation::HashAggregation(
           aggregationNode->step() == core::AggregationNode::Step::kPartial
               ? OperatorType::kPartialAggregation
               : OperatorType::kAggregation,
-          aggregationNode->canSpill(driverCtx->queryConfig())
+          aggregationNode->canSpill(driverCtx->queryConfig()) &&
+                  !keysOnlyDedupPrototype(aggregationNode)
               ? driverCtx->makeSpillConfig(
                     operatorId,
                     aggregationNode->step() ==

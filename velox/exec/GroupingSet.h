@@ -21,6 +21,7 @@
 #include "velox/exec/AggregationMasks.h"
 #include "velox/exec/DistinctAggregations.h"
 #include "velox/exec/HashTable.h"
+#include "velox/exec/KeyOnlyDedupSet.h"
 #include "velox/exec/SortedAggregations.h"
 #include "velox/exec/Spiller.h"
 #include "velox/exec/VectorHasher.h"
@@ -120,6 +121,9 @@ class GroupingSet {
 
   /// Returns the count of the hash table, if any.
   int64_t numDistinct() const {
+    if (distinctKeySet_ != nullptr) {
+      return static_cast<int64_t>(distinctKeySet_->size());
+    }
     return table_ ? table_->numDistinct() : 0;
   }
 
@@ -211,6 +215,15 @@ class GroupingSet {
   std::optional<int64_t> estimateOutputRowSize() const;
 
  private:
+  // Prototype compact path for final keys-only distinct aggregations with a
+  // single int32/int64/date key and no spill support.
+  std::unique_ptr<KeyOnlyDedupSet> distinctKeySet_;
+  column_index_t fastDistinctKeyChannel_{0};
+  bool fastDistinctKeyIsInt64_{false};
+  size_t fastDistinctSlotIndex_{0};
+  bool fastDistinctZeroEmitted_{false};
+  bool fastDistinctNullEmitted_{false};
+
   bool getOutputInternal(
       int32_t maxOutputRows,
       int32_t maxOutputBytes,
