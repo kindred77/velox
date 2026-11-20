@@ -26,6 +26,15 @@ using facebook::velox::common::testutil::TestValue;
 namespace facebook::velox::exec {
 
 namespace {
+
+bool partialArrayBudgetEnabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("YIHUDB_PARTIAL_ARRAY_BUDGET");
+    return value != nullptr && std::atoi(value) != 0;
+  }();
+  return enabled;
+}
+
 bool allAreSinglyReferenced(
     const std::vector<column_index_t>& argList,
     const std::unordered_map<column_index_t, int>& channelUseCount) {
@@ -513,6 +522,11 @@ void GroupingSet::createHashTable() {
   } else {
     table_ = HashTable<false>::createForAggregation(
         std::move(hashers_), accumulators(false), pool_);
+  }
+
+  if (isPartial_ && partialArrayBudgetEnabled()) {
+    table_->setSparseArrayMaxBytes(BaseHashTable::sparseArrayByteLimit(
+        queryConfig_->maxPartialAggregationMemoryUsage()));
   }
 
   RowContainer& rows = *table_->rows();
@@ -1129,8 +1143,9 @@ bool GroupingSet::isPartialFull(int64_t maxBytes) {
   // mode that turns off value ranges for kArray mode. Large means
   // over 1/16 of the space budget and sparse means under 1 entry
   // per 32 buckets.
-  if (stats.capacity * sizeof(void*) > maxBytes / 16 &&
-      stats.numDistinct < stats.capacity / 32) {
+  if (BaseHashTable::sparseArrayExceedsBudget(
+          stats.capacity, stats.numDistinct,
+          BaseHashTable::sparseArrayByteLimit(maxBytes))) {
     table_->decideHashMode(
         0, BaseHashTable::kNoSpillInputStartPartitionBit, true);
   }

@@ -24,6 +24,7 @@
 #include <optional>
 
 #include "velox/common/base/AsyncSource.h"
+#include "velox/common/base/CheckedArithmetic.h"
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/base/Portability.h"
 #include "velox/common/base/RuntimeMetrics.h"
@@ -2120,15 +2121,29 @@ void HashTable<ignoreNullKeys>::decideHashMode(
     }
   }
 
-  if (rangesWithReserve < kArrayHashMaxSize && !disableRangeArrayHash_) {
+  // Existing groups plus input rows conservatively bound the next group
+  // count. Never reject a potentially dense array on an optimistic NDV guess.
+  const auto groupsUpperBound = hasSparseArrayBudget()
+      ? checkedPlus<uint64_t>(
+            numDistinct_, static_cast<uint64_t>(std::max<int32_t>(numNew, 0)))
+      : 0;
+  const auto fitsSparseBudget = [&](uint64_t capacity) {
+    return !hasSparseArrayBudget() ||
+        !sparseArrayExceedsBudget(
+            capacity, groupsUpperBound, sparseArrayMaxBytes_);
+  };
+
+  if (rangesWithReserve < kArrayHashMaxSize && !disableRangeArrayHash_ &&
+      fitsSparseBudget(rangesWithReserve)) {
     std::fill(useRange.begin(), useRange.end(), true);
     capacity_ = setHasherMode(hashers_, useRange, rangeSizes, distinctSizes);
     setHashMode(HashMode::kArray, numNew, spillInputStartPartitionBit);
     return;
   }
 
-  if (bestWithReserve < kArrayHashMaxSize ||
-      (disableRangeArrayHash_ && bestWithReserve < numDistinct_ * 2)) {
+  if ((bestWithReserve < kArrayHashMaxSize ||
+       (disableRangeArrayHash_ && bestWithReserve < numDistinct_ * 2)) &&
+      fitsSparseBudget(bestWithReserve)) {
     capacity_ = setHasherMode(hashers_, useRange, rangeSizes, distinctSizes);
     setHashMode(HashMode::kArray, numNew, spillInputStartPartitionBit);
     return;
@@ -2146,7 +2161,8 @@ void HashTable<ignoreNullKeys>::decideHashMode(
     return;
   }
 
-  if (distinctsWithReserve < kArrayHashMaxSize) {
+  if (distinctsWithReserve < kArrayHashMaxSize &&
+      fitsSparseBudget(distinctsWithReserve)) {
     clearUseRange(useRange);
     capacity_ = setHasherMode(hashers_, useRange, rangeSizes, distinctSizes);
     setHashMode(HashMode::kArray, numNew, spillInputStartPartitionBit);

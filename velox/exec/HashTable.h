@@ -15,6 +15,8 @@
  */
 #pragma once
 
+#include <limits>
+
 #include "velox/common/base/Portability.h"
 #include "velox/common/base/RuntimeMetrics.h"
 #include "velox/exec/OneWayStatusFlag.h"
@@ -141,6 +143,29 @@ class BaseHashTable {
 
   /// 2M entries, i.e. 16MB is the largest array based hash table.
   static constexpr uint64_t kArrayHashMaxSize = 2L << 20;
+
+  // Preserve the existing sparse-array contraction policy at both selection
+  // and reclamation sites. Dense arrays are not limited by this allowance.
+  static uint64_t sparseArrayByteLimit(uint64_t aggregationBytes) {
+    return aggregationBytes / 16;
+  }
+
+  static bool sparseArrayExceedsBudget(
+      uint64_t capacity,
+      uint64_t groupsUpperBound,
+      uint64_t maxBytes) {
+    return capacity > maxBytes / sizeof(void*) &&
+        groupsUpperBound < capacity / 32;
+  }
+
+  void setSparseArrayMaxBytes(uint64_t bytes) {
+    sparseArrayMaxBytes_ = bytes;
+  }
+
+  bool hasSparseArrayBudget() const {
+    return sparseArrayMaxBytes_ != std::numeric_limits<uint64_t>::max();
+  }
+
 
   /// Specifies the hash mode of a table.
   enum class HashMode { kHash, kArray, kNormalizedKey };
@@ -526,6 +551,8 @@ class BaseHashTable {
 
   ParallelJoinBuildStats parallelJoinBuildStats_;
   CpuWallTiming vectorHasherMergeTiming_;
+
+  uint64_t sparseArrayMaxBytes_{std::numeric_limits<uint64_t>::max()};
 };
 
 FOLLY_ALWAYS_INLINE std::ostream& operator<<(

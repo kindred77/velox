@@ -364,6 +364,11 @@ void HashAggregation::maybeIncreasePartialAggregationMemoryUsage(
   // Update the aggregation memory usage size limit on memory reservation
   // success.
   maxPartialAggregationMemoryUsage_ = extendedPartialAggregationMemoryUsage;
+  if (auto* table = groupingSet_->table();
+      table != nullptr && table->hasSparseArrayBudget()) {
+    table->setSparseArrayMaxBytes(BaseHashTable::sparseArrayByteLimit(
+        maxPartialAggregationMemoryUsage_));
+  }
   addRuntimeStat(
       "maxExtendedPartialAggregationMemoryUsage",
       RuntimeCounter(
