@@ -16,6 +16,9 @@
 
 #pragma once
 
+#include <cstdlib>
+
+#include "velox/common/base/CheckedArithmetic.h"
 #include "velox/common/base/IOUtils.h"
 #include "velox/exec/Aggregate.h"
 #include "velox/type/HugeInt.h"
@@ -259,6 +262,12 @@ class DecimalAggregate : public exec::Aggregate {
     stringViewVector->resize(numGroups);
     uint64_t* rawNulls = nullptr;
     rawNulls = getRawNulls(stringViewVector);
+    static const bool exactAllocation = [] {
+      const char* value = std::getenv("YIHUDB_AGG_STATE_EXACT_ALLOC");
+      return value == nullptr || std::atoi(value) != 0;
+    }();
+    bool compact = exactAllocation;
+    char* nextState = nullptr;
     for (auto i = 0; i < numGroups; ++i) {
       auto accumulator = decimalAccumulator(groups[i]);
       if (isNull(groups[i])) {
@@ -266,10 +275,36 @@ class DecimalAggregate : public exec::Aggregate {
       } else {
         clearNull(rawNulls, i);
         auto size = accumulator->serializedSize();
-        char* rawBuffer = stringViewVector->getRawStringBufferWithSpace(size);
+        if (compact && nextState == nullptr) {
+          // Small fixed-state batches need no minimum string chunk. Bound the
+          // reservation by the old chunk capacity; large batches keep their
+          // incremental allocation to avoid increasing size-class rounding.
+          const auto chunkCapacity = stringViewVector->pool()->preferredSize(
+              FlatVector<StringView>::kInitialStringSize +
+              AlignedBuffer::kPaddedSize) - AlignedBuffer::kPaddedSize;
+          auto remaining = static_cast<size_t>(numGroups - i);
+          if (checkedMultiply(remaining, size) > chunkCapacity) {
+            compact = false;
+          } else {
+            if (exec::Aggregate::numNulls_ != 0) {
+              remaining = 1;
+              for (auto j = i + 1; j < numGroups; ++j) {
+                remaining += !isNull(groups[j]);
+              }
+            }
+            nextState = stringViewVector->getRawStringBufferWithSpace(
+                checkedMultiply(remaining, size), true);
+          }
+        }
+        char* rawBuffer = compact
+            ? nextState
+            : stringViewVector->getRawStringBufferWithSpace(size);
         StringView serialized(rawBuffer, size);
         accumulator->serialize(serialized);
         stringViewVector->setNoCopy(i, serialized);
+        if (compact) {
+          nextState += size;
+        }
       }
     }
   }
