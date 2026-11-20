@@ -21,10 +21,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 
 #include "velox/common/base/AsyncSource.h"
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/base/Portability.h"
+#include "velox/common/base/RuntimeMetrics.h"
 #include "velox/common/base/SimdUtil.h"
 #include "velox/common/process/ProcessBase.h"
 #include "velox/common/process/TraceContext.h"
@@ -48,6 +50,32 @@ using facebook::velox::common::testutil::TestValue;
 namespace facebook::velox::exec {
 
 namespace {
+
+// Allocation events preserve transient modes that later capacity samples lose.
+// The existing driver-local writer attributes each event to its owning operator.
+void recordHashTableAllocation(
+    bool arrayMode,
+    uint64_t requestedBytes,
+    uint64_t allocatedBytes,
+    const memory::MemoryPool::Stats& before,
+    const memory::MemoryPool::Stats& after) {
+  static constexpr std::array<std::array<std::string_view, 6>, 2> names{{
+      {"hashTableBucketRequestedBytes", "hashTableBucketAllocatedBytes",
+       "hashTableBucketUsedBeforeBytes", "hashTableBucketUsedAfterBytes",
+       "hashTableBucketReservedBeforeBytes", "hashTableBucketReservedAfterBytes"},
+      {"hashTableArrayRequestedBytes", "hashTableArrayAllocatedBytes",
+       "hashTableArrayUsedBeforeBytes", "hashTableArrayUsedAfterBytes",
+       "hashTableArrayReservedBeforeBytes", "hashTableArrayReservedAfterBytes"}}};
+  const std::array<uint64_t, 6> values{
+      requestedBytes, allocatedBytes, before.usedBytes, after.usedBytes,
+      before.reservedBytes, after.reservedBytes};
+  const auto& labels = names[arrayMode ? 1 : 0];
+  for (size_t i = 0; i < values.size(); ++i) {
+    addThreadLocalRuntimeStat(
+        labels[i], RuntimeCounter(
+            static_cast<int64_t>(values[i]), RuntimeCounter::Unit::kBytes));
+  }
+}
 
 /// Sizes the "reuse the previous probe result when the grouping key repeats"
 /// mechanism for the group-by probe. Per probe batch it counts the processed
@@ -1033,9 +1061,15 @@ void HashTable<ignoreNullKeys>::allocateTables(
   // cache line.
   const auto numPages =
       memory::AllocationTraits::numPages(size * tableSlotSize());
+  const auto before = getThreadLocalRunTimeStatWriter() != nullptr
+      ? std::make_optional(rows_->pool()->stats()) : std::nullopt;
   rows_->pool()->allocateContiguous(numPages, tableAllocation_);
   table_ = tableAllocation_.data<char*>();
   ::memset(table_, 0, capacity_ * sizeof(char*));
+  if (before) {
+    recordHashTableAllocation(
+        false, byteSize, tableAllocation_.size(), *before, rows_->pool()->stats());
+  }
 }
 
 template <bool ignoreNullKeys>
@@ -1894,9 +1928,15 @@ void HashTable<ignoreNullKeys>::setHashMode(
   if (mode == HashMode::kArray) {
     const auto bytes = capacity_ * tableSlotSize();
     const auto numPages = memory::AllocationTraits::numPages(bytes);
+    const auto before = getThreadLocalRunTimeStatWriter() != nullptr
+        ? std::make_optional(rows_->pool()->stats()) : std::nullopt;
     rows_->pool()->allocateContiguous(numPages, tableAllocation_);
     table_ = tableAllocation_.data<char*>();
     memset(table_, 0, bytes);
+    if (before) {
+      recordHashTableAllocation(
+          true, bytes, tableAllocation_.size(), *before, rows_->pool()->stats());
+    }
     hashMode_ = HashMode::kArray;
     rehash(true, spillInputStartPartitionBit);
   } else if (mode == HashMode::kHash) {
