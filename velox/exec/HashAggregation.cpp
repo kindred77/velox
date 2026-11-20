@@ -16,6 +16,7 @@
 #include "velox/exec/HashAggregation.h"
 
 #include <cstdlib>
+#include <cstring>
 
 #include <optional>
 #include "velox/common/testutil/TestValue.h"
@@ -376,88 +377,102 @@ void HashAggregation::maybeIncreasePartialAggregationMemoryUsage(
 }
 
 RowVectorPtr HashAggregation::getOutput() {
-  if (finished_) {
-    input_ = nullptr;
-    return nullptr;
-  }
-  // An empty raw partial contributes no values. Avoid materializing an
-  // identity state on every empty driver; the final global aggregate owns
-  // SQL's empty-input default. Keep SINGLE, intermediate and drain semantics.
-  if (isGlobal_ && isPartialOutput_ && isRawInput_ && noMoreInput_ &&
-      numInputRows_ == 0 && !isDraining() && skipEmptyGlobalPartialEnabled()) {
-    addRuntimeStat("emptyGlobalPartialSkipped", RuntimeCounter(1));
-    input_ = nullptr;
-    finished_ = true;
-    return nullptr;
-  }
-  if (abandonedPartialAggregation_) {
-    if (noMoreInput_) {
-      finished_ = true;
-    }
-    if (!input_) {
-      finishDrain();
+  // Finish extraction before destroying state: some EOF paths construct their
+  // final result after setting finished_. Returned vectors retain their buffers.
+  auto result = [&]() -> RowVectorPtr {
+    if (finished_) {
+      input_ = nullptr;
       return nullptr;
     }
-    prepareOutput(input_->size());
-    groupingSet_->toIntermediate(input_, output_);
-    addRuntimeStat(
-        std::string(HashAggregation::kAbandonedPartialAggregationRows),
-        RuntimeCounter(input_->size()));
-    numOutputRows_ += input_->size();
-    input_ = nullptr;
-    return output_;
-  }
-
-  // Produce results if one of the following is true:
-  // - received no-more-input message;
-  // - partial aggregation reached memory limit;
-  // - distinct aggregation has new keys;
-  // - running in partial streaming mode and have some output ready.
-  if (!noMoreInput_ && !isDraining() && !partialFull_ && !newDistincts_ &&
-      !groupingSet_->hasDrainedNewGroups() && !groupingSet_->hasOutput()) {
-    input_ = nullptr;
-    return nullptr;
-  }
-
-  if (isDistinct_ && !bufferPartialDistinctOutput_) {
-    auto distinctOutput = getDistinctOutput();
-    if (distinctOutput == nullptr) {
-      finishDrain();
-    }
-    return distinctOutput;
-  }
-
-  const auto& queryConfig = operatorCtx_->driverCtx()->queryConfig();
-  const auto maxOutputRows =
-      isGlobal_ ? 1 : outputBatchRows(estimatedOutputRowSize_);
-  // Reuse output vectors if possible.
-  prepareOutput(maxOutputRows);
-
-  const bool hasData = bufferPartialDistinctOutput_
-      ? groupingSet_->getDistinctOutput(
-            maxOutputRows,
-            queryConfig.preferredOutputBatchBytes(),
-            resultIterator_,
-            output_)
-      : groupingSet_->getOutput(
-            maxOutputRows,
-            queryConfig.preferredOutputBatchBytes(),
-            resultIterator_,
-            output_);
-  if (!hasData) {
-    resultIterator_.reset();
-    resetPartialOutputIfNeed();
-    finishDrain();
-    if (noMoreInput_) {
+    // An empty raw partial contributes no values. Avoid materializing an
+    // identity state on every empty driver; the final global aggregate owns
+    // SQL's empty-input default. Keep SINGLE, intermediate and drain semantics.
+    if (isGlobal_ && isPartialOutput_ && isRawInput_ && noMoreInput_ &&
+        numInputRows_ == 0 && !isDraining() && skipEmptyGlobalPartialEnabled()) {
+      addRuntimeStat("emptyGlobalPartialSkipped", RuntimeCounter(1));
+      input_ = nullptr;
       finished_ = true;
-      if (emitDefaultGlobalGroupingSetRows_) {
-        return getDefaultGlobalGroupingSetOutput();
-      }
+      return nullptr;
     }
-    return nullptr;
+    if (abandonedPartialAggregation_) {
+      if (noMoreInput_) {
+        finished_ = true;
+      }
+      if (!input_) {
+        finishDrain();
+        return nullptr;
+      }
+      prepareOutput(input_->size());
+      groupingSet_->toIntermediate(input_, output_);
+      addRuntimeStat(
+          std::string(HashAggregation::kAbandonedPartialAggregationRows),
+          RuntimeCounter(input_->size()));
+      numOutputRows_ += input_->size();
+      input_ = nullptr;
+      return output_;
+    }
+
+    // Produce results if one of the following is true:
+    // - received no-more-input message;
+    // - partial aggregation reached memory limit;
+    // - distinct aggregation has new keys;
+    // - running in partial streaming mode and have some output ready.
+    if (!noMoreInput_ && !isDraining() && !partialFull_ && !newDistincts_ &&
+        !groupingSet_->hasDrainedNewGroups() && !groupingSet_->hasOutput()) {
+      input_ = nullptr;
+      return nullptr;
+    }
+
+    if (isDistinct_ && !bufferPartialDistinctOutput_) {
+      auto distinctOutput = getDistinctOutput();
+      if (distinctOutput == nullptr) {
+        finishDrain();
+      }
+      return distinctOutput;
+    }
+
+    const auto& queryConfig = operatorCtx_->driverCtx()->queryConfig();
+    const auto maxOutputRows =
+        isGlobal_ ? 1 : outputBatchRows(estimatedOutputRowSize_);
+    // Reuse output vectors if possible.
+    prepareOutput(maxOutputRows);
+
+    const bool hasData = bufferPartialDistinctOutput_
+        ? groupingSet_->getDistinctOutput(
+              maxOutputRows,
+              queryConfig.preferredOutputBatchBytes(),
+              resultIterator_,
+              output_)
+        : groupingSet_->getOutput(
+              maxOutputRows,
+              queryConfig.preferredOutputBatchBytes(),
+              resultIterator_,
+              output_);
+    if (!hasData) {
+      resultIterator_.reset();
+      resetPartialOutputIfNeed();
+      finishDrain();
+      if (noMoreInput_) {
+        finished_ = true;
+        if (emitDefaultGlobalGroupingSetRows_) {
+          return getDefaultGlobalGroupingSetOutput();
+        }
+      }
+      return nullptr;
+    }
+    numOutputRows_ += output_->size();
+    return output_;
+  }();
+  if (finished_ && groupingSet_) {
+    const char* release = std::getenv("YIHUDB_AGG_RELEASE_FINISHED");
+    if (release != nullptr && std::strcmp(release, "1") == 0) {
+      resultIterator_.reset();
+      output_.reset();
+      groupingSet_.reset();
+      pool()->release();
+    }
   }
-  numOutputRows_ += output_->size();
-  return output_;
+  return result;
 }
 
 RowVectorPtr HashAggregation::getDistinctOutput() {
