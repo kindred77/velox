@@ -15,6 +15,9 @@
  */
 
 #include "velox/vector/FlatVector.h"
+
+#include <cstdlib>
+#include <utility>
 #include "velox/vector/ComplexVector.h"
 #include "velox/vector/ConstantVector.h"
 #include "velox/vector/FlatMapVector.h"
@@ -94,6 +97,35 @@ void FlatVector<StringView>::prepareForReuse() {
     rawValues_ = nullptr;
   }
 
+  static const bool growReuse = [] {
+    const char* value = std::getenv("YIHUDB_STRING_BUFFER_REUSE_GROWTH");
+    return value == nullptr || std::atoi(value) != 0;
+  }();
+  if (growReuse && stringBuffers_.size() > 1) {
+    // An exact-sized first batch may leave a tiny first buffer. Retain an
+    // already-grown chunk instead of reallocating it on every later batch,
+    // without growing the reuse budget beyond the normal minimum chunk.
+    const auto reuseLimit = std::min(
+        kMaxStringSizeForReuse,
+        pool()->preferredSize(kInitialStringSize + AlignedBuffer::kPaddedSize) -
+            AlignedBuffer::kPaddedSize);
+    if (stringBuffers_.front()->capacity() < reuseLimit) {
+      size_t candidate = 0;
+      for (size_t i = 1; i < stringBuffers_.size(); ++i) {
+        const auto& buffer = stringBuffers_[i];
+        if (buffer->isMutable() && buffer->capacity() <= reuseLimit &&
+            buffer->capacity() > stringBuffers_[candidate]->capacity()) {
+          candidate = i;
+          if (buffer->capacity() == reuseLimit) {
+            break;
+          }
+        }
+      }
+      if (candidate != 0) {
+        std::swap(stringBuffers_.front(), stringBuffers_[candidate]);
+      }
+    }
+  }
   keepAtMostOneStringBuffer();
 
   // Clear the StringViews to avoid referencing freed memory.
