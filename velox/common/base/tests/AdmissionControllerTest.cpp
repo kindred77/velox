@@ -17,6 +17,9 @@
 #include "velox/common/base/AdmissionController.h"
 #include <gtest/gtest.h>
 #include <atomic>
+#include <chrono>
+#include <future>
+#include <limits>
 #include "velox/common/base/VeloxException.h"
 #include "velox/common/base/tests/GTestUtils.h"
 
@@ -45,6 +48,143 @@ TEST(AdmissionController, basic) {
   VELOX_ASSERT_THROW(
       admissionController.accept(kLimit + 1),
       "A single request cannot exceed the max limit");
+}
+
+TEST(AdmissionController, overflowDoesNotOverAdmit) {
+  AdmissionController::Config config;
+  config.maxLimit = std::numeric_limits<uint64_t>::max();
+  AdmissionController controller(config);
+  const auto held = config.maxLimit - 1;
+  controller.accept(held);
+  std::promise<void> entered;
+  auto waiter = std::async(std::launch::async, [&] {
+    entered.set_value();
+    controller.accept(3);
+  });
+  entered.get_future().wait();
+  const bool admittedEarly =
+      waiter.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
+  EXPECT_FALSE(admittedEarly);
+  if (admittedEarly) {
+    // A wrapping implementation has lost its accounting; do not underflow it
+    // again during cleanup and obscure the original failure.
+    waiter.get();
+    return;
+  }
+  EXPECT_EQ(controller.currentResourceUsage(), held);
+  controller.release(1);
+  EXPECT_EQ(waiter.wait_for(std::chrono::seconds(1)), std::future_status::timeout);
+  EXPECT_EQ(controller.currentResourceUsage(), held - 1);
+  controller.release(held - 1);
+  waiter.get();
+  EXPECT_EQ(controller.currentResourceUsage(), 3);
+  controller.release(3);
+  EXPECT_EQ(controller.currentResourceUsage(), 0);
+}
+
+TEST(AdmissionController, nonblockingCapacityAndZero) {
+  AdmissionController::Config config;
+  config.maxLimit = 6;
+  AdmissionController controller(config);
+  EXPECT_TRUE(controller.tryAccept(0));
+  EXPECT_TRUE(controller.tryAccept(4));
+  EXPECT_FALSE(controller.tryAccept(3));
+  EXPECT_EQ(controller.currentResourceUsage(), 4);
+  EXPECT_TRUE(controller.tryAccept(2));
+  EXPECT_FALSE(controller.tryAccept(1));
+  EXPECT_FALSE(controller.tryAccept(7));
+  EXPECT_TRUE(controller.tryAccept(0));
+  EXPECT_EQ(controller.currentResourceUsage(), 6);
+  controller.release(4);
+  EXPECT_TRUE(controller.tryAccept(4));
+  controller.release(6);
+  EXPECT_EQ(controller.currentResourceUsage(), 0);
+
+  config.maxLimit = 0;
+  AdmissionController zero(config);
+  EXPECT_TRUE(zero.tryAccept(0));
+  EXPECT_FALSE(zero.tryAccept(1));
+}
+
+TEST(AdmissionController, nonblockingUnsignedLimit) {
+  AdmissionController::Config config;
+  config.maxLimit = std::numeric_limits<uint64_t>::max();
+  AdmissionController controller(config);
+  EXPECT_TRUE(controller.tryAccept(config.maxLimit - 1));
+  EXPECT_FALSE(controller.tryAccept(2));
+  EXPECT_TRUE(controller.tryAccept(1));
+  EXPECT_FALSE(controller.tryAccept(1));
+  EXPECT_EQ(controller.currentResourceUsage(), config.maxLimit);
+  controller.release(config.maxLimit);
+  EXPECT_EQ(controller.currentResourceUsage(), 0);
+}
+
+TEST(AdmissionController, queuedRequestsCannotBeBypassed) {
+  AdmissionController::Config config;
+  config.maxLimit = 10;
+  AdmissionController controller(config);
+  controller.accept(8);
+  std::promise<void> entered;
+  auto head = std::async(std::launch::async, [&] {
+    entered.set_value();
+    controller.accept(3);
+  });
+  entered.get_future().wait();
+  // Observe a real queued request without sleeps or test-only controller APIs.
+  bool denied = false;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (!denied && std::chrono::steady_clock::now() < deadline) {
+    denied = !controller.tryAccept(1);
+    if (!denied) controller.release(1);
+    std::this_thread::yield();
+  }
+  EXPECT_TRUE(denied);
+  EXPECT_TRUE(controller.tryAccept(0));
+  EXPECT_EQ(controller.currentResourceUsage(), 8);
+  std::promise<void> tailEntered;
+  auto tail = std::async(std::launch::async, [&] {
+    tailEntered.set_value();
+    controller.accept(1);
+  });
+  tailEntered.get_future().wait();
+  EXPECT_EQ(tail.wait_for(std::chrono::seconds(1)), std::future_status::timeout);
+  controller.release(8);
+  head.get();
+  tail.get();
+  EXPECT_EQ(controller.currentResourceUsage(), 4);
+  controller.release(4);
+  EXPECT_EQ(controller.currentResourceUsage(), 0);
+}
+
+TEST(AdmissionController, nonblockingConcurrentResourceOwnership) {
+  AdmissionController::Config config;
+  config.maxLimit = 8;
+  AdmissionController controller(config);
+  std::atomic<uint64_t> live{0};
+  std::atomic<uint64_t> acquired{0};
+  std::atomic<bool> exceeded{false};
+  std::vector<std::thread> workers;
+  for (int worker = 0; worker < 4; ++worker) {
+    workers.emplace_back([&, worker] {
+      for (int attempt = 0; attempt < 2500; ++attempt) {
+        const uint64_t amount = 1 + (worker + attempt) % 4;
+        if (!controller.tryAccept(amount)) {
+          std::this_thread::yield();
+          continue;
+        }
+        if (live.fetch_add(amount) + amount > config.maxLimit) exceeded = true;
+        ++acquired;
+        std::this_thread::yield();
+        live.fetch_sub(amount);
+        controller.release(amount);
+      }
+    });
+  }
+  for (auto& worker : workers) worker.join();
+  EXPECT_FALSE(exceeded.load());
+  EXPECT_GT(acquired.load(), 0);
+  EXPECT_EQ(live.load(), 0);
+  EXPECT_EQ(controller.currentResourceUsage(), 0);
 }
 
 TEST(AdmissionController, multiThreaded) {

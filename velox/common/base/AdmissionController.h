@@ -15,7 +15,10 @@
  */
 #pragma once
 
+#include <cstdint>
 #include <deque>
+#include <limits>
+#include <string>
 #include <mutex>
 #include "velox/common/future/VeloxPromise.h"
 
@@ -47,6 +50,11 @@ class AdmissionController {
 
   // Accept can block until sufficient resources are freed by other threads.
   void accept(uint64_t resourceUnits);
+
+  // Does not wait for capacity or enqueue. Positive requests cannot bypass waiters;
+  // a zero request succeeds without consuming capacity. Returns false when
+  // capacity is unavailable, including requests larger than the total limit.
+  bool tryAccept(uint64_t resourceUnits);
   void release(uint64_t resourceUnits);
 
   uint64_t currentResourceUsage() const {
@@ -55,6 +63,11 @@ class AdmissionController {
   }
 
  private:
+  // Called under mu_; subtraction remains valid even at UINT64_MAX.
+  bool canAdmitLocked(uint64_t resourceUnits) const {
+    return resourceUnits <= config_.maxLimit - unitsUsed_;
+  }
+
   struct Request {
     uint64_t unitsRequested;
     ContinuePromise promise;

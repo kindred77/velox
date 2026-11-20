@@ -23,6 +23,9 @@
 namespace facebook::velox::common {
 
 void AdmissionController::accept(uint64_t resourceUnits) {
+  if (resourceUnits == 0) {
+    return;
+  }
   ContinueFuture future;
   uint64_t updatedValue = 0;
   VELOX_CHECK_LE(
@@ -31,7 +34,7 @@ void AdmissionController::accept(uint64_t resourceUnits) {
       "A single request cannot exceed the max limit");
   {
     std::lock_guard<std::mutex> l(mu_);
-    if (unitsUsed_ + resourceUnits > config_.maxLimit) {
+    if (!queue_.empty() || !canAdmitLocked(resourceUnits)) {
       Request req;
       req.unitsRequested = resourceUnits;
       future = req.promise.getSemiFuture();
@@ -62,6 +65,24 @@ void AdmissionController::accept(uint64_t resourceUnits) {
   }
 }
 
+bool AdmissionController::tryAccept(uint64_t resourceUnits) {
+  if (resourceUnits == 0) {
+    return true;
+  }
+  uint64_t updatedValue;
+  {
+    std::lock_guard<std::mutex> l(mu_);
+    if (!queue_.empty() || !canAdmitLocked(resourceUnits)) {
+      return false;
+    }
+    updatedValue = unitsUsed_ += resourceUnits;
+  }
+  if (!config_.resourceUsageAvgMetric.empty()) {
+    RECORD_METRIC_VALUE(config_.resourceUsageAvgMetric, updatedValue);
+  }
+  return true;
+}
+
 void AdmissionController::release(uint64_t resourceUnits) {
   uint64_t updatedValue = 0;
   {
@@ -73,7 +94,7 @@ void AdmissionController::release(uint64_t resourceUnits) {
     unitsUsed_ -= resourceUnits;
     while (!queue_.empty()) {
       auto& request = queue_.front();
-      if (unitsUsed_ + request.unitsRequested > config_.maxLimit) {
+      if (!canAdmitLocked(request.unitsRequested)) {
         break;
       }
       unitsUsed_ += request.unitsRequested;
