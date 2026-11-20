@@ -18,6 +18,7 @@
 
 #include <atomic>
 
+#include "velox/common/base/CheckedArithmetic.h"
 #include "velox/common/memory/RawVector.h"
 #include "velox/exec/Aggregate.h"
 #include "velox/exec/ContainerRowSerde.h"
@@ -1142,11 +1143,23 @@ int64_t RowContainer::sizeIncrement(
   // Small containers can grow in smaller units but for spilling the practical
   // minimum increment is a huge page.
   constexpr int32_t kAllocUnit = memory::AllocationTraits::kHugePageSize;
-  int32_t needRows = std::max<int64_t>(0, numRows - numFreeRows_);
-  int64_t needBytes =
-      std::max<int64_t>(0, variableLengthBytes - stringAllocator_->freeSpace());
-  return bits::roundUp(needRows * fixedRowSize_, kAllocUnit) +
-      bits::roundUp(needBytes, kAllocUnit);
+  const int64_t needRows = numRows > 0 && uint64_t(numRows) > numFreeRows_
+      ? int64_t(uint64_t(numRows) - numFreeRows_)
+      : 0;
+  const auto freeBytes = stringAllocator_->freeSpace();
+  const int64_t needBytes = variableLengthBytes > 0 &&
+          uint64_t(variableLengthBytes) > freeBytes
+      ? int64_t(uint64_t(variableLengthBytes) - freeBytes)
+      : 0;
+  const auto roundToAllocUnit = [](int64_t bytes) {
+    return checkedPlus(bytes, int64_t(kAllocUnit - 1)) &
+        ~int64_t(kAllocUnit - 1);
+  };
+  // Match newRow's payload, including normalized keys. Unrepresentable caps
+  // must fail before callers use a wrapped result as a reservation bound.
+  return checkedPlus(
+      roundToAllocUnit(checkedMultiply(needRows, int64_t(rowStride()))),
+      roundToAllocUnit(needBytes));
 }
 
 void RowContainer::skip(RowContainerIterator& iter, int32_t numRows) const {
