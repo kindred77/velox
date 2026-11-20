@@ -428,7 +428,9 @@ class BaseHashTable {
   virtual HashTableStats stats() const = 0;
 
   /// Returns table growth in bytes after adding 'numNewDistinct' distinct
-  /// entries. This only concerns the hash table, not the payload rows.
+  /// entries. This only concerns the hash table, not the payload rows. It
+  /// follows generic/normalized rehash sizing; value-dependent array mode
+  /// transitions require separate allocation authorization.
   virtual uint64_t hashTableSizeIncrease(int32_t numNewDistinct) const = 0;
 
   /// Returns the estimated new hash table size in bytes with the given number
@@ -777,15 +779,7 @@ class HashTable : public BaseHashTable {
       SelectivityVector& rows,
       int8_t spillInputStartPartitionBit) override;
 
-  uint64_t hashTableSizeIncrease(int32_t numNewDistinct) const override {
-    if (numDistinct_ + numNewDistinct > rehashSize()) {
-      // If rehashed, the table adds size_ entries (i.e. doubles),
-      // adding one pointer worth for each new position.  (16 tags, 16 6 byte
-      // pointers, 16 bytes padding).
-      return capacity_ * tableSlotSize();
-    }
-    return 0;
-  }
+  uint64_t hashTableSizeIncrease(int32_t numNewDistinct) const override;
 
   uint64_t estimateHashTableSize(uint64_t numDistinct) const override {
     // Take the max of max size in array mode and estimated size in non-array
@@ -899,6 +893,15 @@ class HashTable : public BaseHashTable {
   static uint64_t rehashSize(int64_t size) {
     return size * kHashTableLoadFactor;
   }
+
+  struct TableAllocationPlan {
+    uint64_t capacity;
+    bool allocate;
+    bool rehash;
+  };
+
+  // Same-capacity tombstone cleanup is still an allocation and rehash.
+  TableAllocationPlan planTableAllocation(int32_t numNew) const;
 
   // Returns the number of entries with 'numNew' and existing 'numDistincts'
   // distincts to create a new hash table.

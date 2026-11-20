@@ -1093,6 +1093,39 @@ void HashTable<ignoreNullKeys>::clear(bool freeTable) {
 }
 
 template <bool ignoreNullKeys>
+typename HashTable<ignoreNullKeys>::TableAllocationPlan
+HashTable<ignoreNullKeys>::planTableAllocation(int32_t numNew) const {
+  VELOX_CHECK_GE(numNew, 0);
+  if (table_ == nullptr || capacity_ == 0) {
+    return {newHashTableEntries(numDistinct_, numNew), true, numDistinct_ > 0};
+  }
+  const auto newNumDistincts = checkedPlus(numDistinct_, int64_t(numNew));
+  if (newNumDistincts > rehashSize()) {
+    // Reserve a free slot even when the requested count is a power of two.
+    return {bits::nextPowerOfTwo(checkedPlus(
+                std::max(newNumDistincts, capacity_ - numTombstones_), int64_t(1))),
+            true,
+            true};
+  }
+  return {uint64_t(capacity_), false, false};
+}
+
+template <bool ignoreNullKeys>
+uint64_t HashTable<ignoreNullKeys>::hashTableSizeIncrease(
+    int32_t numNewDistinct) const {
+  VELOX_CHECK_GE(numNewDistinct, 0);
+  if (numNewDistinct == 0) {
+    return 0;
+  }
+  const auto newCapacity = planTableAllocation(numNewDistinct).capacity;
+  if (newCapacity <= uint64_t(capacity_)) {
+    return 0;
+  }
+  return checkedMultiply(
+      newCapacity - uint64_t(capacity_), uint64_t(tableSlotSize()));
+}
+
+template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::checkSize(
     int32_t numNew,
     bool initNormalizedKeys,
@@ -1107,25 +1140,12 @@ void HashTable<ignoreNullKeys>::checkSize(
       numTombstones_,
       hashMode_);
 
-  const int64_t newNumDistincts = numNew + numDistinct_;
-  if (table_ == nullptr || capacity_ == 0) {
-    const auto newSize = newHashTableEntries(numDistinct_, numNew);
-    allocateTables(newSize, spillInputStartPartitionBit);
-    if (numDistinct_ > 0) {
+  const auto allocation = planTableAllocation(numNew);
+  if (allocation.allocate) {
+    allocateTables(allocation.capacity, spillInputStartPartitionBit);
+    if (allocation.rehash) {
       rehash(initNormalizedKeys, spillInputStartPartitionBit);
     }
-    // We are not always able to reuse a tombstone slot as a free one for hash
-    // collision handling purpose. For example, if all the table slots are
-    // either occupied or tombstone, then we can't store any new entry in the
-    // table. Also, if there is non-trivial amount of tombstone slots in table,
-    // then the table lookup will become slow. Given that, we treat tombstone
-    // slot as non-empty slot here to decide whether to trigger rehash or not.
-  } else if (newNumDistincts > rehashSize()) {
-    // NOTE: we need to plus one here as number itself could be power of two.
-    const auto newCapacity = bits::nextPowerOfTwo(
-        std::max(newNumDistincts, capacity_ - numTombstones_) + 1);
-    allocateTables(newCapacity, spillInputStartPartitionBit);
-    rehash(initNormalizedKeys, spillInputStartPartitionBit);
   }
 }
 
