@@ -153,6 +153,9 @@ class TaskCursor {
 
   static std::unique_ptr<TaskCursor> create(const CursorParameters& params);
 
+  /// Owned CPU executor for a query. Its lifetime must cover all query Tasks.
+  static std::shared_ptr<folly::Executor> createQueryExecutor();
+
   /// Starts the task if not started yet.
   virtual void start() = 0;
 

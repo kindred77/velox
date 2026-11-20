@@ -286,8 +286,7 @@ class MultiThreadedTaskCursor : public TaskCursorBase {
   explicit MultiThreadedTaskCursor(const CursorParameters& params)
       : TaskCursorBase(
             params,
-            std::make_shared<folly::CPUThreadPoolExecutor>(
-                folly::available_concurrency())),
+            params.queryCtx ? nullptr : TaskCursor::createQueryExecutor()),
         maxDrivers_{params.maxDrivers},
         numConcurrentSplitGroups_{params.numConcurrentSplitGroups},
         numSplitGroups_{params.numSplitGroups} {
@@ -917,8 +916,7 @@ class TaskDebuggerParallelCursor : public TaskDebuggerCursorBase {
   explicit TaskDebuggerParallelCursor(const CursorParameters& params)
       : TaskDebuggerCursorBase(
             params,
-            std::make_shared<folly::CPUThreadPoolExecutor>(
-                folly::available_concurrency())),
+            params.queryCtx ? nullptr : TaskCursor::createQueryExecutor()),
         maxDrivers_(params.maxDrivers),
         numConcurrentSplitGroups_(params.numConcurrentSplitGroups) {
     // Installs the required trace provider.
@@ -1070,6 +1068,11 @@ bool RowCursor::next() {
     decoded_[i]->decode(*vector->childAt(i), allRows_);
   }
   return true;
+}
+
+std::shared_ptr<folly::Executor> TaskCursor::createQueryExecutor() {
+  return std::make_shared<folly::CPUThreadPoolExecutor>(
+      folly::available_concurrency());
 }
 
 std::unique_ptr<TaskCursor> TaskCursor::create(const CursorParameters& params) {
