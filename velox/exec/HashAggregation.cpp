@@ -27,6 +27,18 @@
 using facebook::velox::common::testutil::TestValue;
 
 namespace facebook::velox::exec {
+namespace {
+bool skipEmptyGlobalPartialEnabled() {
+  // Experimental until every state consumer's empty-input finalization and
+  // the complete query resource bounds have been validated.
+  static const bool enabled = [] {
+    const char* value = std::getenv("YIHUDB_SKIP_EMPTY_GLOBAL_PARTIAL");
+    return value != nullptr && std::atoi(value) != 0;
+  }();
+  return enabled;
+}
+} // namespace
+
 
 HashAggregation::HashAggregation(
     int32_t operatorId,
@@ -361,6 +373,16 @@ void HashAggregation::maybeIncreasePartialAggregationMemoryUsage(
 RowVectorPtr HashAggregation::getOutput() {
   if (finished_) {
     input_ = nullptr;
+    return nullptr;
+  }
+  // An empty raw partial contributes no values. Avoid materializing an
+  // identity state on every empty driver; the final global aggregate owns
+  // SQL's empty-input default. Keep SINGLE, intermediate and drain semantics.
+  if (isGlobal_ && isPartialOutput_ && isRawInput_ && noMoreInput_ &&
+      numInputRows_ == 0 && !isDraining() && skipEmptyGlobalPartialEnabled()) {
+    addRuntimeStat("emptyGlobalPartialSkipped", RuntimeCounter(1));
+    input_ = nullptr;
+    finished_ = true;
     return nullptr;
   }
   if (abandonedPartialAggregation_) {
