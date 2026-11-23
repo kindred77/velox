@@ -14,16 +14,27 @@
  * limitations under the License.
  */
 #include "velox/exec/HashAggregation.h"
+#include "velox/exec/AggregationResourceDomains.h"
+#include "velox/core/AggregationResourcePolicy.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 
 #include <optional>
+#include <limits>
+#include "velox/core/QueryCtx.h"
 #include "velox/common/testutil/TestValue.h"
+#include "velox/common/base/AdmissionController.h"
+#include "velox/common/memory/AllocationPreparation.h"
+#include "velox/common/memory/Memory.h"
 #include "velox/exec/OperatorType.h"
+#include "velox/exec/OperatorUtils.h"
 #include "velox/exec/PrefixSort.h"
 #include "velox/exec/Task.h"
 #include "velox/expression/Expr.h"
+#include "velox/vector/VectorTypeUtils.h"
+#include "velox/vector/EncodedVectorCopy.h"
 
 using facebook::velox::common::testutil::TestValue;
 
@@ -40,6 +51,29 @@ bool skipEmptyGlobalPartialEnabled() {
 }
 } // namespace
 
+struct HashAggregation::BoundedRunState {
+  explicit BoundedRunState(std::shared_ptr<common::AdmissionController> owner)
+      : budget(std::move(owner)) {}
+  std::shared_ptr<common::AdmissionController> budget;
+  RowVectorPtr input;
+  vector_size_t offset{0};
+  vector_size_t rows{1};
+  vector_size_t retryRows{0};
+  uint64_t grant{0};
+  std::optional<uint64_t> retainedInputBytes;
+  bool eof{false};
+  std::optional<common::AdmissionReservation> reservation;
+  ContinueFuture future{ContinueFuture::makeEmpty()};
+};
+
+HashAggregation::~HashAggregation() = default;
+
+bool HashAggregation::needsInput() const {
+  if (boundedRun_) {
+    return !boundedRun_->eof && !boundedRun_->input && !boundedRun_->reservation;
+  }
+  return !noMoreInput_ && !partialFull_;
+}
 
 HashAggregation::HashAggregation(
     int32_t operatorId,
@@ -82,17 +116,55 @@ HashAggregation::HashAggregation(
           driverCtx->queryConfig().maxPartialAggregationMemoryUsage()) {}
 
 void HashAggregation::initialize() {
+  if (const auto& policy = aggregationNode_->resourcePolicy()) {
+    policy->validate();
+    for (const auto& resource : policy->inputResources) {
+      VELOX_USER_CHECK(resource.has_value(),
+          "Aggregate has no bounded-run resource contract");
+    }
+    auto domains = operatorCtx_->task()->queryCtx()->registry<AggregationResourceDomains>(
+        AggregationResourceDomains::kRegistryKey);
+    VELOX_USER_CHECK(domains, "Aggregation resource domains are not installed");
+    auto budget = domains->controller(policy->domainId);
+    pool()->setAllocationBudget(budget);
+    boundedRun_ = std::make_unique<BoundedRunState>(std::move(budget));
+  }
   Operator::initialize();
 
   VELOX_CHECK(pool()->trackUsage());
 
+  if (boundedRun_) {
+    VELOX_USER_CHECK(isRawInput_ && !isGlobal_ && !isDistinct_ && !canSpill() &&
+        aggregationNode_->preGroupedKeys().empty() &&
+        aggregationNode_->globalGroupingSets().empty(),
+        "Partial aggregation has no bounded-run execution contract");
+    for (const auto& type : outputType_->children()) {
+      VELOX_USER_CHECK(fixedWidthVectorRowBytes(*type).has_value() ||
+          ((type->isVarchar() || type->isVarbinary()) && !type->providesCustomComparison()),
+          "Output type has no bounded-run execution contract");
+    }
+    // Keep the immutable node as the reconstruction recipe. Preparation may
+    // be discarded; SQL input is consumed only after the work set is complete.
+    return;
+  }
+
+  std::shared_ptr<core::ExpressionEvaluator> evaluator;
+  groupingSet_ = makeGroupingSet(evaluator, true);
+  hasCompactableAggregates_ = groupingSet_->hasCompactableAggregates();
+  aggregationNode_.reset();
+}
+
+std::unique_ptr<GroupingSet> HashAggregation::makeGroupingSet(
+    std::shared_ptr<core::ExpressionEvaluator>& expressionEvaluator,
+    bool setIdentityProjections,
+    AggregateInputResourceContracts resources) {
   const auto& inputType = aggregationNode_->sources()[0]->outputType();
   std::vector<column_index_t> groupingKeyInputChannels;
   std::vector<column_index_t> groupingKeyOutputChannels;
   setupGroupingKeyChannelProjections(
       groupingKeyInputChannels, groupingKeyOutputChannels);
 
-  auto hashers = createVectorHashers(inputType, groupingKeyInputChannels);
+  auto hashers = createVectorHashers(inputType, groupingKeyInputChannels, pool());
   const auto numHashers = hashers.size();
 
   std::vector<column_index_t> preGroupedChannels;
@@ -102,9 +174,8 @@ void HashAggregation::initialize() {
     preGroupedChannels.push_back(channel);
   }
 
-  std::shared_ptr<core::ExpressionEvaluator> expressionEvaluator;
   std::vector<AggregateInfo> aggregateInfos = toAggregateInfo(
-      *aggregationNode_, *operatorCtx_, numHashers, expressionEvaluator);
+      *aggregationNode_, *operatorCtx_, numHashers, expressionEvaluator, false, resources);
 
   // Check that aggregate result type match the output type.
   for (auto i = 0; i < aggregateInfos.size(); i++) {
@@ -118,9 +189,11 @@ void HashAggregation::initialize() {
         core::AggregationNode::toName(aggregationNode_->step()));
   }
 
-  for (auto i = 0; i < hashers.size(); ++i) {
-    identityProjections_.emplace_back(
-        hashers[groupingKeyOutputChannels[i]]->channel(), i);
+  if (setIdentityProjections) {
+    for (auto i = 0; i < hashers.size(); ++i) {
+      identityProjections_.emplace_back(
+          hashers[groupingKeyOutputChannels[i]]->channel(), i);
+    }
   }
 
   std::optional<column_index_t> groupIdChannel;
@@ -130,7 +203,7 @@ void HashAggregation::initialize() {
     VELOX_CHECK(groupIdChannel.has_value());
   }
 
-  groupingSet_ = std::make_unique<GroupingSet>(
+  return std::make_unique<GroupingSet>(
       inputType,
       std::move(hashers),
       std::move(preGroupedChannels),
@@ -147,9 +220,6 @@ void HashAggregation::initialize() {
       operatorCtx_->pool(),
       spillStats_.get());
 
-  hasCompactableAggregates_ = groupingSet_->hasCompactableAggregates();
-
-  aggregationNode_.reset();
 }
 
 void HashAggregation::setupGroupingKeyChannelProjections(
@@ -207,6 +277,43 @@ bool HashAggregation::abandonPartialAggregationEarly(int64_t numOutput) const {
 }
 
 void HashAggregation::addInput(RowVectorPtr input) {
+  if (boundedRun_) {
+    VELOX_CHECK(needsInput());
+    VELOX_USER_CHECK(!input->mayHaveNulls(), "Top-level nullable input has no bounded-run contract");
+    auto children = input->children();
+    {
+      // Loading is a once-only input stage, not reversible preparation. Load
+      // each original key batch before creating any prefix dictionaries.
+      ReclaimableSectionGuard reclaimable(this);
+      const auto& type = aggregationNode_->sources()[0]->outputType();
+      for (const auto& key : aggregationNode_->groupingKeys()) {
+        const auto channel = exprToChannel(key.get(), type);
+        children[channel] = BaseVector::loadedVectorShared(children[channel]);
+      }
+      for (const auto& aggregate : aggregationNode_->aggregates()) {
+        for (const auto& argument : aggregate.call->inputs()) {
+          if (const auto* field = dynamic_cast<const core::FieldAccessTypedExpr*>(argument.get())) {
+            const auto channel = exprToChannel(field, type);
+            children[channel] = BaseVector::loadedVectorShared(children[channel]);
+          }
+        }
+      }
+    }
+    boundedRun_->input = std::make_shared<RowVector>(input->pool(), input->type(),
+        input->nulls(), input->size(), std::move(children));
+    boundedRun_->offset = 0;
+    // Output batching is a delivery preference, not an aggregation working-set
+    // limit. Preparation admits this input run or splits it before SQL updates.
+    boundedRun_->rows = std::max<vector_size_t>(1, input->size());
+    boundedRun_->retryRows = 0;
+    boundedRun_->retainedInputBytes = accountedRetainedBackingBytes(
+        boundedRun_->input, boundedRun_->budget.get());
+    if (boundedRun_->retainedInputBytes.value_or(0) != 0) {
+      addRuntimeStat("partialRetainedInputBytes", RuntimeCounter(
+          *boundedRun_->retainedInputBytes, RuntimeCounter::Unit::kBytes));
+    }
+    return;
+  }
   if (!pushdownChecked_) {
     mayPushdown_ = operatorCtx_->driver()->mayPushdownAggregation(this);
     pushdownChecked_ = true;
@@ -255,6 +362,7 @@ void HashAggregation::addInput(RowVectorPtr input) {
 bool HashAggregation::startDrain() {
   VELOX_CHECK(isDraining());
   VELOX_CHECK(!noMoreInput_);
+  if (boundedRun_) return true;
   VELOX_CHECK(
       !groupingSet_->hasSpilled(),
       "Barrier drain is not supported for spilled hash aggregation");
@@ -264,6 +372,10 @@ bool HashAggregation::startDrain() {
 
 void HashAggregation::finishDrain() {
   if (!isDraining()) {
+    return;
+  }
+  if (boundedRun_) {
+    if (!boundedRun_->input && !boundedRun_->reservation) Operator::finishDrain();
     return;
   }
   groupingSet_->resetTable(/*freeTable=*/false);
@@ -345,7 +457,7 @@ void HashAggregation::maybeIncreasePartialAggregationMemoryUsage(
       (aggregationPct > kPartialMinFinalPct &&
        maxPartialAggregationMemoryUsage_ >=
            maxExtendedPartialAggregationMemoryUsage_)) {
-    groupingSet_->abandonPartialAggregation();
+    groupingSet_->abandonPartialAggregation(false);
     pool()->release();
     abandonedPartialAggregation_ = true;
     return;
@@ -376,7 +488,161 @@ void HashAggregation::maybeIncreasePartialAggregationMemoryUsage(
           maxPartialAggregationMemoryUsage_, RuntimeCounter::Unit::kBytes));
 }
 
+RowVectorPtr HashAggregation::getBoundedOutput() {
+  auto& state = *boundedRun_;
+  while (state.input && state.offset < state.input->size()) {
+    if (state.reservation && !state.reservation->isGranted()) return nullptr;
+    // A reservation wakes an unconsumed run. Temporary contention does not
+    // lower the capacity bound learned from this query's actual hard limit.
+    if (state.reservation) state.retryRows = 0;
+    const auto size = std::min({state.rows,
+        state.retryRows == 0 ? state.rows : state.retryRows,
+        state.input->size() - state.offset});
+    const bool singletonRows = abandonedPartialAggregation_;
+    RowVectorPtr result;
+    bool preparationComplete = false;
+    uint64_t preparedCredit = 0;
+    auto operation = [&] {
+      struct Work {
+        explicit Work(memory::MemoryPool* pool)
+            : resources(memory::StlAllocator<std::optional<core::AggregateInputResourceContract>>(pool)),
+              groups(memory::StlAllocator<char*>(pool)) {}
+        std::vector<std::optional<core::AggregateInputResourceContract>,
+            memory::StlAllocator<std::optional<core::AggregateInputResourceContract>>> resources;
+        BufferPtr mapping;
+        RowVectorPtr input;
+        RowVectorPtr output;
+        std::shared_ptr<core::ExpressionEvaluator> evaluator;
+        std::unique_ptr<GroupingSet> grouping;
+        std::vector<char*, memory::StlAllocator<char*>> groups;
+      };
+      std::unique_ptr<Work> work;
+      {
+        memory::AllocationPreparationScope preparation(pool());
+        auto candidate = std::make_unique<Work>(pool());
+        candidate->mapping = allocateIndices(size, pool());
+        auto* indices = candidate->mapping->asMutable<vector_size_t>();
+        for (vector_size_t i = 0; i < size; ++i) indices[i] = state.offset + i;
+        candidate->input = wrap(size, candidate->mapping,
+            asRowType(state.input->type()), state.input->children(), pool());
+        // The discardable key probe determines the output cardinality before
+        // SQL values are initialized. Allocate its backing during preparation.
+        candidate->output = std::make_shared<RowVector>(pool(), outputType_,
+            nullptr, 0, std::vector<VectorPtr>(outputType_->size()));
+        candidate->resources.resize(aggregationNode_->aggregates().size());
+        candidate->grouping = makeGroupingSet(candidate->evaluator, false,
+            {candidate->resources.data(), candidate->resources.size()});
+        VELOX_USER_CHECK(std::equal(candidate->resources.begin(), candidate->resources.end(),
+            aggregationNode_->resourcePolicy()->inputResources.begin(),
+            aggregationNode_->resourcePolicy()->inputResources.end()),
+            "Aggregate resource contract differs from the planned contract");
+        candidate->grouping->prepareBoundedRun(candidate->input, candidate->output,
+            {candidate->resources.data(), candidate->resources.size()}, singletonRows);
+        if (!singletonRows) candidate->groups.resize(candidate->output->size());
+        preparedCredit = preparation.grantedBytes();
+        work = std::move(candidate);
+      }
+      preparationComplete = true;
+      // A separate strict scope prevents underestimation after input mutation
+      // from becoming a preparation retry. The entire run is already backed.
+      const bool consumed = pool()->tryWithAllocationCredit(0, [&] {
+        work->grouping->addPreparedBoundedInput(work->input, work->output);
+        if (singletonRows) {
+          result = std::move(work->output);
+        } else {
+          work->grouping->noMoreInput(); // EOF of this private partial run.
+          const auto groups = work->grouping->numDistinct();
+          RowContainerIterator iterator;
+          // The entire run is admitted and its output already prepared.
+          // String payload can exceed INT32_MAX; byte batching must not split it.
+          const bool produced = work->grouping->getOutput(work->output->size(),
+              -1, iterator, work->output,
+              folly::Range<char**>(work->groups.data(), work->groups.size()));
+          VELOX_CHECK_EQ(produced, groups != 0);
+          if (produced) {
+            VELOX_CHECK_EQ(work->output->size(), groups, "Partial run must be delivered whole");
+            result = std::move(work->output);
+          }
+        }
+        work->grouping->resetTable(true);
+        work->grouping.reset();
+      });
+      VELOX_CHECK(consumed);
+    };
+    try {
+      if (state.reservation) {
+        auto reservation = std::move(*state.reservation);
+        state.reservation.reset();
+        state.future = ContinueFuture::makeEmpty();
+        pool()->withAllocationCredit(std::move(reservation), operation);
+      } else if (!pool()->tryWithAllocationCredit(state.grant, operation)) {
+        // A peer may be holding a delivered result. Try a smaller atomic run
+        // before waiting for credit that its consumer may not yet release.
+        if (size > 1) {
+          state.retryRows = std::max<vector_size_t>(1, size / 2);
+          state.grant = 0;
+          addRuntimeStat("partialContentionRunSplits", RuntimeCounter(1));
+          continue;
+        }
+        // Unknown backing may retain this same budget. Waiting could require
+        // freeing the very input that this operator must first consume.
+        if (!state.retainedInputBytes) {
+          VELOX_MEM_ALLOC_ERROR("Cannot wait for partial aggregation admission with unknown retained input ownership");
+        }
+        state.reservation.emplace(state.budget->reserveAsync(state.grant));
+        state.future = state.reservation->takeFuture();
+        continue;
+      }
+    } catch (const memory::AllocationPreparationDemand& demand) {
+      if (preparationComplete) throw;
+      VELOX_CHECK_GT(demand.requiredBytes(), state.grant);
+      state.grant = demand.requiredBytes();
+      addRuntimeStat("partialPreparationRefinements", RuntimeCounter(1));
+      // This input cannot be freed while preparing its consumer. Waiting for
+      // its credit would form a producer/consumer cycle even with no peers.
+      // Other owners' bytes may be released, so do not subtract global usage.
+      const auto cap = state.budget->maxResourceUsage();
+      const auto workLimit = cap - std::min(cap, state.retainedInputBytes.value_or(0));
+      if (state.grant > workLimit) {
+        if (size <= 1) {
+          VELOX_MEM_ALLOC_ERROR("Query budget cannot admit the minimum partial run with its retained input");
+        }
+        if (state.retainedInputBytes.value_or(0) != 0) addRuntimeStat("partialRetainedInputRunSplits", RuntimeCounter(1));
+        state.rows = std::max<vector_size_t>(1, size / 2);
+        state.retryRows = 0;
+        state.grant = 0;
+      }
+      continue;
+    }
+    state.offset += size;
+    state.grant = 0;
+    state.retryRows = 0;
+    numInputRows_ += size;
+    numOutputRows_ += result ? result->size() : 0;
+    if (singletonRows) {
+      addRuntimeStat(std::string(kAbandonedPartialAggregationRows), RuntimeCounter(size));
+    } else if (abandonPartialAggregationEarly(numOutputRows_)) {
+      abandonedPartialAggregation_ = true;
+    }
+    addRuntimeStat("boundedPartialRuns", RuntimeCounter(1));
+    addRuntimeStat("boundedPartialInputRows", RuntimeCounter(size));
+    addRuntimeStat("boundedPartialOutputRows", RuntimeCounter(result ? result->size() : 0));
+    addRuntimeStat("partialPreparationCreditBytes",
+        RuntimeCounter(preparedCredit, RuntimeCounter::Unit::kBytes));
+    if (state.offset == state.input->size()) state.input.reset();
+    if (result) return result; // All preparation credit has settled by here.
+  }
+  state.input.reset();
+  finishDrain();
+  if (state.eof) {
+    Operator::noMoreInput();
+    finished_ = true;
+  }
+  return nullptr;
+}
+
 RowVectorPtr HashAggregation::getOutput() {
+  if (boundedRun_) return getBoundedOutput();
   // Finish extraction before destroying state: some EOF paths construct their
   // final result after setting finished_. Returned vectors retain their buffers.
   auto result = [&]() -> RowVectorPtr {
@@ -587,6 +853,10 @@ RowVectorPtr HashAggregation::getDefaultGlobalGroupingSetOutput() {
 }
 
 void HashAggregation::noMoreInput() {
+  if (boundedRun_) {
+    boundedRun_->eof = true;
+    return;
+  }
   updateEstimatedOutputRowSize();
   groupingSet_->noMoreInput();
   Operator::noMoreInput();
@@ -600,6 +870,10 @@ void HashAggregation::noMoreInput() {
 }
 
 BlockingReason HashAggregation::isBlocked(ContinueFuture* future) {
+  if (boundedRun_ && boundedRun_->future.valid()) {
+    *future = std::move(boundedRun_->future);
+    return BlockingReason::kWaitForMemory;
+  }
   if (future_.valid()) {
     *future = std::move(future_);
     return BlockingReason::kWaitForAggregationPeers;
@@ -679,6 +953,8 @@ void HashAggregation::reclaim(
 }
 
 void HashAggregation::close() {
+  boundedRun_.reset();
+  aggregationNode_.reset();
   Operator::close();
 
   output_ = nullptr;

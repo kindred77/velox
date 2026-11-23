@@ -464,7 +464,7 @@ void IndexLookupJoin::initLookupInput() {
     VELOX_CHECK(lookupKeyOrConditionHashers_.empty());
     VELOX_CHECK(!lookupInputChannels_.empty());
     lookupKeyOrConditionHashers_ =
-        createVectorHashers(probeType_, lookupInputChannels_);
+        createVectorHashers(probeType_, lookupInputChannels_, pool());
   };
 
   for (const auto& condition : joinConditions_) {

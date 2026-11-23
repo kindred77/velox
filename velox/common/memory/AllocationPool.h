@@ -40,6 +40,14 @@ class AllocationPool {
   // only be power of 2.
   char* allocateFixed(uint64_t bytes, int32_t alignment = 1);
 
+  /// Upper bound on additional backing bytes for repeated fixed allocations.
+  /// Intended for preauthorization, not an average/spill heuristic. Alignment
+  /// must be a power of two no larger than one page; unsupported layouts must
+  /// use a different bound before updating their data. The pool state and
+  /// configuration must remain unchanged until the matching request sequence.
+  uint64_t fixedAllocationBytesUpperBound(
+      uint64_t count, uint64_t bytes, int32_t alignment = 1) const;
+
   // Starts a new run for variable length allocation. The actual size
   // is at least one machine page. Throws std::bad_alloc if no space.
   void newRun(int64_t preferredSize);

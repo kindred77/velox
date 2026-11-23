@@ -19,12 +19,65 @@
 #include "velox/vector/ConstantVector.h"
 #include "velox/vector/DecodedVector.h"
 #include "velox/vector/FlatMapVector.h"
+#include "velox/vector/FlatVector.h"
 #include "velox/vector/LazyVector.h"
 #include "velox/vector/VectorTypeUtils.h"
 
 namespace facebook::velox {
 
 namespace {
+
+// The alias keeps both the pool and the concrete vector alive without retaining
+// a producer Task. Declaration order releases the vector before its pool.
+struct PoolOwnedVector {
+  std::shared_ptr<memory::MemoryPool> pool;
+  VectorPtr vector;
+};
+
+VectorPtr retainCopyPool(const EncodedVectorCopyOptions& options, VectorPtr vector) {
+  if (!options.poolOwner || !vector) return vector;
+  auto* raw = vector.get();
+  auto owner = std::make_shared<PoolOwnedVector>(PoolOwnedVector{options.poolOwner, std::move(vector)});
+  return VectorPtr(std::move(owner), raw);
+}
+
+bool canReuseFixedBacking(const VectorPtr& vector, memory::MemoryPool* pool) {
+  if (!vector || vector->pool() != pool || !fixedWidthVectorRowBytes(*vector->type())) return false;
+  const auto owned = [pool](const BufferPtr& buffer) {
+    return !buffer || (buffer->pool() == pool && buffer->isPOD() && !buffer->isView());
+  };
+  if (!owned(vector->nulls())) return false;
+  if (vector->encoding() == VectorEncoding::Simple::ROW) {
+    auto* row = vector->asUnchecked<RowVector>();
+    if (row->rawVectorForBatchReader()) return false;
+    for (const auto& child : row->children())
+      if (!canReuseFixedBacking(child, pool)) return false;
+    return true;
+  }
+  return vector->isFlatEncoding() && owned(vector->values());
+}
+
+// createEmptyLike constructs its descendants directly instead of passing
+// through copyImpl. Empty detached vectors still need a live allocation pool.
+void retainEmptyCopyPools(const EncodedVectorCopyOptions& options, VectorPtr& vector) {
+  if (!options.poolOwner || !vector) return;
+  const auto retain = [&](VectorPtr& child) { retainEmptyCopyPools(options, child); };
+  switch (vector->encoding()) {
+    case VectorEncoding::Simple::ROW:
+      for (auto& child : vector->asUnchecked<RowVector>()->children()) retain(child);
+      break;
+    case VectorEncoding::Simple::ARRAY:
+      retain(vector->asUnchecked<ArrayVector>()->elements());
+      break;
+    case VectorEncoding::Simple::MAP:
+      retain(vector->asUnchecked<MapVector>()->mapKeys());
+      retain(vector->asUnchecked<MapVector>()->mapValues());
+      break;
+    default:
+      break;
+  }
+  vector = retainCopyPool(options, std::move(vector));
+}
 
 void copyImpl(
     const EncodedVectorCopyOptions& options,
@@ -453,7 +506,11 @@ VectorPtr newRow(
     const RowVector& source,
     const folly::Range<const BaseVector::CopyRange*>& ranges) {
   auto size = newTargetSize(ranges);
-  auto nulls = newNulls(size, options.pool, source.rawNulls(), ranges);
+  const bool reuseNulls = options.reuseSource && ranges.size() == 1 &&
+      ranges[0].sourceIndex == 0 && ranges[0].targetIndex == 0 &&
+      ranges[0].count == source.size();
+  auto nulls = reuseNulls ? source.nulls()
+      : newNulls(size, options.pool, source.rawNulls(), ranges);
   std::vector<VectorPtr> children(source.childrenSize());
   for (column_index_t i = 0; i < children.size(); ++i) {
     copyImpl(options, source.childAt(i), ranges, children[i], false);
@@ -527,6 +584,7 @@ VectorPtr newFlatMap(
       source.keyType(), source.numDistinctKeys(), options.pool);
   BaseVector::CopyRange keyRange{0, 0, source.numDistinctKeys()};
   distinctKeys->copyRanges(source.distinctKeys().get(), {&keyRange, 1});
+  distinctKeys = retainCopyPool(options, std::move(distinctKeys));
 
   std::vector<VectorPtr> mapValues;
   mapValues.reserve(distinctKeys->size());
@@ -537,6 +595,7 @@ VectorPtr newFlatMap(
       copyImpl(options, source.mapValuesAt(i), ranges, value, false);
     } else {
       value = BaseVector::create(source.valueType(), size, options.pool);
+      value = retainCopyPool(options, std::move(value));
     }
     mapValues.push_back(std::move(value));
   }
@@ -1209,7 +1268,7 @@ void copyIntoExisting(
   }
 }
 
-void copyImpl(
+void copyImplInternal(
     const EncodedVectorCopyOptions& options,
     const VectorPtr& source,
     const folly::Range<const BaseVector::CopyRange*>& ranges,
@@ -1218,10 +1277,18 @@ void copyImpl(
   if (ranges.empty()) {
     if (!target) {
       target = BaseVector::createEmptyLike(source.get(), 0, options.pool);
+      retainEmptyCopyPools(options, target);
     }
     return;
   }
   VELOX_CHECK_GT(source->size(), 0);
+  // A one-row ROW decodes as constant. Keep fresh row containers so every
+  // detached child gets its own pool owner, even when all buffers are reused.
+  if (options.poolOwner && options.reuseSource && !target &&
+      source->encoding() == VectorEncoding::Simple::ROW) {
+    target = newRow(options, *source->asUnchecked<RowVector>(), ranges);
+    return;
+  }
   DecodedVector decodedSource;
   auto sourceBase = decodedSource.decodeAndGetBase(source);
   if (target) {
@@ -1274,6 +1341,16 @@ void copyImpl(
   }
 }
 
+void copyImpl(
+    const EncodedVectorCopyOptions& options,
+    const VectorPtr& source,
+    const folly::Range<const BaseVector::CopyRange*>& ranges,
+    VectorPtr& target,
+    bool targetMutable) {
+  copyImplInternal(options, source, ranges, target, targetMutable);
+  target = retainCopyPool(options, std::move(target));
+}
+
 } // namespace
 
 void encodedVectorCopy(
@@ -1281,6 +1358,12 @@ void encodedVectorCopy(
     const VectorPtr& source,
     const folly::Range<const BaseVector::CopyRange*>& ranges,
     VectorPtr& target) {
+  if (options.poolOwner) {
+    VELOX_CHECK(options.poolOwner.get() == options.pool, "Copy pool owner must match destination pool");
+    VELOX_CHECK(!target, "Pool-owned copy requires a fresh target");
+    VELOX_CHECK(!options.reuseSource || canReuseFixedBacking(source, options.pool),
+        "Pool-owned source reuse requires direct fixed-width backing in one pool");
+  }
   if (options.reuseSource) {
     VELOX_CHECK(source->pool() == options.pool);
   }
@@ -1292,6 +1375,92 @@ void encodedVectorCopy(
       0 <= options.compactNestedThreshold &&
       options.compactNestedThreshold <= 1);
   copyImpl(options, source, ranges, target, target.use_count() == 1);
+}
+
+std::optional<uint64_t> accountedRetainedBackingBytes(
+    const VectorPtr& source, const common::AdmissionController* budget) {
+  if (!source || !budget) return std::nullopt;
+  std::vector<const Buffer*> seenBuffers;
+  std::vector<const BaseVector*> seenVectors;
+  uint64_t bytes = 0;
+  bool known = true;
+  const auto add = [&](const BufferPtr& buffer) {
+    if (!buffer || std::find(seenBuffers.begin(), seenBuffers.end(), buffer.get()) != seenBuffers.end()) return;
+    seenBuffers.push_back(buffer.get());
+    auto* pool = buffer->pool();
+    // Views can retain an opaque releaser. Never infer their resource domain
+    // from the enclosing vector, which may itself just be a projection.
+    if (!pool || buffer->isView() || !buffer->isPOD() ||
+        dynamic_cast<const AlignedBuffer*>(buffer.get()) == nullptr) {
+      known = false;
+      return;
+    }
+    if (pool->allocationBudget().get() != budget) return;
+    const uint64_t mask = pool->alignment() - 1;
+    const uint64_t allocation = checkedPlus(uint64_t(buffer->capacity()), uint64_t(AlignedBuffer::kPaddedSize));
+    bytes = checkedPlus(bytes, checkedPlus(allocation, mask) & ~mask);
+  };
+  const auto visit = [&](auto&& self, const VectorPtr& vector) -> void {
+    if (!vector || std::find(seenVectors.begin(), seenVectors.end(), vector.get()) != seenVectors.end()) return;
+    seenVectors.push_back(vector.get());
+    add(vector->nulls());
+    switch (vector->encoding()) {
+      case VectorEncoding::Simple::ROW: {
+        auto* row = vector->asUnchecked<RowVector>();
+        for (const auto& child : row->children()) self(self, child);
+        self(self, row->rawVectorForBatchReader());
+        break;
+      }
+      case VectorEncoding::Simple::FLAT:
+        if (vector->typeKind() == TypeKind::VARCHAR ||
+            vector->typeKind() == TypeKind::VARBINARY) {
+          add(vector->values());
+          for (const auto& buffer : vector->asUnchecked<FlatVector<StringView>>()->stringBuffers()) add(buffer);
+        } else if (fixedWidthVectorRowBytes(*vector->type())) {
+          add(vector->values());
+        } else {
+          known = false;
+        }
+        break;
+      case VectorEncoding::Simple::DICTIONARY:
+        add(vector->wrapInfo());
+        self(self, vector->valueVector());
+        break;
+      case VectorEncoding::Simple::CONSTANT:
+        // Constant::wrapInfo() materializes an index view on demand. Inline
+        // scalar constants have no backing; complex constants retain a base.
+        self(self, vector->valueVector());
+        if (vector->typeKind() == TypeKind::VARCHAR ||
+            vector->typeKind() == TypeKind::VARBINARY) {
+          add(vector->asUnchecked<ConstantVector<StringView>>()->getStringBuffer());
+        }
+        break;
+      default:
+        known = false; // In particular, do not load a LazyVector to inspect it.
+        break;
+    }
+  };
+  visit(visit, source);
+  if (!known) return std::nullopt;
+  return bytes;
+}
+
+VectorPtr tryReuseAccountedVector(const VectorPtr& source) {
+  if (!source || !source->pool() || !source->pool()->allocationBudget() ||
+      !canReuseFixedBacking(source, source->pool())) return nullptr;
+  auto pool = source->pool()->shared_from_this();
+  VectorPtr result;
+  // This is a resource handoff, not an admission request. Any unexpected
+  // buffer allocation must fail instead of escaping the original domain.
+  const bool reused = pool->tryWithAllocationCredit(0, [&] {
+    EncodedVectorCopyOptions options{.pool = pool.get(), .reuseSource = true, .poolOwner = pool};
+    if (source->size() == 0)
+      encodedVectorCopy(options, source, folly::Range<const BaseVector::CopyRange*>{}, result);
+    else
+      encodedVectorCopy(options, source, result);
+  });
+  VELOX_CHECK(reused, "Zero-credit result handoff must not wait for admission");
+  return result;
 }
 
 } // namespace facebook::velox

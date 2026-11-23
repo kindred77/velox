@@ -183,7 +183,7 @@ TopNRowNumber::TopNRowNumber(
         [](auto) {}};
 
     table_ = std::make_unique<HashTable<false>>(
-        createVectorHashers(node->inputType(), keys),
+        createVectorHashers(node->inputType(), keys, pool()),
         std::vector<Accumulator>{accumulator},
         std::vector<TypePtr>{},
         false, // allowDuplicates

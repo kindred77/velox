@@ -21,6 +21,8 @@
 #include "velox/common/testutil/TestValue.h"
 #include "velox/exec/Driver.h"
 #include "velox/exec/OperatorUtils.h"
+#include "velox/exec/RowContainer.h"
+#include "velox/exec/VectorHasher.h"
 #include "velox/exec/Task.h"
 #include "velox/expression/Expr.h"
 
@@ -507,6 +509,37 @@ std::vector<column_index_t> toChannels(
     channels.push_back(channel);
   }
   return channels;
+}
+
+std::vector<std::unique_ptr<VectorHasher>> createVectorHashers(
+    const RowTypePtr& rowType,
+    const std::vector<core::FieldAccessTypedExprPtr>& keys,
+    memory::MemoryPool* pool) {
+  const auto numKeys = keys.size();
+  std::vector<column_index_t> keyChannels;
+  keyChannels.reserve(numKeys);
+  for (const auto& key : keys) {
+    const auto channel = exprToChannel(key.get(), rowType);
+    keyChannels.push_back(channel);
+  }
+  return createVectorHashers(rowType, keyChannels, pool);
+}
+
+RowComparator::RowComparator(
+    const RowTypePtr& rowType,
+    const std::vector<core::FieldAccessTypedExprPtr>& sortingKeys,
+    const std::vector<core::SortOrder>& sortingOrders,
+    RowContainer* rowContainer)
+    : rowContainer_(rowContainer) {
+  const auto numKeys = sortingKeys.size();
+  for (auto i = 0; i < numKeys; ++i) {
+    const auto channel = exprToChannel(sortingKeys[i].get(), rowType);
+    VELOX_USER_CHECK_NE(
+        channel,
+        kConstantChannel,
+        "RowComparator doesn't allow constant comparison keys");
+    keyInfo_.push_back(std::make_pair(channel, sortingOrders[i]));
+  }
 }
 
 column_index_t exprToChannel(

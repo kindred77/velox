@@ -70,6 +70,12 @@ class GroupingSet {
 
   void addInput(const RowVectorPtr& input, bool mayPushdown);
 
+  /// Pure, discardable preparation of a complete partial run. Unknown resource
+  /// providers fail before any aggregate consumes input.
+  void prepareBoundedRun(const RowVectorPtr& input, const RowVectorPtr& output,
+      ConstAggregateInputResourceContracts resources, bool singletonRows);
+  void addPreparedBoundedInput(const RowVectorPtr& input, RowVectorPtr& output);
+
   void noMoreInput();
 
   /// Typically, the output is not available until all input has been added.
@@ -88,7 +94,8 @@ class GroupingSet {
       int32_t maxOutputRows,
       int32_t maxOutputBytes,
       RowContainerIterator& iterator,
-      RowVectorPtr& result);
+      RowVectorPtr& result,
+      folly::Range<char**> scratch = {});
 
   /// Produces buffered output for a pure distinct aggregation. Unlike the
   /// streaming new-groups path, this walks the retained hash table and is used
@@ -194,7 +201,7 @@ class GroupingSet {
 
   /// Frees hash tables and other state when giving up partial aggregation as
   /// non-productive. Must be called before toIntermediate() is used.
-  void abandonPartialAggregation();
+  void abandonPartialAggregation(bool usePreparedStates);
 
   /// Translates the raw input in input to accumulators initialized from a
   /// single input row. Passes grouping keys through.
@@ -233,7 +240,8 @@ class GroupingSet {
       int32_t maxOutputRows,
       int32_t maxOutputBytes,
       RowContainerIterator& iterator,
-      RowVectorPtr& result);
+      RowVectorPtr& result,
+      folly::Range<char**> scratch = {});
   bool isDistinct() const {
     return aggregates_.empty();
   }
@@ -260,6 +268,8 @@ class GroupingSet {
   }
 
   void createHashTable();
+
+  void addInputForPreparedProbe(const RowVectorPtr& input, bool mayPushdown);
 
   void populateTempVectors(int32_t aggregateIndex, const RowVectorPtr& input);
 
@@ -420,6 +430,7 @@ class GroupingSet {
   std::vector<VectorPtr> tempVectors_;
   std::unique_ptr<BaseHashTable> table_;
   std::unique_ptr<HashLookup> lookup_;
+  const RowVector* preparedBoundedInput_{nullptr};
   SelectivityVector activeRows_;
 
   // Used to allocate memory for a single row accumulating results of global
@@ -497,11 +508,11 @@ class GroupingSet {
   // RowContainer for toIntermediate for aggregates that do not have a
   // toIntermediate() fast path
   std::unique_ptr<RowContainer> intermediateRows_;
-  std::vector<char*> intermediateGroups_;
-  std::vector<vector_size_t> intermediateRowNumbers_;
+  std::vector<char*, memory::StlAllocator<char*>> intermediateGroups_;
+  std::vector<vector_size_t, memory::StlAllocator<vector_size_t>> intermediateRowNumbers_;
   // Temporary for case where an aggregate in toIntermediate() outputs post-init
   // state of aggregate for all rows.
-  std::vector<char*> firstGroup_;
+  std::vector<char*, memory::StlAllocator<char*>> firstGroup_;
 };
 
 class AggregationInputSpiller : public SpillerBase {

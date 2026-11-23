@@ -22,6 +22,30 @@
 
 namespace facebook::velox {
 
+/// Wraps a value as a constant, allocating any new backing from 'pool'.
+/// Existing complex value backing may be borrowed; it is not transferred.
+VectorPtr wrapInConstant(
+    vector_size_t size, vector_size_t index, VectorPtr vector,
+    memory::MemoryPool* pool);
+
+/// Conservative value/null payload bytes per row for fixed scalar/ROW trees.
+/// This excludes allocation rounding and metadata; actual admission still
+/// belongs to the pool. Unsupported or custom-comparison types return unknown.
+std::optional<uint64_t> fixedWidthVectorRowBytes(const Type& type);
+
+/// Creates an independent fixed-width vector tree with value and null buffers
+/// backed for 'size' rows, including ROW parents. Does not copy another vector.
+VectorPtr createFixedWidthVector(
+    const TypePtr& type, vector_size_t size, memory::MemoryPool* pool,
+    bool nullableRoot = true);
+
+/// Checks existing exclusive value/null backing; does not allocate or repair.
+bool hasFixedWidthVectorBacking(const BaseVector& vector, bool nullableRoot = true);
+
+/// Decoding a loaded fixed scalar in these encodings borrows its values/nulls.
+/// Does not certify later indices() materialization or aggregate semantics.
+bool isDirectlyDecodedScalar(const BaseVector& vector);
+
 // Maps TypeKind to the corresponding writable vector.
 template <TypeKind K>
 struct KindToFlatVector {

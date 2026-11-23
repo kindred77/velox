@@ -781,7 +781,8 @@ bool VectorHasher::makeValueIdsForRows<TypeKind::VARCHAR>(
         result[i] = 0;
       }
     } else {
-      std::string storage;
+      StoredString storage{
+          memory::StlAllocator<char>(uniqueValuesStorage_.get_allocator())};
       auto id = valueId<StringView>(HashStringAllocator::contiguousString(
           valueAt<StringView>(groups[i], offset), storage));
       if (id == kUnmappable) {
@@ -1156,13 +1157,15 @@ void VectorHasher::copyStringToLocal(const UniqueValue* unique) {
     return;
   }
   if (uniqueValuesStorage_.empty()) {
-    uniqueValuesStorage_.emplace_back();
+    uniqueValuesStorage_.emplace_back(
+        memory::StlAllocator<char>(uniqueValuesStorage_.get_allocator()));
     uniqueValuesStorage_.back().reserve(std::max(kStringBufferUnitSize, size));
     distinctStringsBytes_ += uniqueValuesStorage_.back().capacity();
   }
   auto str = &uniqueValuesStorage_.back();
   if (str->size() + size > str->capacity()) {
-    uniqueValuesStorage_.emplace_back();
+    uniqueValuesStorage_.emplace_back(
+        memory::StlAllocator<char>(uniqueValuesStorage_.get_allocator()));
     uniqueValuesStorage_.back().reserve(std::max(kStringBufferUnitSize, size));
     distinctStringsBytes_ += uniqueValuesStorage_.back().capacity();
     str = &uniqueValuesStorage_.back();
@@ -1492,26 +1495,14 @@ std::string VectorHasher::toString() const {
 
 std::vector<std::unique_ptr<VectorHasher>> createVectorHashers(
     const RowTypePtr& rowType,
-    const std::vector<core::FieldAccessTypedExprPtr>& keys) {
-  const auto numKeys = keys.size();
-  std::vector<column_index_t> keyChannels;
-  keyChannels.reserve(numKeys);
-  for (const auto& key : keys) {
-    const auto channel = exprToChannel(key.get(), rowType);
-    keyChannels.push_back(channel);
-  }
-  return createVectorHashers(rowType, keyChannels);
-}
-
-std::vector<std::unique_ptr<VectorHasher>> createVectorHashers(
-    const RowTypePtr& rowType,
-    const std::vector<column_index_t>& keyChannels) {
+    const std::vector<column_index_t>& keyChannels,
+    memory::MemoryPool* pool) {
   const auto numKeys = keyChannels.size();
   std::vector<std::unique_ptr<VectorHasher>> hashers;
   hashers.reserve(numKeys);
   for (const auto& keyChannel : keyChannels) {
     hashers.push_back(
-        VectorHasher::create(rowType->childAt(keyChannel), keyChannel));
+        VectorHasher::create(rowType->childAt(keyChannel), keyChannel, pool));
   }
   return hashers;
 }

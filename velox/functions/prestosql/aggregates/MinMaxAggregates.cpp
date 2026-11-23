@@ -597,7 +597,8 @@ std::vector<exec::AggregateRegistrationResult> registerMinMax(
           }
         }
       },
-      {.orderSensitive = false},
+      {.orderSensitive = false,
+       .inputResourceModel = core::AggregateInputResourceModel::kFixedScalarState},
       withCompanionFunctions,
       overwrite);
 }

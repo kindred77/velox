@@ -29,6 +29,17 @@
 namespace facebook::velox::exec {
 namespace {
 
+RowVectorPtr copyCursorResult(
+    const RowVectorPtr& source,
+    const std::shared_ptr<memory::MemoryPool>& outputPool) {
+  VectorPtr result = tryReuseAccountedVector(source);
+  if (!result) {
+    result = encodedVectorCopy(
+        {.pool = outputPool.get(), .reuseSource = false, .poolOwner = outputPool}, source);
+  }
+  return std::static_pointer_cast<RowVector>(std::move(result));
+}
+
 class TaskQueue {
  public:
   struct TaskQueueEntry {
@@ -67,8 +78,8 @@ class TaskQueue {
 
   bool hasNext();
 
-  velox::memory::MemoryPool* pool() const {
-    return pool_.get();
+  const std::shared_ptr<velox::memory::MemoryPool>& pool() const {
+    return pool_;
   }
 
   std::optional<int32_t> numProducers_;
@@ -327,12 +338,7 @@ class MultiThreadedTaskCursor : public TaskCursorBase {
           if (!vector || !copyResult) {
             return queue->enqueue(vector, drained, future);
           }
-          VectorPtr copy = encodedVectorCopy(
-              {.pool = queue->pool(), .reuseSource = false}, vector);
-          return queue->enqueue(
-              std::static_pointer_cast<RowVector>(std::move(copy)),
-              drained,
-              future);
+          return queue->enqueue(copyCursorResult(vector, queue->pool()), drained, future);
         },
         0,
         std::move(spillDiskOpts),
@@ -544,6 +550,9 @@ class SingleThreadedTaskCursor : public TaskCursorBase {
   }
 
   bool moveNext(ContinueFuture* future) override {
+    // current() is valid until the next pull. Its backing may own the credit
+    // needed by Task::next(), so release our reference before advancing.
+    current_.reset();
     while (true) {
       if (!task_->isRunning()) {
         // Surface a cancellation/abort error rather than reporting "done", so
@@ -559,9 +568,7 @@ class SingleThreadedTaskCursor : public TaskCursorBase {
       RowVectorPtr next = task_->next(&waitFuture);
       if (next != nullptr) {
         if (outputPool_ && copyResult_) {
-          VectorPtr copy = encodedVectorCopy(
-              {.pool = outputPool_.get(), .reuseSource = false}, next);
-          current_ = std::static_pointer_cast<RowVector>(std::move(copy));
+          current_ = copyCursorResult(next, outputPool_);
         } else {
           current_ = next;
         }

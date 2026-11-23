@@ -127,7 +127,7 @@ void ColumnStatsCollector::createGroupingSet() {
   auto [groupingKeyInputChannels, groupingKeyOutputChannels] =
       setupGroupingKeyChannelProjections();
 
-  auto hashers = createVectorHashers(inputType_, groupingKeyInputChannels);
+  auto hashers = createVectorHashers(inputType_, groupingKeyInputChannels, pool_);
   const auto numHashers = hashers.size();
 
   // Setup aggregates based on the column stats specifications

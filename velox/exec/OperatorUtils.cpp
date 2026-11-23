@@ -21,6 +21,7 @@
 #include "velox/vector/ConstantVector.h"
 #include "velox/vector/FlatVector.h"
 #include "velox/vector/LazyVector.h"
+#include "velox/vector/VectorTypeUtils.h"
 
 namespace facebook::velox::exec {
 
@@ -397,7 +398,14 @@ RowVectorPtr wrap(
   std::vector<VectorPtr> wrappedChildren;
   wrappedChildren.reserve(childVectors.size());
   for (auto& child : childVectors) {
-    wrappedChildren.emplace_back(wrapChild(size, mapping, child));
+    if (child->isConstantEncoding() && size != child->size()) {
+      // Constant folding can allocate NULL/string backing. Charge new
+      // wrapping to the destination rather than the immutable source pool.
+      wrappedChildren.emplace_back(
+          facebook::velox::wrapInConstant(size, 0, child, pool));
+    } else {
+      wrappedChildren.emplace_back(wrapChild(size, mapping, child));
+    }
   }
   return std::make_shared<RowVector>(
       pool, rowType, nullptr, size, wrappedChildren);

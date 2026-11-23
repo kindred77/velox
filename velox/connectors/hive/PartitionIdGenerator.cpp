@@ -30,7 +30,7 @@ PartitionIdGenerator::PartitionIdGenerator(
       !partitionChannels_.empty(), "There must be at least one partition key.");
   for (auto channel : partitionChannels_) {
     hashers_.emplace_back(
-        exec::VectorHasher::create(inputType->childAt(channel), channel));
+        exec::VectorHasher::create(inputType->childAt(channel), channel, pool_));
     VELOX_USER_CHECK(
         hashers_.back()->typeSupportsValueIds(),
         "Unsupported partition type: {}.",

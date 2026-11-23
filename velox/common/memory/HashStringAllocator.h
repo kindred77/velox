@@ -23,6 +23,9 @@
 #include "velox/type/StringView.h"
 
 #include <folly/container/F14Map.h>
+#include <functional>
+#include <limits>
+#include <utility>
 
 namespace facebook::velox {
 
@@ -199,10 +202,17 @@ class HashStringAllocator : public StreamArena {
     copyMultipartNoInline(str, group, offset);
   }
 
+  /// 'view' must originate from copyMultipart(), as for contiguousString().
+  static bool isContiguous(StringView view) {
+    return view.isInline() || view.size() <= headerOf(view.data())->size();
+  }
+
   /// Returns a contiguous view on 'view', where 'view' comes from
   /// copyMultipart(). Uses 'storage' to own a possible temporary copy. Making a
   /// temporary copy only happens for non-contiguous strings.
-  static StringView contiguousString(StringView view, std::string& storage);
+  template <typename Allocator>
+  static StringView contiguousString(StringView view,
+      std::basic_string<char, std::char_traits<char>, Allocator>& storage);
 
   /// Allocates 'size' contiguous bytes preceded by a Header. Returns the
   /// address of Header.
@@ -297,7 +307,20 @@ class HashStringAllocator : public StreamArena {
 
   /// Returns the total memory footprint of 'this'.
   int64_t retainedSize() const {
-    return state_.pool().allocatedBytes() + state_.sizeFromPool();
+    auto retained =
+        checkedPlus(state_.pool().allocatedBytes(), state_.sizeFromPool());
+    const auto& registrations = state_.allocationsFromPool();
+    if (registrations.bucket_count() != 0) {
+      registrations.visitAllocationClasses([&](size_t bytes, size_t count) {
+        if (count != 0) {
+          retained = checkedPlus(
+              retained,
+              checkedMultiply(
+                  poolAllocationBytes(bytes), static_cast<int64_t>(count)));
+        }
+      });
+    }
+    return retained;
   }
 
   /// Adds the allocation of 'header' and any extensions (if header has
@@ -352,6 +375,14 @@ class HashStringAllocator : public StreamArena {
   }
 
  private:
+  int64_t poolAllocationBytes(uint64_t bytes) const {
+    const auto padding = static_cast<uint64_t>(pool()->alignment() - 1);
+    VELOX_CHECK_LE(
+        bytes,
+        static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) - padding);
+    return static_cast<int64_t>((bytes + padding) & ~padding);
+  }
+
   static constexpr int32_t kUnitSize = 16 * memory::AllocationTraits::kPageSize;
   static constexpr int32_t kMinContiguous = 48;
   static constexpr int32_t kNumFreeLists = kMaxAlloc - kMinAlloc + 2;
@@ -412,7 +443,9 @@ class HashStringAllocator : public StreamArena {
   /// HashStringAllocator is frozen will cause an exception to be thrown.
   class State {
    public:
-    explicit State(memory::MemoryPool* pool) : pool_(pool) {}
+    explicit State(memory::MemoryPool* pool)
+        : pool_(pool),
+          allocationsFromPool_(AllocationsFromPool::allocator_type(pool)) {}
 
     void freeze() {
       VELOX_CHECK(
@@ -459,7 +492,12 @@ class HashStringAllocator : public StreamArena {
 
     typedef CompactDoubleList FreeList[kNumFreeLists];
     typedef uint64_t FreeNonEmptyBitMap[bits::nwords(kNumFreeLists)];
-    typedef folly::F14FastMap<void*, size_t> AllocationsFromPool;
+    using AllocationsFromPool = folly::F14FastMap<
+        void*,
+        size_t,
+        std::hash<void*>,
+        std::equal_to<void*>,
+        memory::StlAllocator<std::pair<void* const, size_t>>>;
 
     // Circular list of free blocks.
     DECLARE_FIELD(FreeList, freeLists);
@@ -491,7 +529,7 @@ class HashStringAllocator : public StreamArena {
     // Map from pointer to size for large blocks allocated from pool().
     DECLARE_FIELD(AllocationsFromPool, allocationsFromPool);
 
-    // Sum of sizes in 'allocationsFromPool_'.
+    // Pool-aligned payload bytes in 'allocationsFromPool_', excluding its metadata.
     DECLARE_FIELD_WITH_INIT_VALUE(int64_t, sizeFromPool, 0);
 
 #undef DECLARE_FIELD_WITH_INIT_VALUE
@@ -648,6 +686,16 @@ class HashStringAllocator::InputStream : public ByteInputStream {
   Header* header_;
   ByteRange range_;
 };
+
+template <typename Allocator>
+StringView HashStringAllocator::contiguousString(StringView view,
+    std::basic_string<char, std::char_traits<char>, Allocator>& storage) {
+  if (isContiguous(view)) return view;
+  InputStream stream(headerOf(view.data()));
+  storage.resize(view.size());
+  stream.ByteInputStream::readBytes(storage.data(), view.size());
+  return StringView(storage.data(), view.size());
+}
 
 /// Utility for keeping track of allocation between two points in time. A
 /// counter on a row supplied at construction is incremented by the change in

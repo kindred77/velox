@@ -17,6 +17,9 @@
 #include "velox/exec/Aggregate.h"
 
 #include <unordered_map>
+#include <algorithm>
+#include <limits>
+#include "velox/exec/AggregateFunctionRegistry.h"
 #include "velox/exec/AggregateCompanionAdapter.h"
 #include "velox/exec/AggregateCompanionSignatures.h"
 #include "velox/exec/window/AggregateWindow.h"
@@ -93,6 +96,7 @@ AggregateRegistrationResult registerAggregateFunction(
   if (registerCompanionFunctions) {
     auto companionMetadata = metadata;
     companionMetadata.companionFunction = true;
+    companionMetadata.inputResourceModel = core::AggregateInputResourceModel::kUnknown;
 
     registered.partialFunction =
         CompanionFunctionsRegistrar::registerPartialFunction(
@@ -289,12 +293,124 @@ std::optional<CompanionFunctionSignatureMap> getCompanionFunctionSignatures(
   return companionSignatures;
 }
 
+namespace {
+
+std::optional<AggregateFunctionEntry> captureAggregate(const std::string& name) {
+  const auto sanitized = sanitizeName(name);
+  return aggregateFunctions().withRLock(
+      [&](const auto& functions) -> std::optional<AggregateFunctionEntry> {
+        const auto it = functions.find(sanitized);
+        return it == functions.end() ? std::nullopt
+                                    : std::optional<AggregateFunctionEntry>(it->second);
+      });
+}
+
+std::optional<uint32_t> fixedPrimitiveSize(const TypePtr& type) {
+  if (!type || !type->isPrimitiveType() || !type->isFixedWidth() ||
+      type->providesCustomComparison()) {
+    return std::nullopt;
+  }
+  const auto size = type->cppSizeInBytes();
+  if (!size || size > 16 || (size & (size - 1))) {
+    return std::nullopt;
+  }
+  return static_cast<uint32_t>(size);
+}
+
+std::optional<core::AggregateInputResourceContract> resourceContract(
+    const AggregateFunctionEntry& entry,
+    core::AggregationNode::Step step,
+    const std::vector<TypePtr>& inputs,
+    const TypePtr& output,
+    const TypePtr& intermediate) {
+  const auto model = entry.metadata.inputResourceModel;
+  if (!isRawInput(step) || entry.metadata.companionFunction ||
+      model == core::AggregateInputResourceModel::kUnknown || inputs.size() > 1 ||
+      !output || !intermediate || !output->equivalent(*intermediate)) {
+    return std::nullopt;
+  }
+  for (const auto& input : inputs) {
+    if (!fixedPrimitiveSize(input)) {
+      return std::nullopt;
+    }
+  }
+  uint64_t bytes = 0;
+  uint32_t alignment = 1;
+  if (model == core::AggregateInputResourceModel::kFixedScalarState) {
+    const auto size = fixedPrimitiveSize(intermediate);
+    if (!size) {
+      return std::nullopt;
+    }
+    bytes = alignment = *size;
+  } else if (model == core::AggregateInputResourceModel::kFixedRowState) {
+    if (!intermediate->isRow() || intermediate->size() == 0) {
+      return std::nullopt;
+    }
+    for (const auto& field : intermediate->asRow().children()) {
+      const auto size = fixedPrimitiveSize(field);
+      if (!size) {
+        return std::nullopt;
+      }
+      // Native field size is a conservative alignment bound. Limit after each
+      // field, so subsequent align-up arithmetic cannot overflow uint64_t.
+      bytes = ((bytes + *size - 1) / *size) * *size + *size;
+      if (bytes > std::numeric_limits<uint32_t>::max()) {
+        return std::nullopt;
+      }
+      alignment = std::max(alignment, *size);
+    }
+    bytes = ((bytes + alignment - 1) / alignment) * alignment;
+  } else {
+    return std::nullopt;
+  }
+  if (bytes > std::numeric_limits<uint32_t>::max()) {
+    return std::nullopt;
+  }
+  return core::AggregateInputResourceContract{
+      static_cast<uint32_t>(bytes), alignment,
+      static_cast<uint32_t>(inputs.size()), model};
+}
+
+} // namespace
+
+std::optional<core::AggregateInputResourceContract> getAggregateInputResourceContract(
+    const std::string& name,
+    core::AggregationNode::Step step,
+    const std::vector<TypePtr>& rawInputTypes,
+    const TypePtr& outputType) {
+  const auto entry = captureAggregate(name);
+  if (!entry) {
+    return std::nullopt;
+  }
+  const auto intermediate =
+      tryResolveIntermediateType(entry->signatures, rawInputTypes);
+  return resourceContract(
+      *entry, step, rawInputTypes, outputType,
+      intermediate ? *intermediate : nullptr);
+}
+
 std::unique_ptr<Aggregate> Aggregate::create(
     const std::string& name,
     core::AggregationNode::Step step,
     const std::vector<TypePtr>& argTypes,
     const TypePtr& resultType,
-    const core::QueryConfig& config) {
+    const core::QueryConfig& config,
+    AggregateResourceConstructionInfo* resources) {
+  if (resources) {
+    const auto entry = captureAggregate(name);
+    VELOX_USER_CHECK(entry.has_value(), "Aggregate function not registered: {}", name);
+    const auto intermediate = tryResolveIntermediateType(entry->signatures, argTypes);
+    const auto contract = resourceContract(
+        *entry, step, argTypes, resultType,
+        intermediate ? *intermediate : nullptr);
+    VELOX_USER_CHECK(
+        contract.has_value(), "Aggregate has no bounded-run resource contract");
+    // The owned snapshot survives registry overwrite; factories run outside
+    // the lock and may themselves register functions.
+    auto aggregate = entry->factory(step, argTypes, resultType, config);
+    *resources = {entry->metadata, *intermediate, *contract};
+    return aggregate;
+  }
   // Lookup the function in the new registry first.
   if (auto func = getAggregateFunctionEntry(name)) {
     return func->factory(step, argTypes, resultType, config);

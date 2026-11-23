@@ -20,6 +20,8 @@
 #include <chrono>
 #include <future>
 #include <limits>
+#include <optional>
+#include <folly/executors/InlineExecutor.h>
 #include "velox/common/base/VeloxException.h"
 #include "velox/common/base/tests/GTestUtils.h"
 
@@ -185,6 +187,172 @@ TEST(AdmissionController, nonblockingConcurrentResourceOwnership) {
   EXPECT_GT(acquired.load(), 0);
   EXPECT_EQ(live.load(), 0);
   EXPECT_EQ(controller.currentResourceUsage(), 0);
+}
+
+TEST(AdmissionController, asyncReservationOwnsGrantUntilClaimOrCancellation) {
+  AdmissionController::Config config;
+  config.maxLimit = 10;
+  auto controller = std::make_shared<AdmissionController>(config);
+  {
+    auto reservation = controller->reserveAsync(6);
+    auto ready = reservation.takeFuture();
+    EXPECT_TRUE(ready.isReady());
+    EXPECT_TRUE(reservation.isGranted());
+    EXPECT_EQ(controller->currentResourceUsage(), 6);
+    EXPECT_EQ(reservation.claim(), 6);
+    EXPECT_THROW(reservation.claim(), std::exception);
+  }
+  EXPECT_EQ(controller->currentResourceUsage(), 6);
+  controller->release(6);
+  {
+    auto reservation = controller->reserveAsync(10);
+    EXPECT_TRUE(reservation.isGranted());
+  }
+  EXPECT_EQ(controller->currentResourceUsage(), 0);
+  EXPECT_THROW(controller->reserveAsync(11), std::exception);
+  auto zero = controller->reserveAsync(0);
+  EXPECT_TRUE(zero.takeFuture().isReady());
+  EXPECT_EQ(zero.claim(), 0);
+}
+
+TEST(AdmissionController, asyncCancellationUnblocksFifoWithoutBypass) {
+  AdmissionController::Config config;
+  config.maxLimit = 10;
+  auto controller = std::make_shared<AdmissionController>(config);
+  controller->accept(10);
+  auto head = controller->reserveAsync(8);
+  auto tail = controller->reserveAsync(3);
+  auto headReady = head.takeFuture();
+  auto tailReady = tail.takeFuture();
+  EXPECT_FALSE(headReady.isReady());
+  EXPECT_FALSE(tailReady.isReady());
+  EXPECT_THROW(head.claim(), std::exception);
+  controller->release(4);
+  EXPECT_FALSE(controller->tryAccept(1));
+  EXPECT_FALSE(tailReady.isReady());
+  head.cancel();
+  EXPECT_TRUE(headReady.isReady());
+  EXPECT_FALSE(head.isGranted());
+  EXPECT_TRUE(tailReady.isReady());
+  EXPECT_TRUE(tail.isGranted());
+  EXPECT_EQ(controller->currentResourceUsage(), 9);
+  tail.cancel();
+  tail.cancel();
+  EXPECT_EQ(controller->currentResourceUsage(), 6);
+  controller->release(6);
+}
+
+TEST(AdmissionController, asyncWakeCanReenterController) {
+  AdmissionController::Config config;
+  config.maxLimit = 10;
+  auto controller = std::make_shared<AdmissionController>(config);
+  controller->accept(10);
+  auto reservation = controller->reserveAsync(5);
+  auto callback = reservation.takeFuture().via(&folly::InlineExecutor::instance())
+      .thenValue([&](auto&&) {
+        EXPECT_EQ(controller->currentResourceUsage(), 5);
+        EXPECT_TRUE(controller->tryAccept(1));
+        controller->release(1);
+      });
+  controller->release(10);
+  EXPECT_TRUE(callback.isReady());
+  std::move(callback).get();
+  reservation.cancel();
+  EXPECT_EQ(controller->currentResourceUsage(), 0);
+}
+
+TEST(AdmissionController, asyncMoveCancelsPreviousOwnershipAndKeepsControllerAlive) {
+  AdmissionController::Config config;
+  config.maxLimit = 10;
+  auto controller = std::make_shared<AdmissionController>(config);
+  std::weak_ptr<AdmissionController> weak = controller;
+  auto old = controller->reserveAsync(4);
+  auto next = controller->reserveAsync(6);
+  old = std::move(next);
+  EXPECT_EQ(controller->currentResourceUsage(), 6);
+  controller.reset();
+  EXPECT_FALSE(weak.expired());
+  old.cancel();
+  EXPECT_EQ(weak.lock()->currentResourceUsage(), 0);
+}
+
+TEST(AdmissionController, asyncWakeMayDropAllExternalOwners) {
+  struct ObservedController : AdmissionController {
+    ObservedController(const Config& config, bool& destroyed)
+        : AdmissionController(config), destroyed(destroyed) {}
+    ~ObservedController() { destroyed = true; }
+    bool& destroyed;
+  };
+  AdmissionController::Config config;
+  config.maxLimit = 10;
+  bool destroyed = false;
+  auto controller = std::make_shared<ObservedController>(config, destroyed);
+  controller->accept(10);
+  std::optional<AdmissionReservation> reservation(controller->reserveAsync(5));
+  auto callback = reservation->takeFuture().via(&folly::InlineExecutor::instance())
+      .thenValue([&](auto&&) {
+        reservation.reset();
+        controller.reset();
+        EXPECT_FALSE(destroyed);
+      });
+  auto* releasingController = controller.get();
+  releasingController->release(10);
+  std::move(callback).get();
+  EXPECT_TRUE(destroyed);
+}
+
+TEST(AdmissionController, asyncGrantAndCancellationRaceReturnsAllUnits) {
+  AdmissionController::Config config;
+  config.maxLimit = 4;
+  auto controller = std::make_shared<AdmissionController>(config);
+  for (int attempt = 0; attempt < 100; ++attempt) {
+    controller->accept(4);
+    auto reservation = controller->reserveAsync(4);
+    auto ready = reservation.takeFuture();
+    std::thread release([&] { controller->release(4); });
+    std::thread cancel([&] { reservation.cancel(); });
+    release.join();
+    cancel.join();
+    EXPECT_TRUE(ready.isReady());
+    EXPECT_FALSE(reservation.isGranted());
+    EXPECT_EQ(controller->currentResourceUsage(), 0);
+  }
+}
+
+TEST(AdmissionController, asyncInlineCompletionHasBoundedCallbackDepth) {
+  for (bool cancelPendingChain : {false, true}) {
+    SCOPED_TRACE(cancelPendingChain);
+    AdmissionController::Config config;
+    config.maxLimit = 1;
+    auto controller = std::make_shared<AdmissionController>(config);
+    controller->accept(1);
+    std::vector<AdmissionReservation> reservations;
+    reservations.reserve(32);
+    for (int i = 0; i < 32; ++i) reservations.push_back(controller->reserveAsync(1));
+    std::vector<folly::Future<folly::Unit>> callbacks;
+    int depth = 0, maximumDepth = 0;
+    for (size_t i = 0; i < reservations.size(); ++i) {
+      callbacks.push_back(reservations[i].takeFuture()
+          .via(&folly::InlineExecutor::instance()).thenValue([&, i](auto&&) {
+            ++depth;
+            maximumDepth = std::max(maximumDepth, depth);
+            if (cancelPendingChain && i + 1 < reservations.size()) {
+              reservations[i + 1].cancel();
+            }
+            reservations[i].cancel();
+            --depth;
+          }));
+    }
+    if (cancelPendingChain) reservations[0].cancel();
+    else controller->release(1);
+    for (auto& callback : callbacks) {
+      EXPECT_TRUE(callback.isReady());
+      std::move(callback).get();
+    }
+    EXPECT_EQ(maximumDepth, 1);
+    if (cancelPendingChain) controller->release(1);
+    EXPECT_EQ(controller->currentResourceUsage(), 0);
+  }
 }
 
 TEST(AdmissionController, multiThreaded) {

@@ -32,7 +32,27 @@ struct EncodedVectorCopyOptions {
   /// How many nested rows in ARRAY or MAP need to be referenced in order to
   /// avoid a compaction on it.
   double compactNestedThreshold = 0.5;
+
+  /// Optional lifetime owner for newly copied vectors, including nested values.
+  /// Must match pool. Independent buffers still follow their vector's lifetime.
+  /// Only supported for a fresh target. Source reuse additionally requires
+  /// direct fixed-width backing wholly owned by this pool.
+  std::shared_ptr<memory::MemoryPool> poolOwner;
+
 };
+
+/// Reuse fully pool-accounted, direct fixed-width backing without allocating
+/// another buffer. Returns null for unknown or mixed ownership. Result vectors
+/// retain their pool and their original allocation charges until final release.
+VectorPtr tryReuseAccountedVector(const VectorPtr& source);
+
+/// Aligned backing retained by ROW/fixed-width/string/dictionary/constant trees.
+/// Each buffer is attributed to its actual pool, independent of wrapper pools;
+/// shared buffers count once, including padding/alignment. Unknown layouts or
+/// opaque view owners return nullopt without loading/materializing them.
+std::optional<uint64_t> accountedRetainedBackingBytes(
+    const VectorPtr& source, const common::AdmissionController* budget);
+
 
 /// Copy the vector while try to preserve the encoding on `target' (with
 /// exceptions listed below), mainly to reduce the memory usage of `target'.  If

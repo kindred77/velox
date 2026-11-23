@@ -19,11 +19,12 @@
 namespace facebook::velox::exec {
 
 AggregationMasks::AggregationMasks(
-    std::vector<std::optional<column_index_t>> maskChannels)
-    : maskChannels_{std::move(maskChannels)} {
+    std::vector<std::optional<column_index_t>> maskChannels,
+    memory::MemoryPool* pool)
+    : maskChannels_{std::move(maskChannels)}, decodedMask_(pool) {
   for (const auto& maskChannel : maskChannels_) {
     if (maskChannel.has_value()) {
-      maskedRows_.insert({maskChannel.value(), SelectivityVector::empty()});
+      maskedRows_.try_emplace(maskChannel.value(), 0, false, pool);
     }
   }
 }

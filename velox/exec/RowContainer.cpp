@@ -31,6 +31,15 @@
 
 namespace facebook::velox::exec {
 namespace {
+using RowStringScratch = std::basic_string<
+    char, std::char_traits<char>, memory::StlAllocator<char>>;
+
+RowStringScratch makeRowStringScratch() {
+  auto* pool = memory::MemoryPool::currentAllocationCreditPool();
+  return RowStringScratch(pool ? memory::StlAllocator<char>(pool)
+                               : memory::StlAllocator<char>());
+}
+
 template <TypeKind Kind>
 static int32_t kindSize() {
   return sizeof(typename KindToFlatVector<Kind>::HashRowType);
@@ -295,6 +304,21 @@ RowContainer::RowContainer(
 
 RowContainer::~RowContainer() {
   clear();
+}
+
+void RowContainer::reserveRows(vector_size_t count) {
+  VELOX_CHECK_GE(count, 0);
+  VELOX_CHECK(mutable_ && !useListRowIndex_);
+  while (numFreeRows_ < uint64_t(count)) {
+    auto* row = rows_.allocateFixed(fixedRowSize_ + normalizedKeySize_, alignment_) +
+        normalizedKeySize_;
+    if (normalizedKeySize_) ++numRowsWithNormalizedKey_;
+    initializeRow(row, false);
+    bits::setBit(row, freeFlagOffset_);
+    nextFree(row) = firstFreeRow_;
+    firstFreeRow_ = row;
+    ++numFreeRows_;
+  }
 }
 
 char* RowContainer::newRow() {
@@ -899,7 +923,10 @@ int32_t RowContainer::compareStringAsc(
     StringView left,
     const DecodedVector& decoded,
     vector_size_t index) {
-  std::string storage;
+  if (HashStringAllocator::isContiguous(left)) {
+    return left.compare(decoded.valueAt<StringView>(index));
+  }
+  auto storage = makeRowStringScratch();
   return HashStringAllocator::contiguousString(left, storage)
       .compare(decoded.valueAt<StringView>(index));
 }
@@ -918,8 +945,12 @@ int RowContainer::compareComplexType(
 }
 
 int32_t RowContainer::compareStringAsc(StringView left, StringView right) {
-  std::string leftStorage;
-  std::string rightStorage;
+  if (HashStringAllocator::isContiguous(left) &&
+      HashStringAllocator::isContiguous(right)) {
+    return left.compare(right);
+  }
+  auto leftStorage = makeRowStringScratch();
+  RowStringScratch rightStorage(leftStorage.get_allocator());
   return HashStringAllocator::contiguousString(left, leftStorage)
       .compare(HashStringAllocator::contiguousString(right, rightStorage));
 }
@@ -958,7 +989,7 @@ void RowContainer::hashTyped(
   using T = typename KindToFlatVector<Kind>::HashRowType;
 
   auto offset = column.offset();
-  std::string storage;
+  std::optional<RowStringScratch> storage;
   auto numRows = rows.size();
 
   for (int32_t i = 0; i < numRows; ++i) {
@@ -969,9 +1000,12 @@ void RowContainer::hashTyped(
     } else {
       uint64_t hash;
       if constexpr (is_string_kind(Kind)) {
-        hash =
-            folly::hasher<StringView>()(HashStringAllocator::contiguousString(
-                valueAt<StringView>(row, offset), storage));
+        auto view = valueAt<StringView>(row, offset);
+        if (!HashStringAllocator::isContiguous(view)) {
+          if (!storage) storage.emplace(makeRowStringScratch());
+          view = HashStringAllocator::contiguousString(view, *storage);
+        }
+        hash = folly::hasher<StringView>()(view);
       } else if constexpr (is_nested_kind(Kind)) {
         auto in = prepareRead(row, offset);
         hash = ContainerRowSerde::hash(in, type);
@@ -1160,6 +1194,12 @@ int64_t RowContainer::sizeIncrement(
   return checkedPlus(
       roundToAllocUnit(checkedMultiply(needRows, int64_t(rowStride()))),
       roundToAllocUnit(needBytes));
+}
+
+uint64_t RowContainer::fixedRowBackingBytesUpperBound(uint64_t count) const {
+  VELOX_CHECK(!useListRowIndex_, "Row index requires a separate demand bound");
+  const uint64_t newRows = count > numFreeRows_ ? count - numFreeRows_ : 0;
+  return rows_.fixedAllocationBytesUpperBound(newRows, rowStride(), alignment_);
 }
 
 void RowContainer::skip(RowContainerIterator& iter, int32_t numRows) const {
@@ -1359,23 +1399,6 @@ void RowPartitions::appendPartitions(folly::Range<const uint8_t*> partitions) {
           offset + copySize,
           xsimd::batch<uint8_t>::size);
     }
-  }
-}
-
-RowComparator::RowComparator(
-    const RowTypePtr& rowType,
-    const std::vector<core::FieldAccessTypedExprPtr>& sortingKeys,
-    const std::vector<core::SortOrder>& sortingOrders,
-    RowContainer* rowContainer)
-    : rowContainer_(rowContainer) {
-  const auto numKeys = sortingKeys.size();
-  for (auto i = 0; i < numKeys; ++i) {
-    const auto channel = exprToChannel(sortingKeys[i].get(), rowType);
-    VELOX_USER_CHECK_NE(
-        channel,
-        kConstantChannel,
-        "RowComparator doesn't allow constant comparison keys");
-    keyInfo_.push_back(std::make_pair(channel, sortingOrders[i]));
   }
 }
 

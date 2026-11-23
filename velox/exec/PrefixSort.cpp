@@ -16,6 +16,7 @@
 #include "velox/exec/PrefixSort.h"
 
 #include <atomic>
+#include <cstring>
 #include <functional>
 #include <thread>
 
@@ -41,7 +42,10 @@ FOLLY_ALWAYS_INLINE void encodeRowColumn(
   if (!prefixSortLayout.normalizedKeyHasNullByte[index] ||
       !RowContainer::isNullAt(
           row, rowColumn.nullByte(), rowColumn.nullMask())) {
-    value = *(reinterpret_cast<T*>(row + rowColumn.offset()));
+    // RowContainer packs fields and rows without native type alignment.
+    T stored;
+    std::memcpy(&stored, row + rowColumn.offset(), sizeof(T));
+    value = stored;
   } else {
     value = std::nullopt;
   }

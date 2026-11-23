@@ -16,6 +16,7 @@
 #pragma once
 
 #include "velox/core/PlanNode.h"
+#include "velox/exec/AggregateResources.h"
 #include "velox/vector/ComplexVector.h"
 
 namespace facebook::velox::exec {
@@ -79,7 +80,8 @@ std::vector<AggregateInfo> toAggregateInfo(
     const OperatorCtx& operatorCtx,
     uint32_t numKeys,
     std::shared_ptr<core::ExpressionEvaluator>& expressionEvaluator,
-    bool isStreaming = false);
+    bool isStreaming = false,
+    AggregateInputResourceContracts resources = {});
 
 /// Extract index of the 'mask' column for each aggregation from aggregations.
 /// Aggregations without masks use std::nullopt.

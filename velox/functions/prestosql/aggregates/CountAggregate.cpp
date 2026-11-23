@@ -14,6 +14,9 @@
  * limitations under the License.
  */
 #include "velox/functions/prestosql/aggregates/CountAggregate.h"
+
+#include <optional>
+#include "velox/common/memory/HashStringAllocator.h"
 #include "velox/common/base/Exceptions.h"
 #include "velox/expression/FunctionSignature.h"
 #include "velox/functions/lib/aggregates/SumAggregateBase.h"
@@ -28,10 +31,17 @@ class CountAggregate : public SimpleNumericAggregate<bool, int64_t, int64_t> {
   using BaseAggregate = SimpleNumericAggregate<bool, int64_t, int64_t>;
 
  public:
-  explicit CountAggregate() : BaseAggregate(BIGINT()) {}
+  explicit CountAggregate()
+      : BaseAggregate(BIGINT()), decodedIntermediate_(std::in_place) {}
 
   int32_t accumulatorFixedWidthSize() const override {
     return sizeof(int64_t);
+  }
+
+  bool prepareForBoundedInput(bool rawInput, const SelectivityVector& rows,
+      const std::vector<VectorPtr>& args, const VectorPtr& output) override {
+    if (args.empty()) return rawInput;
+    return BaseAggregate::template prepareFixedNumericInput<int64_t>(rawInput, rows, args, output);
   }
 
   void extractValues(char** groups, int32_t numGroups, VectorPtr* result)
@@ -51,7 +61,8 @@ class CountAggregate : public SimpleNumericAggregate<bool, int64_t, int64_t> {
       return;
     }
 
-    DecodedVector decoded(*args[0], rows);
+    DecodedVector decoded(allocator_ ? allocator_->pool() : nullptr);
+    decoded.decode(*args[0], rows);
     if (decoded.isConstantMapping()) {
       if (!decoded.isNullAt(0)) {
         rows.applyToSelected(
@@ -74,9 +85,9 @@ class CountAggregate : public SimpleNumericAggregate<bool, int64_t, int64_t> {
       const SelectivityVector& rows,
       const std::vector<VectorPtr>& args,
       bool /*mayPushdown*/) override {
-    decodedIntermediate_.decode(*args[0], rows);
+    decodedIntermediate_->decode(*args[0], rows);
     rows.applyToSelected([&](vector_size_t i) {
-      addToGroup(groups[i], decodedIntermediate_.valueAt<int64_t>(i));
+      addToGroup(groups[i], decodedIntermediate_->valueAt<int64_t>(i));
     });
   }
 
@@ -90,7 +101,8 @@ class CountAggregate : public SimpleNumericAggregate<bool, int64_t, int64_t> {
       return;
     }
 
-    DecodedVector decoded(*args[0], rows);
+    DecodedVector decoded(allocator_ ? allocator_->pool() : nullptr);
+    decoded.decode(*args[0], rows);
     if (decoded.isConstantMapping()) {
       if (!decoded.isNullAt(0)) {
         addToGroup(group, rows.countSelected());
@@ -113,18 +125,18 @@ class CountAggregate : public SimpleNumericAggregate<bool, int64_t, int64_t> {
       const SelectivityVector& rows,
       const std::vector<VectorPtr>& args,
       bool /*mayPushdown*/) override {
-    decodedIntermediate_.decode(*args[0], rows);
+    decodedIntermediate_->decode(*args[0], rows);
 
     int64_t count = 0;
-    if (decodedIntermediate_.mayHaveNulls()) {
+    if (decodedIntermediate_->mayHaveNulls()) {
       rows.applyToSelected([&](vector_size_t i) {
-        if (!decodedIntermediate_.isNullAt(i)) {
-          count += decodedIntermediate_.valueAt<int64_t>(i);
+        if (!decodedIntermediate_->isNullAt(i)) {
+          count += decodedIntermediate_->valueAt<int64_t>(i);
         }
       });
     } else {
       rows.applyToSelected([&](vector_size_t i) {
-        count += decodedIntermediate_.valueAt<int64_t>(i);
+        count += decodedIntermediate_->valueAt<int64_t>(i);
       });
     }
 
@@ -132,6 +144,12 @@ class CountAggregate : public SimpleNumericAggregate<bool, int64_t, int64_t> {
   }
 
  protected:
+  void setAllocatorInternal(HashStringAllocator* allocator) override {
+    BaseAggregate::setAllocatorInternal(allocator);
+    // Decoder copies belong to the aggregate, not the process allocator.
+    decodedIntermediate_.emplace(allocator ? allocator->pool() : nullptr);
+  }
+
   void initializeNewGroupsInternal(
       char** groups,
       folly::Range<const vector_size_t*> indices) override {
@@ -146,7 +164,7 @@ class CountAggregate : public SimpleNumericAggregate<bool, int64_t, int64_t> {
     *value<int64_t>(group) += count;
   }
 
-  DecodedVector decodedIntermediate_;
+  std::optional<DecodedVector> decodedIntermediate_;
 };
 
 } // namespace
@@ -181,7 +199,8 @@ void registerCountAggregate(
             argTypes.size(), 1, "{} takes at most one argument", names.front());
         return std::make_unique<CountAggregate>();
       },
-      {.orderSensitive = false},
+      {.orderSensitive = false,
+       .inputResourceModel = core::AggregateInputResourceModel::kFixedScalarState},
       withCompanionFunctions,
       overwrite);
 }

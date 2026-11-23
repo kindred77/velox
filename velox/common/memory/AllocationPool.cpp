@@ -16,6 +16,7 @@
 
 #include "velox/common/memory/AllocationPool.h"
 #include "velox/common/base/BitUtil.h"
+#include "velox/common/base/CheckedArithmetic.h"
 #if defined(_MSC_VER)
 #include "velox/common/base/Builtins.h"
 #endif
@@ -23,6 +24,11 @@
 #include "velox/common/memory/MemoryAllocator.h"
 
 namespace facebook::velox::memory {
+namespace {
+// Shared by the allocation path and its conservative preauthorization bound.
+constexpr int64_t kMinimumLargeMapBytes = 16 * AllocationTraits::kHugePageSize;
+} // namespace
+
 
 folly::Range<char*> AllocationPool::rangeAt(int32_t index) const {
   if (index < allocations_.size()) {
@@ -49,6 +55,79 @@ void AllocationPool::clear() {
   bytesInRun_ = 0;
   currentOffset_ = 0;
   usedBytes_ = 0;
+}
+
+uint64_t AllocationPool::fixedAllocationBytesUpperBound(
+    uint64_t count, uint64_t bytes, int32_t alignment) const {
+  if (count == 0) return 0;
+  VELOX_CHECK_GT(bytes, 0);
+  VELOX_CHECK_GT(alignment, 0);
+  const uint64_t align = alignment;
+  VELOX_CHECK(bits::isPowerOfTwo(align));
+  VELOX_CHECK_LE(align, uint64_t(AllocationTraits::kPageSize));
+  const uint64_t span = checkedPlus(bytes, align - 1);
+  const uint64_t stride = span & ~(align - 1);
+
+  // Only whole entries already backed AND addressable can avoid new backing.
+  // Subtracting an unusable tail would undercount large entries at run ends.
+  const uint64_t available = std::max<int64_t>(
+      0, std::min(freeBytes(), freeAddressableBytes()));
+  const uint64_t padding = startOfRun_ == nullptr ? 0
+      : alignmentPadding(startOfRun_ + currentOffset_, alignment);
+  uint64_t freeEntries = 0;
+  if (available >= padding && available - padding >= bytes) {
+    freeEntries = 1 + (available - padding - bytes) / stride;
+  }
+  if (count <= freeEntries) return 0;
+  count -= freeEntries;
+  // Keep total payload representable even when the small phase can cover it.
+  (void)checkedMultiply(count, stride);
+  constexpr uint64_t huge = AllocationTraits::kHugePageSize;
+  VELOX_CHECK(!pool_->sizeClasses().empty());
+  const uint64_t largestSmall =
+      AllocationTraits::pageBytes(pool_->sizeClasses().back());
+  VELOX_CHECK_GT(largestSmall, 0);
+  uint64_t smallBytes = 0;
+  if (span <= largestSmall && hugePageThreshold_ > usedBytes_ &&
+      largeAllocations_.empty()) {
+    // newRunImpl requests a single run with minSizeClass equal to its page
+    // count. The first supported class at least that large is its backing.
+    // Malloc-backed runs need not be page aligned: reserve worst-case initial
+    // padding before counting complete entries in each future run.
+    const auto pages = std::max<MachinePageCount>(
+        kMinPages, AllocationTraits::numPages(span));
+    const auto& classes = pool_->sizeClasses();
+    const auto sizeClass = std::lower_bound(classes.begin(), classes.end(), pages);
+    VELOX_CHECK(sizeClass != classes.end());
+    const uint64_t runBytes = AllocationTraits::pageBytes(*sizeClass);
+    const uint64_t entriesPerSmallRun = 1 + (runBytes - span) / stride;
+    const uint64_t neededRuns = 1 + (count - 1) / entriesPerSmallRun;
+    const uint64_t untilLarge = hugePageThreshold_ - usedBytes_;
+    const uint64_t allowedRuns = 1 + (untilLarge - 1) / runBytes;
+    const uint64_t smallRuns = std::min(neededRuns, allowedRuns);
+    smallBytes = checkedMultiply(smallRuns, runBytes);
+    if (smallRuns == neededRuns) return smallBytes;
+    count -= checkedMultiply(smallRuns, entriesPerSmallRun);
+  } else if (span <= largestSmall && hugePageThreshold_ > usedBytes_) {
+    // A large run can still grow without newRunImpl even below the threshold.
+    // Keep the conservative small-phase allowance as well: once its address
+    // range ends, this configuration may switch back to small runs.
+    const uint64_t smallCap = checkedPlus(
+        uint64_t(hugePageThreshold_ - usedBytes_), largestSmall);
+    smallBytes = count > smallCap / largestSmall
+        ? smallCap : checkedMultiply(count, largestSmall);
+  }
+
+  const uint64_t payload = checkedMultiply(count, stride);
+  // Every fresh large map has at least this many addressable bytes after
+  // worst-case alignment at both ends. Each used run rounds backing by < huge;
+  // an existing partially filled large run can contribute one extra rounding.
+  constexpr uint64_t minRange = kMinimumLargeMapBytes - 2 * huge;
+  const uint64_t entriesPerRun = std::max<uint64_t>(1, minRange / stride);
+  uint64_t largeRuns = 1 + (count - 1) / entriesPerRun;
+  if (!largeAllocations_.empty()) largeRuns = checkedPlus(largeRuns, uint64_t(1));
+  const uint64_t bound = checkedPlus(payload, checkedMultiply(largeRuns, huge));
+  return checkedPlus(smallBytes, bound);
 }
 
 char* AllocationPool::allocateFixed(uint64_t bytes, int32_t alignment) {
@@ -102,7 +181,7 @@ void AllocationPool::newRunImpl(MachinePageCount numPages) {
     int64_t nextSize = std::min(
         kMaxMmapBytes,
         std::max<int64_t>(
-            16 * AllocationTraits::kHugePageSize,
+            kMinimumLargeMapBytes,
             bits::nextPowerOfTwo(
                 usedBytes_ + AllocationTraits::kHugePageSize)));
     // Round 'numPages' to no of pages in huge page. Allocating this plus an

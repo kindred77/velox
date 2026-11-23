@@ -20,14 +20,34 @@
 #include "velox/vector/DecodedVector.h"
 #include "velox/vector/FlatVector.h"
 #include "velox/vector/LazyVector.h"
+#include "velox/vector/VectorTypeUtils.h"
 
 #include <vector>
+#include <optional>
 
 namespace facebook::velox::functions::aggregate {
 
 template <typename TInput, typename TAccumulator, typename TResult>
 class SimpleNumericAggregate : public exec::Aggregate {
  protected:
+  template <typename TOutput = TAccumulator>
+  bool prepareFixedNumericInput(
+      bool rawInput, const SelectivityVector& rows,
+      const std::vector<VectorPtr>& args, const VectorPtr& output) {
+    return rawInput && args.size() == 1 && isFixedSize() &&
+        isDirectlyDecodedScalar(*args[0]) && (output->size() > 0 || !rows.hasSelections()) &&
+        output->template as<FlatVector<TOutput>>() != nullptr &&
+        hasFixedWidthVectorBacking(*output);
+  }
+
+  void setAllocatorInternal(HashStringAllocator* allocator) override {
+    auto* pool = allocator ? allocator->pool() : nullptr;
+    if (pushdownScratch_->indices.get_allocator().pool != pool) {
+      pushdownScratch_.emplace(pool);
+    }
+    exec::Aggregate::setAllocatorInternal(allocator);
+  }
+
   explicit SimpleNumericAggregate(TypePtr resultType) : Aggregate(resultType) {}
 
  public:
@@ -103,23 +123,25 @@ class SimpleNumericAggregate : public exec::Aggregate {
     // Callers can request pushdown for the operator as a whole even when a
     // particular aggregate type (e.g. Timestamp or int128_t) does not support
     // it.
-    DecodedVector decoded(
-        *arg, rows, !mayPushdown || !kMayPushdown<TData>);
+    // Copied decoding scratch belongs to the accumulator's resource; borrowed
+    // input buffers keep their source ownership. Standalone callers may omit it.
+    DecodedVector decoded(allocator_ ? allocator_->pool() : nullptr);
+    decoded.decode(*arg, rows, !mayPushdown || !kMayPushdown<TData>);
     if constexpr (kMayPushdown<TData>) {
       if (mayPushdown &&
           decoded.base()->encoding() == VectorEncoding::Simple::LAZY &&
           !arg->type()->isDecimal()) {
         auto* lazy = decoded.base()->asChecked<const LazyVector>();
         if (lazy->supportsHook()) {
+          auto prepared = preparePushdownInput(decoded, rows, groups);
           velox::aggregate::SimpleCallableHook<TData, UpdateSingleValue> hook(
               exec::Aggregate::offset_,
               exec::Aggregate::nullByte_,
               exec::Aggregate::nullMask_,
-              groups,
+              prepared.groups,
               &this->exec::Aggregate::numNulls_,
               updateSingleValue);
-          auto indices = decoded.indices();
-          lazy->load(RowSet(indices, arg->size()), &hook);
+          lazy->load(prepared.rows, &hook);
           return;
         }
         decoded.decode(*arg, rows);
@@ -176,8 +198,8 @@ class SimpleNumericAggregate : public exec::Aggregate {
       TData initialValue) {
     // See updateGroups: unsupported hook types cannot leave a LazyVector
     // undecoded even if the operator enables aggregate pushdown.
-    DecodedVector decoded(
-        *arg, rows, !mayPushdown || !kMayPushdown<TData>);
+    DecodedVector decoded(allocator_ ? allocator_->pool() : nullptr);
+    decoded.decode(*arg, rows, !mayPushdown || !kMayPushdown<TData>);
     if constexpr (kMayPushdown<TData>) {
       if (mayPushdown &&
           decoded.base()->encoding() == VectorEncoding::Simple::LAZY &&
@@ -189,7 +211,9 @@ class SimpleNumericAggregate : public exec::Aggregate {
           // directly during decode instead of materializing the column; a
           // per-row group array pointing at the single group is safe for any
           // row numbering (yihudb scalar-aggregate pushdown, 2026-08-24).
-          std::vector<char*> groups(arg->size(), group);
+          auto prepared = preparePushdownInput(decoded, rows, nullptr);
+          GroupPointers groups(prepared.rows.size(), group,
+              pushdownScratch_->groups.get_allocator());
           velox::aggregate::SimpleCallableHook<TData, UpdateSingle> hook(
               exec::Aggregate::offset_,
               exec::Aggregate::nullByte_,
@@ -197,8 +221,7 @@ class SimpleNumericAggregate : public exec::Aggregate {
               groups.data(),
               &this->exec::Aggregate::numNulls_,
               updateSingleValue);
-          auto indices = decoded.indices();
-          lazy->load(RowSet(indices, arg->size()), &hook);
+          lazy->load(prepared.rows, &hook);
           return;
         }
         decoded.decode(*arg, rows);
@@ -239,41 +262,61 @@ class SimpleNumericAggregate : public exec::Aggregate {
   template <typename THook>
   void
   pushdown(char** groups, const SelectivityVector& rows, const VectorPtr& arg) {
-    DecodedVector decoded(*arg, rows, false);
-    const vector_size_t* indices = decoded.indices();
+    DecodedVector decoded(allocator_ ? allocator_->pool() : nullptr);
+    decoded.decode(*arg, rows, false);
+    auto prepared = preparePushdownInput(decoded, rows, groups);
     THook hook(
         exec::Aggregate::offset_,
         exec::Aggregate::nullByte_,
         exec::Aggregate::nullMask_,
-        groups,
+        prepared.groups,
         &this->exec::Aggregate::numNulls_);
-    // The decoded vector does not really keep the info from the 'rows', except
-    // for the 'upper bound' of it. In case not all rows are selected we need to
-    // generate proper indices, which we 'indirect' through the ones we got from
-    // the decoded vector.
-    vector_size_t numIndices{arg->size()};
-    if (not rows.isAllSelected()) {
-      const auto numSelected = rows.countSelected();
-      if (numSelected != arg->size()) {
-        pushdownCustomIndices_.resize(numSelected);
-        vector_size_t tgtIndex{0};
-#ifdef _MSC_VER
-        rows.applyToSelected([&](vector_size_t i) {
-#else
-        rows.template applyToSelected([&](vector_size_t i) {
-#endif
-          pushdownCustomIndices_[tgtIndex++] = indices[i];
-        });
-        indices = pushdownCustomIndices_.data();
-        numIndices = numSelected;
-      }
-    }
     auto* lazy = decoded.base()->asChecked<const LazyVector>();
     VELOX_CHECK(lazy->supportsHook());
-    lazy->load(RowSet(indices, numIndices), &hook);
+    lazy->load(prepared.rows, &hook);
   }
 
  private:
+  using GroupPointers = std::vector<char*, memory::StlAllocator<char*>>;
+  struct PushdownScratch {
+    explicit PushdownScratch(memory::MemoryPool* pool)
+        : indices(pool ? memory::StlAllocator<vector_size_t>(pool)
+                       : memory::StlAllocator<vector_size_t>{}),
+          groups(pool ? memory::StlAllocator<char*>(pool)
+                      : memory::StlAllocator<char*>{}) {}
+    std::vector<vector_size_t, memory::StlAllocator<vector_size_t>> indices;
+    GroupPointers groups;
+  };
+  std::optional<PushdownScratch> pushdownScratch_{std::in_place, nullptr};
+
+  struct PushdownInput {
+    RowSet rows;
+    char** groups;
+  };
+
+  PushdownInput preparePushdownInput(
+      const DecodedVector& decoded, const SelectivityVector& rows,
+      char** groups) {
+    const auto* indices = decoded.indices();
+    if (rows.isAllSelected()) {
+      return {RowSet(indices, rows.end()), groups};
+    }
+    auto& scratch = *pushdownScratch_;
+    const auto count = rows.countSelected();
+    scratch.indices.resize(count);
+    if (groups) scratch.groups.resize(count);
+    vector_size_t position = 0;
+    // ValueHook receives positions in the selected RowSet. Compact its group
+    // pointers with the source indices, before loading can update SQL state.
+    rows.applyToSelected([&](vector_size_t row) {
+      scratch.indices[position] = indices[row];
+      if (groups) scratch.groups[position] = groups[row];
+      ++position;
+    });
+    return {RowSet(scratch.indices.data(), count),
+            groups ? scratch.groups.data() : nullptr};
+  }
+
   // TData is either TAccumulator or TResult, which in most cases are the same,
   // but for sum(real) can differ.
   template <

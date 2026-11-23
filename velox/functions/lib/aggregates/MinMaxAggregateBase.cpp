@@ -58,6 +58,11 @@ class SimpleNumericMinMaxAggregate : public SimpleNumericAggregate<T, T, T> {
       TimestampPrecision precision)
       : BaseAggregate(resultType), timestampPrecision_(precision) {}
 
+  bool prepareForBoundedInput(bool rawInput, const SelectivityVector& rows,
+      const std::vector<VectorPtr>& args, const VectorPtr& output) override {
+    return BaseAggregate::template prepareFixedNumericInput<T>(rawInput, rows, args, output);
+  }
+
   int32_t accumulatorFixedWidthSize() const override {
     return sizeof(T);
   }

@@ -341,19 +341,11 @@ core::PlanNodePtr getTraceNode(
 
   if (const auto* aggregationNode =
           dynamic_cast<const core::AggregationNode*>(traceNode)) {
-    return std::make_shared<core::AggregationNode>(
-        nodeId,
-        aggregationNode->step(),
-        aggregationNode->groupingKeys(),
-        aggregationNode->preGroupedKeys(),
-        aggregationNode->aggregateNames(),
-        aggregationNode->aggregates(),
-        aggregationNode->globalGroupingSets(),
-        aggregationNode->groupId(),
-        aggregationNode->ignoreNullKeys(),
-        aggregationNode->noGroupsSpanBatches(),
-        std::make_shared<DummySourceNode>(
-            aggregationNode->sources().front()->outputType()));
+    return core::AggregationNode::Builder(*aggregationNode)
+        .id(nodeId)
+        .source(std::make_shared<DummySourceNode>(
+            aggregationNode->sources().front()->outputType()))
+        .build();
   }
 
   if (const auto* partitionedOutputNode =

@@ -136,6 +136,12 @@ struct UniqueValueComparer {
 // assignment matches the historical behavior.
 class FlatValueIds {
  public:
+  explicit FlatValueIds(memory::MemoryPool* pool = nullptr)
+      : keys_(pool ? memory::StlAllocator<int64_t>(pool)
+                   : memory::StlAllocator<int64_t>{}),
+        slots_(pool ? memory::StlAllocator<uint32_t>(pool)
+                    : memory::StlAllocator<uint32_t>{}) {}
+
   size_t size() const {
     return keys_.size();
   }
@@ -226,13 +232,16 @@ class FlatValueIds {
   }
 
   // Keys in first-seen order, ids are 'index + 1'.
-  std::vector<int64_t> keys_;
+  std::vector<int64_t, memory::StlAllocator<int64_t>> keys_;
   // 'keys_' index + 1 per slot, 0 is empty.
-  std::vector<uint32_t> slots_;
+  std::vector<uint32_t, memory::StlAllocator<uint32_t>> slots_;
   size_t mask_{0};
 };
 
 class VectorHasher {
+  using StoredString =
+      std::basic_string<char, std::char_traits<char>, memory::StlAllocator<char>>;
+
  public:
   static constexpr uint64_t kUnmappable =
       std::numeric_limits<uint64_t>::max();
@@ -251,12 +260,21 @@ class VectorHasher {
   // reservePct to enableValueIds().
   static constexpr int32_t kNoLimit = -1;
 
-  VectorHasher(TypePtr type, column_index_t channel)
+  VectorHasher(TypePtr type, column_index_t channel, memory::MemoryPool* pool = nullptr)
       : channel_(channel),
         type_(std::move(type)),
         typeKind_(type_->kind()),
         typeProvidesCustomComparison_(type_->providesCustomComparison()),
-        useFlatValueIds_(typeUsesFlatValueIds(typeKind_)) {
+        decoded_(pool),
+        cachedHashes_(pool ? raw_vector<uint64_t>(pool) : raw_vector<uint64_t>{}),
+        shortValueIdCache_(pool ? memory::StlAllocator<ShortValueIdCacheEntry>(pool)
+                               : memory::StlAllocator<ShortValueIdCacheEntry>{}),
+        uniqueValues_(pool ? memory::StlAllocator<UniqueValue>(pool)
+                           : memory::StlAllocator<UniqueValue>{}),
+        useFlatValueIds_(typeUsesFlatValueIds(typeKind_)),
+        flatValues_(pool),
+        uniqueValuesStorage_(pool ? memory::StlAllocator<StoredString>(pool)
+                                  : memory::StlAllocator<StoredString>{}) {
     if (!typeSupportsValueIds()) {
       // Ensure any range or unique value based hashing is disabled.
       setRangeOverflow();
@@ -276,8 +294,8 @@ class VectorHasher {
 
   static std::unique_ptr<VectorHasher> create(
       TypePtr type,
-      column_index_t channel) {
-    return std::make_unique<VectorHasher>(std::move(type), channel);
+      column_index_t channel, memory::MemoryPool* pool = nullptr) {
+    return std::make_unique<VectorHasher>(std::move(type), channel, pool);
   }
 
   column_index_t channel() const {
@@ -872,7 +890,8 @@ class VectorHasher {
     uint32_t size{kEmptyShortValueIdCacheSize};
   };
 
-  std::vector<ShortValueIdCacheEntry> shortValueIdCache_;
+  std::vector<ShortValueIdCacheEntry, memory::StlAllocator<ShortValueIdCacheEntry>>
+      shortValueIdCache_;
 
   // Cached ids are only valid as long as 'uniqueValues_' keeps assigning the
   // same ids, so every path that clears or replaces the map must clear the
@@ -1086,8 +1105,8 @@ class VectorHasher {
   int64_t min_ = 1;
   int64_t max_ = 0;
   // Table for mapping distinct values to small ints.
-  folly::F14FastSet<UniqueValue, UniqueValueHasher, UniqueValueComparer>
-      uniqueValues_;
+  folly::F14FastSet<UniqueValue, UniqueValueHasher, UniqueValueComparer,
+      memory::StlAllocator<UniqueValue>> uniqueValues_;
 
   // True for the integer key types, whose value ids live in 'flatValues_'.
   // Other key types keep using 'uniqueValues_' with its historical code.
@@ -1095,7 +1114,8 @@ class VectorHasher {
   FlatValueIds flatValues_;
 
   // Memory for unique string values.
-  std::vector<std::string> uniqueValuesStorage_;
+  std::vector<StoredString, memory::StlAllocator<StoredString>>
+      uniqueValuesStorage_;
   uint64_t distinctStringsBytes_ = 0;
 
   common::FilterPtr bloomFilter_;
@@ -1242,11 +1262,13 @@ bool VectorHasher::makeValueIdsDecoded<bool, false>(
 /// Creates VectorHasher instances for specified columns.
 std::vector<std::unique_ptr<VectorHasher>> createVectorHashers(
     const RowTypePtr& rowType,
-    const std::vector<core::FieldAccessTypedExprPtr>& keys);
+    const std::vector<core::FieldAccessTypedExprPtr>& keys,
+    memory::MemoryPool* pool = nullptr);
 
 std::vector<std::unique_ptr<VectorHasher>> createVectorHashers(
     const RowTypePtr& rowType,
-    const std::vector<column_index_t>& keyChannels);
+    const std::vector<column_index_t>& keyChannels,
+    memory::MemoryPool* pool = nullptr);
 
 } // namespace facebook::velox::exec
 

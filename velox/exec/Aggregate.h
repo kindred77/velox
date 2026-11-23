@@ -21,6 +21,7 @@
 #include "velox/core/PlanNode.h"
 #include "velox/core/QueryConfig.h"
 #include "velox/exec/AggregateUtil.h"
+#include "velox/exec/AggregateResources.h"
 #include "velox/expression/FunctionSignature.h"
 #include "velox/vector/BaseVector.h"
 
@@ -31,6 +32,7 @@ class ExpressionEvaluator;
 namespace facebook::velox::exec {
 
 class AggregateFunctionSignature;
+struct AggregateResourceConstructionInfo;
 
 /// Returns true if aggregation receives raw (unprocessed) input, e.g. partial
 /// and single aggregation.
@@ -86,6 +88,22 @@ class Aggregate {
 
   /// Returns true if toIntermediate() is supported.
   virtual bool supportsToIntermediate() const {
+    return false;
+  }
+
+  /// Prepare scratch only, without consuming input or initializing group
+  /// values. False is an unknown resource contract. True certifies that fixed
+  /// row slots and an exclusive flat output (values + nulls already backed)
+  /// suffice for initialize/update/extract with no additional allocation,
+  /// and that extracted values do not borrow the accumulator storage.
+  /// Registration authorizes resources; this method only prepares/checks the
+  /// actual carrier. Called during wholly discardable preparation. Certifying
+  /// a provider also requires repeatable construction/literal setup without
+  /// executing SQL expressions; lazy input loading belongs to a once-only
+  /// input stage outside preparation, not a preparation retry.
+  virtual bool prepareForBoundedInput(
+      bool /*rawInput*/, const SelectivityVector& /*rows*/,
+      const std::vector<VectorPtr>& /*args*/, const VectorPtr& /*output*/) {
     return false;
   }
 
@@ -363,7 +381,8 @@ class Aggregate {
       core::AggregationNode::Step step,
       const std::vector<TypePtr>& argTypes,
       const TypePtr& resultType,
-      const core::QueryConfig& config);
+      const core::QueryConfig& config,
+      AggregateResourceConstructionInfo* resources = nullptr);
 
  protected:
   virtual void setAllocatorInternal(HashStringAllocator* allocator);
@@ -512,11 +531,6 @@ class Aggregate {
   std::shared_ptr<core::ExpressionEvaluator> expressionEvaluator_{nullptr};
   std::vector<core::LambdaTypedExprPtr> lambdaExpressions_;
 
-  // When selectivity vector has holes, in the pushdown, we need to generate a
-  // different indices vector as the one we get from the DecodedVector is simply
-  // sequential.
-  std::vector<vector_size_t> pushdownCustomIndices_;
-
   bool validateIntermediateInputs_ = false;
 
   bool clusteredInput_ = false;
@@ -539,6 +553,19 @@ struct AggregateFunctionMetadata {
 
   /// Indicates if this is a companion function.
   bool companionFunction{false};
+
+  /// Declared once here and shared by planning and budgeted construction.
+  core::AggregateInputResourceModel inputResourceModel{
+      core::AggregateInputResourceModel::kUnknown};
+};
+
+/// Optional output for budgeted construction. Ordinary construction does not
+/// bind signatures or copy factories for resource inspection. A successful
+/// output refers to the same registry snapshot as the constructed instance.
+struct AggregateResourceConstructionInfo {
+  AggregateFunctionMetadata metadata;
+  TypePtr intermediateType;
+  core::AggregateInputResourceContract inputResources;
 };
 /// Register an aggregate function with the specified name and signatures. If
 /// registerCompanionFunctions is true, also register companion aggregate and

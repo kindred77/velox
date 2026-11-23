@@ -15,11 +15,14 @@
  */
 
 #include "velox/common/memory/MemoryPool.h"
+#include "velox/common/memory/AllocationPreparation.h"
 
 #include <signal.h>
+#include <folly/ScopeGuard.h>
 
 #include "velox/common/Casts.h"
 #include "velox/common/base/Counters.h"
+#include "velox/common/base/AdmissionController.h"
 #include "velox/common/base/StatsReporter.h"
 #include "velox/common/base/SuccinctPrinter.h"
 #include "velox/common/memory/Memory.h"
@@ -156,6 +159,110 @@ void treeMemoryUsageVisitor(
   });
 }
 
+// Synchronous preauthorization belongs to the calling operation, not to every
+// thread allocating from its pool (e.g. a downstream vector reuse operation).
+struct AllocationCreditScope;
+thread_local AllocationCreditScope* activeAllocationCredit = nullptr;
+struct AllocationCreditScope {
+  MemoryPool* pool;
+  std::shared_ptr<common::AdmissionController> budget;
+  uint64_t remaining;
+  uint64_t granted;
+  AllocationCreditScope* previous;
+  bool preparing{false};
+
+  AllocationCreditScope(MemoryPool* owner,
+      std::shared_ptr<common::AdmissionController> admission, uint64_t bytes)
+      : pool(owner), budget(std::move(admission)), remaining(bytes), granted(bytes),
+        previous(activeAllocationCredit) {
+    activeAllocationCredit = this;
+  }
+  ~AllocationCreditScope() {
+    activeAllocationCredit = previous;
+    if (remaining != 0) budget->release(remaining);
+  }
+};
+
+AllocationCreditScope* allocationCreditFor(const MemoryPool* pool) {
+  for (auto* credit = activeAllocationCredit; credit; credit = credit->previous) {
+    if (credit->pool == pool) return credit;
+  }
+  return nullptr;
+}
+
+void returnAllocationUnits(const MemoryPool* pool,
+    const std::shared_ptr<common::AdmissionController>& budget, uint64_t bytes) {
+  if (!budget || bytes == 0) return;
+  if (auto* credit = allocationCreditFor(pool)) {
+    VELOX_CHECK_LE(bytes, std::numeric_limits<uint64_t>::max() - credit->remaining);
+    credit->remaining += bytes;
+  } else {
+    budget->release(bytes);
+  }
+}
+
+class AllocationBudgetCharge {
+ public:
+  AllocationBudgetCharge(const MemoryPool* pool, uint64_t bytes)
+      : pool_(pool), budget_(pool->allocationBudget()), bytes_(bytes) {
+    if (!budget_ || bytes_ == 0) return;
+    if (auto* credit = allocationCreditFor(pool_)) {
+      if (bytes_ > credit->remaining && credit->preparing) {
+        const auto additional = bytes_ - credit->remaining;
+        const auto required = checkedPlus(credit->granted, additional);
+        if (!budget_->tryAccept(additional)) {
+          throw AllocationPreparationDemand(required);
+        }
+        credit->remaining += additional;
+        credit->granted = required;
+      }
+      VELOX_CHECK_LE(bytes_, credit->remaining,
+          "Allocation exceeds the operation's preauthorized bound");
+      credit->remaining -= bytes_;
+    } else if (!budget_->tryAccept(bytes_)) {
+      VELOX_MEM_ALLOC_ERROR(fmt::format("Query allocation budget cannot admit {} bytes", bytes_));
+    }
+  }
+  ~AllocationBudgetCharge() {
+    if (!committed_) returnAllocationUnits(pool_, budget_, bytes_);
+  }
+  void commit() { committed_ = true; }
+ private:
+  const MemoryPool* pool_;
+  const std::shared_ptr<common::AdmissionController> budget_;
+  const uint64_t bytes_;
+  bool committed_{false};
+};
+
+// Page replacement may destroy the old block even when it throws. Keep the
+// old charge until the backend settles, then reconcile the actual final size.
+// Reserve a conservative full new block instead of treating reservation deltas
+// as evidence of physical free. No pointer-indexed allocation ledger is needed.
+template <typename FinalSize>
+class AllocationBudgetReplacement {
+ public:
+  AllocationBudgetReplacement(const MemoryPool* pool, uint64_t oldBytes,
+      uint64_t newBytes, FinalSize finalSize)
+      : pool_(pool), budget_(pool->allocationBudget()), oldBytes_(oldBytes),
+        newBytes_(newBytes), finalSize_(std::move(finalSize)), charge_(pool, newBytes) {}
+  ~AllocationBudgetReplacement() {
+    if (!budget_) return;
+    VELOX_CHECK_LE(newBytes_, std::numeric_limits<uint64_t>::max() - oldBytes_);
+    const uint64_t owned = oldBytes_ + newBytes_;
+    const uint64_t actual = finalSize_();
+    VELOX_CHECK_LE(actual, owned);
+    charge_.commit();
+    returnAllocationUnits(pool_, budget_, owned - actual);
+  }
+ private:
+  const MemoryPool* pool_;
+  const std::shared_ptr<common::AdmissionController> budget_;
+  const uint64_t oldBytes_;
+  const uint64_t newBytes_;
+  FinalSize finalSize_;
+  AllocationBudgetCharge charge_;
+};
+
 std::string capacityToString(int64_t capacity) {
   return capacity == kMaxMemory ? "UNLIMITED" : succinctBytes(capacity);
 }
@@ -173,6 +280,51 @@ std::string capacityToString(int64_t capacity) {
     leakCheckDbg();                     \
   }
 } // namespace
+
+AllocationPreparationScope::AllocationPreparationScope(MemoryPool* pool) {
+  auto* credit = allocationCreditFor(pool);
+  VELOX_CHECK_NOT_NULL(credit, "Preparation requires an existing allocation credit scope");
+  credit_ = credit;
+  previous_ = credit->preparing;
+  credit->preparing = true;
+}
+
+AllocationPreparationScope::~AllocationPreparationScope() {
+  static_cast<AllocationCreditScope*>(credit_)->preparing = previous_;
+}
+
+uint64_t AllocationPreparationScope::grantedBytes() const {
+  return static_cast<const AllocationCreditScope*>(credit_)->granted;
+}
+
+void MemoryPool::setAllocationBudget(
+    std::shared_ptr<common::AdmissionController> budget) {
+  VELOX_CHECK(isLeaf() && trackUsage_ && usedBytes() == 0);
+  VELOX_CHECK(budget != nullptr && allocationBudget_ == nullptr);
+  allocationBudget_ = std::move(budget);
+}
+
+MemoryPool* MemoryPool::currentAllocationCreditPool() {
+  return activeAllocationCredit ? activeAllocationCredit->pool : nullptr;
+}
+
+bool MemoryPool::tryWithAllocationCredit(
+    uint64_t bytes, const std::function<void()>& operation) {
+  if (!allocationBudget_) { operation(); return true; }
+  if (!allocationBudget_->tryAccept(bytes)) return false;
+  AllocationCreditScope credit(this, allocationBudget_, bytes);
+  operation();
+  return true;
+}
+
+void MemoryPool::withAllocationCredit(common::AdmissionReservation reservation,
+    const std::function<void()>& operation) {
+  VELOX_CHECK(allocationBudget_ && reservation.belongsTo(allocationBudget_.get()),
+      "Allocation credit belongs to a different budget");
+  const auto bytes = reservation.claim();
+  AllocationCreditScope credit(this, allocationBudget_, bytes);
+  operation();
+}
 
 std::string MemoryPool::Stats::toString() const {
   return fmt::format(
@@ -546,9 +698,12 @@ void* MemoryPoolImpl::allocate(
 
   CHECK_AND_INC_MEM_OP_STATS(this, Allocs);
   const auto alignedSize = sizeAlign(size);
+  AllocationBudgetCharge charge(this, alignedSize);
   reserve(alignedSize);
+  auto rollback = folly::makeGuard([&] { release(alignedSize); });
   void* buffer = allocator_->allocateBytes(alignedSize, alignment_);
   if (FOLLY_UNLIKELY(buffer == nullptr)) {
+    rollback.dismiss();
     release(alignedSize);
     handleAllocationFailure(
         fmt::format(
@@ -558,6 +713,8 @@ void* MemoryPoolImpl::allocate(
             toString(),
             allocator_->getAndClearFailureMessage()));
   }
+  rollback.dismiss();
+  charge.commit();
   DEBUG_RECORD_ALLOC(this, buffer, size);
   return buffer;
 }
@@ -569,7 +726,9 @@ void MemoryPoolImpl::reportExternalAllocation(int64_t size) {
         "Memory operation is only allowed on leaf memory pool: {}", toString());
   }
   ++numExternalAllocs_;
+  AllocationBudgetCharge charge(this, size);
   reserve(size);
+  charge.commit();
   cumulativeExternalBytes_ += size;
 }
 
@@ -577,9 +736,12 @@ void* MemoryPoolImpl::allocateZeroFilled(int64_t numEntries, int64_t sizeEach) {
   CHECK_AND_INC_MEM_OP_STATS(this, Allocs);
   const auto size = sizeEach * numEntries;
   const auto alignedSize = sizeAlign(size);
+  AllocationBudgetCharge charge(this, alignedSize);
   reserve(alignedSize);
+  auto rollback = folly::makeGuard([&] { release(alignedSize); });
   void* buffer = allocator_->allocateZeroFilled(alignedSize);
   if (FOLLY_UNLIKELY(buffer == nullptr)) {
+    rollback.dismiss();
     release(alignedSize);
     handleAllocationFailure(
         fmt::format(
@@ -590,6 +752,8 @@ void* MemoryPoolImpl::allocateZeroFilled(int64_t numEntries, int64_t sizeEach) {
             toString(),
             allocator_->getAndClearFailureMessage()));
   }
+  rollback.dismiss();
+  charge.commit();
   DEBUG_RECORD_ALLOC(this, buffer, size);
   return buffer;
 }
@@ -598,7 +762,9 @@ void* MemoryPoolImpl::reallocate(void* p, int64_t size, int64_t newSize) {
   CHECK_AND_INC_MEM_OP_STATS(this, Allocs);
   const auto alignedNewSize = sizeAlign(newSize);
   const auto alignedOldSize = sizeAlign(size);
+  AllocationBudgetCharge charge(this, alignedNewSize);
   reserve(alignedNewSize);
+  auto rollback = folly::makeGuard([&] { release(alignedNewSize); });
 
   // Two fully separate branches are kept here intentionally so the legacy
   // path can be deleted as a single block once the in-place path is rolled
@@ -609,6 +775,7 @@ void* MemoryPoolImpl::reallocate(void* p, int64_t size, int64_t newSize) {
     void* const newP = allocator_->reallocateBytes(
         p, alignedOldSize, alignedNewSize, alignment_);
     if (newP == nullptr) {
+      rollback.dismiss();
       release(alignedNewSize);
       handleAllocationFailure(
           fmt::format(
@@ -619,7 +786,10 @@ void* MemoryPoolImpl::reallocate(void* p, int64_t size, int64_t newSize) {
               toString(),
               allocator_->getAndClearFailureMessage()));
     }
+    rollback.dismiss();
+    charge.commit();
     if (p != nullptr) {
+      returnAllocationUnits(this, allocationBudget_, alignedOldSize);
       INC_MEM_OP_STATS(Frees);
       DEBUG_RECORD_FREE(p, size);
       release(alignedOldSize);
@@ -631,6 +801,7 @@ void* MemoryPoolImpl::reallocate(void* p, int64_t size, int64_t newSize) {
   // Legacy path: allocate new + memcpy + free old.
   void* const newP = allocator_->allocateBytes(alignedNewSize, alignment_);
   if (FOLLY_UNLIKELY(newP == nullptr)) {
+    rollback.dismiss();
     release(alignedNewSize);
     handleAllocationFailure(
         fmt::format(
@@ -641,6 +812,8 @@ void* MemoryPoolImpl::reallocate(void* p, int64_t size, int64_t newSize) {
             toString(),
             allocator_->getAndClearFailureMessage()));
   }
+  rollback.dismiss();
+  charge.commit();
   DEBUG_RECORD_ALLOC(this, newP, newSize);
   if (p != nullptr) {
     ::memcpy(newP, p, std::min(size, newSize));
@@ -655,6 +828,7 @@ void MemoryPoolImpl::free(void* p, int64_t size) {
   DEBUG_RECORD_FREE(p, size);
   allocator_->freeBytes(p, alignedSize);
   release(alignedSize);
+  returnAllocationUnits(this, allocationBudget_, alignedSize);
 }
 
 void* MemoryPoolImpl::allocateAligned(int64_t size, uint32_t alignment) {
@@ -665,9 +839,12 @@ void* MemoryPoolImpl::allocateAligned(int64_t size, uint32_t alignment) {
       alignment);
   const auto alignedSize = sizeAlign(size, alignment);
   CHECK_AND_INC_MEM_OP_STATS(this, Allocs);
+  AllocationBudgetCharge charge(this, alignedSize);
   reserve(alignedSize);
+  auto rollback = folly::makeGuard([&] { release(alignedSize); });
   void* buffer = allocator_->allocateBytes(alignedSize, alignment);
   if (FOLLY_UNLIKELY(buffer == nullptr)) {
+    rollback.dismiss();
     release(alignedSize);
     VELOX_MEM_ALLOC_ERROR(
         fmt::format(
@@ -676,6 +853,8 @@ void* MemoryPoolImpl::allocateAligned(int64_t size, uint32_t alignment) {
             alignment,
             toString()));
   }
+  rollback.dismiss();
+  charge.commit();
   return buffer;
 }
 
@@ -688,6 +867,7 @@ void MemoryPoolImpl::freeAligned(
   const auto alignedSize = sizeAlign(size, alignment);
   allocator_->freeBytes(buffer, alignedSize);
   release(alignedSize);
+  returnAllocationUnits(this, allocationBudget_, alignedSize);
 }
 
 bool MemoryPoolImpl::transferTo(MemoryPool* dest, void* buffer, uint64_t size) {
@@ -696,6 +876,7 @@ bool MemoryPoolImpl::transferTo(MemoryPool* dest, void* buffer, uint64_t size) {
   }
   VELOX_CHECK_NOT_NULL(dest);
   auto* destImpl = checkedPointerCast<MemoryPoolImpl, MemoryPool>(dest);
+  if (allocationBudget_ != destImpl->allocationBudget_) return false;
   if (allocator_ != destImpl->allocator_) {
     return false;
   }
@@ -720,12 +901,16 @@ void MemoryPoolImpl::reportExternalFree(int64_t size) {
   }
   ++numExternalFrees_;
   release(size);
+  returnAllocationUnits(this, allocationBudget_, size);
 }
 
 void MemoryPoolImpl::allocateNonContiguous(
     MachinePageCount numPages,
     Allocation& out,
     MachinePageCount minSizeClass) {
+  VELOX_CHECK(!allocationBudget_ || out.empty() || out.pool() == this);
+  AllocationBudgetReplacement budgetTransaction(this, out.byteSize(),
+      allocationBudget_ ? allocator_->allocationBytes(numPages, minSizeClass) : 0, [&] { return out.byteSize(); });
   CHECK_AND_INC_MEM_OP_STATS(this, Allocs);
   if (!out.empty()) {
     INC_MEM_OP_STATS(Frees);
@@ -767,6 +952,7 @@ void MemoryPoolImpl::freeNonContiguous(Allocation& allocation) {
   const int64_t freedBytes = allocator_->freeNonContiguous(allocation);
   VELOX_CHECK(allocation.empty());
   release(freedBytes);
+  returnAllocationUnits(this, allocationBudget_, freedBytes);
 }
 
 MachinePageCount MemoryPoolImpl::largestSizeClass() const {
@@ -781,6 +967,9 @@ void MemoryPoolImpl::allocateContiguous(
     MachinePageCount numPages,
     ContiguousAllocation& out,
     MachinePageCount maxPages) {
+  VELOX_CHECK(!allocationBudget_ || out.empty() || out.pool() == this);
+  AllocationBudgetReplacement budgetTransaction(this, out.size(),
+      allocationBudget_ ? AllocationTraits::pageBytes(numPages) : 0, [&] { return out.size(); });
   CHECK_AND_INC_MEM_OP_STATS(this, Allocs);
   if (!out.empty()) {
     INC_MEM_OP_STATS(Frees);
@@ -821,11 +1010,15 @@ void MemoryPoolImpl::freeContiguous(ContiguousAllocation& allocation) {
   allocator_->freeContiguous(allocation);
   VELOX_CHECK(allocation.empty());
   release(bytesToFree);
+  returnAllocationUnits(this, allocationBudget_, bytesToFree);
 }
 
 void MemoryPoolImpl::growContiguous(
     MachinePageCount increment,
     ContiguousAllocation& allocation) {
+  VELOX_CHECK(!allocationBudget_ || allocation.empty() || allocation.pool() == this);
+  AllocationBudgetReplacement budgetTransaction(this, allocation.size(),
+      allocationBudget_ ? AllocationTraits::pageBytes(increment) : 0, [&] { return allocation.size(); });
   if (!allocator_->growContiguous(
           increment, allocation, [this](uint64_t allocBytes, bool preAlloc) {
             if (preAlloc) {

@@ -40,13 +40,25 @@ class SelectivityVector {
  public:
   SelectivityVector() {}
 
-  explicit SelectivityVector(vector_size_t length, bool allSelected = true) {
+  /// An explicit pool owns bitmap backing and must outlive this object and
+  /// its moves. Null preserves the standalone system resource.
+  explicit SelectivityVector(vector_size_t length, bool allSelected = true,
+      memory::MemoryPool* pool = nullptr)
+      : bits_(pool ? memory::StlAllocator<uint64_t>(pool)
+                   : memory::StlAllocator<uint64_t>{}) {
     bits_.resize(bits::nwords(length), allSelected ? ~0ULL : 0);
     size_ = length;
     begin_ = 0;
     end_ = allSelected ? size_ : 0;
     allSelected_ = allSelected;
   }
+
+  /// Value copies are independent of the source pool's lifetime. Assignment
+  /// keeps the destination resource, including assignment from empty().
+  SelectivityVector(const SelectivityVector& other) { *this = other; }
+  SelectivityVector& operator=(const SelectivityVector&) = default;
+  SelectivityVector(SelectivityVector&&) = default;
+  SelectivityVector& operator=(SelectivityVector&&) = default;
 
   // Returns a statically allocated reference to an empty selectivity vector
   // (size zero).
@@ -377,7 +389,7 @@ class SelectivityVector {
 
  private:
   // The vector of bits for what is selected vs not (1 is selected).
-  std::vector<uint64_t> bits_;
+  std::vector<uint64_t, memory::StlAllocator<uint64_t>> bits_;
 
   // The number of leading bits used in 'bits_'.
   vector_size_t size_ = 0;

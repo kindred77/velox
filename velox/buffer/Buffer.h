@@ -372,6 +372,24 @@ class AlignedBuffer : public Buffer {
   using ImplClass = std::
       conditional_t<is_pod_like_v<T>, AlignedBuffer, NonPODAlignedBuffer<T>>;
 
+  /// Bytes requested from MemoryPool by allocate<T>, including header and
+  /// padding. Callers reserving actual backing must also apply pool alignment.
+  /// This does not include memory owned internally by non-POD elements, nor
+  /// retained old buffers during reallocation. Keep pool sizing policy stable
+  /// between planning the request and allocating it.
+  template <typename T>
+  static size_t allocationSize(
+      size_t numElements,
+      velox::memory::MemoryPool* pool,
+      bool allocateExact = false) {
+    const size_t size = checkedMultiply(numElements, sizeof(T));
+    if (allocateExact) {
+      const size_t tSize = (size / kSizeofAlignedBuffer) * kSizeofAlignedBuffer;
+      return checkedPlus<size_t>(tSize, kSizeofAlignedBuffer + kPaddedSize);
+    }
+    return pool->preferredSize(checkedPlus<size_t>(size, kPaddedSize));
+  }
+
   /**
    * Allocates enough memory to store numElements of type T.  May
    * allocate more memory than strictly necessary. Guarantees that
@@ -385,16 +403,8 @@ class AlignedBuffer : public Buffer {
       const std::optional<T>& initValue = std::nullopt,
       bool allocateExact = false) {
     size_t size = checkedMultiply(numElements, sizeof(T));
-    size_t preferredSize = 0;
-    if (allocateExact) {
-      const size_t tSize = (size / kSizeofAlignedBuffer) * kSizeofAlignedBuffer;
-
-      preferredSize =
-          checkedPlus<size_t>(tSize, kSizeofAlignedBuffer + kPaddedSize);
-    } else {
-      preferredSize =
-          pool->preferredSize(checkedPlus<size_t>(size, kPaddedSize));
-    }
+    const size_t preferredSize =
+        allocationSize<T>(numElements, pool, allocateExact);
 
     void* memory = pool->allocate(preferredSize);
     VELOX_CHECK_NOT_NULL(memory);
@@ -469,8 +479,7 @@ class AlignedBuffer : public Buffer {
       *buffer = std::move(newBuffer);
     } else {
       auto oldCapacity = checkedPlus<size_t>(old->capacity(), kPaddedSize);
-      auto preferredSize =
-          pool->preferredSize(checkedPlus<size_t>(size, kPaddedSize));
+      const auto preferredSize = allocationSize<T>(numElements, pool);
 
       void* newPtr = pool->reallocate(old, oldCapacity, preferredSize);
 
@@ -568,6 +577,13 @@ class AlignedBuffer : public Buffer {
     return false;
   }
 
+ private:
+  // Reject unrepresentable rounded bit counts before allocating or mutating an
+  // existing buffer; bits::nbytes alone can wrap near SIZE_MAX.
+  static size_t bitPackedBytes(size_t numElements) {
+    return checkedPlus<size_t>(numElements, 7) / 8;
+  }
+
  protected:
   AlignedBuffer(velox::memory::MemoryPool* pool, size_t capacity)
       : Buffer{
@@ -630,13 +646,21 @@ class AlignedBuffer : public Buffer {
 };
 
 template <>
+inline size_t AlignedBuffer::allocationSize<bool>(
+    size_t numElements,
+    velox::memory::MemoryPool* pool,
+    bool allocateExact) {
+  return allocationSize<char>(bitPackedBytes(numElements), pool, allocateExact);
+}
+
+template <>
 inline BufferPtr AlignedBuffer::allocate<bool>(
     size_t numElements,
     velox::memory::MemoryPool* pool,
     const std::optional<bool>& initValue,
     bool allocateExact) {
   return allocate<char>(
-      bits::nbytes(numElements),
+      bitPackedBytes(numElements),
       pool,
       initValue ? std::optional<char>(*initValue ? -1 : 0) : std::nullopt,
       allocateExact);
@@ -649,7 +673,7 @@ inline void AlignedBuffer::reallocate<bool>(
     const std::optional<bool>& initValue) {
   reallocate<char>(
       buffer,
-      bits::nbytes(numElements),
+      bitPackedBytes(numElements),
       initValue ? std::optional<char>(*initValue ? -1 : 0) : std::nullopt);
 }
 

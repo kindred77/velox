@@ -57,13 +57,10 @@ namespace facebook::velox {
 ///
 /// Memory Allocation of internal state:
 ///
-/// All memory required is directly allocated from the system’s memory allocator
-/// and is not managed by any memory pool. This means that the indices and nulls
-/// buffers either point directly to the corresponding buffers of the input
-/// vector which is decoded, or, are directly malloced from the system
-/// allocator. This allows objects of DecodedVector to be cached and re-used
-/// when such operations need to be performed frequently. This saves time wasted
-/// on memory allocations (see LocalDecodedVector class).
+/// Owned indices and nulls use the optional pool; default construction uses
+/// the system allocator. Borrowed input buffers and the shared constant-index
+/// tables retain their original ownership. Capacity is retained across decode
+/// calls for reuse; a supplied pool must outlive this decoder and its moves.
 ///
 /// NOTE:
 /// DecodedVector is only designed to read a potentially encoded vector. If the
@@ -77,6 +74,14 @@ class DecodedVector {
  public:
   /// Default constructor. The caller must call decode() or makeIndices() next.
   DecodedVector() = default;
+
+  /// Bind copied indices/nulls to an owner. Null selects the default system
+  /// resource for standalone callers without a query or operator pool.
+  explicit DecodedVector(memory::MemoryPool* pool)
+      : copiedIndices_(pool ? memory::StlAllocator<vector_size_t>(pool)
+                            : memory::StlAllocator<vector_size_t>{}),
+        copiedNulls_(pool ? memory::StlAllocator<uint64_t>(pool)
+                          : memory::StlAllocator<uint64_t>{}) {}
 
   /// Disable copy constructor and assignment.
   DecodedVector(const DecodedVector& other) = delete;
@@ -437,11 +442,11 @@ class DecodedVector {
 
   // Holds indices if an array of indices needs to be materialized,
   // e.g. when combining nested dictionaries.
-  mutable std::vector<vector_size_t> copiedIndices_;
+  mutable std::vector<vector_size_t, memory::StlAllocator<vector_size_t>> copiedIndices_;
 
   // Used as backing for 'nulls_' when null-ness is combined from
   // dictionary and base values.
-  std::vector<uint64_t> copiedNulls_;
+  std::vector<uint64_t, memory::StlAllocator<uint64_t>> copiedNulls_;
 
   // Used as 'nulls_' for a null constant vector.
   static uint64_t constantNullMask_;

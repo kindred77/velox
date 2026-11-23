@@ -41,15 +41,15 @@ class HashAggregation : public Operator {
       DriverCtx* driverCtx,
       const std::shared_ptr<const core::AggregationNode>& aggregationNode);
 
+  ~HashAggregation() override;
+
   void initialize() override;
 
   void addInput(RowVectorPtr input) override;
 
   RowVectorPtr getOutput() override;
 
-  bool needsInput() const override {
-    return !noMoreInput_ && !partialFull_;
-  }
+  bool needsInput() const override;
 
   bool startDrain() override;
 
@@ -74,6 +74,14 @@ class HashAggregation : public Operator {
   void close() override;
 
  private:
+  struct BoundedRunState;
+  std::unique_ptr<BoundedRunState> boundedRun_;
+  RowVectorPtr getBoundedOutput();
+  std::unique_ptr<GroupingSet> makeGroupingSet(
+      std::shared_ptr<core::ExpressionEvaluator>& evaluator,
+      bool setIdentityProjections,
+      AggregateInputResourceContracts resources = {});
+
   void updateRuntimeStats();
 
   void prepareOutput(vector_size_t size);

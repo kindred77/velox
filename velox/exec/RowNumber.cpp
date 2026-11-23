@@ -41,7 +41,7 @@ RowNumber::RowNumber(
 
   if (numKeys > 0) {
     table_ = std::make_unique<HashTable<false>>(
-        createVectorHashers(inputType, keys),
+        createVectorHashers(inputType, keys, pool()),
         std::vector<Accumulator>{},
         std::vector<TypePtr>{BIGINT()},
         false, // allowDuplicates

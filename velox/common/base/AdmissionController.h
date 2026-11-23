@@ -20,9 +20,12 @@
 #include <limits>
 #include <string>
 #include <mutex>
+#include <memory>
 #include "velox/common/future/VeloxPromise.h"
 
 namespace facebook::velox::common {
+
+class AdmissionReservation;
 
 /// A generic admission controller that can be used to limit the number of
 /// resources in use and can log metrics like resource usage, queued count,
@@ -30,7 +33,7 @@ namespace facebook::velox::common {
 /// the set limit, it will be placed in a FIFO queue. The thread must then wait
 /// until sufficient resources are freed by other threads, addressing all
 /// preceding requests in the queue, before its own request can be granted.
-class AdmissionController {
+class AdmissionController : public std::enable_shared_from_this<AdmissionController> {
  public:
   struct Config {
     /// The maximum number of resource units that can be used at any given time.
@@ -57,10 +60,17 @@ class AdmissionController {
   bool tryAccept(uint64_t resourceUnits);
   void release(uint64_t resourceUnits);
 
+  /// Never blocks the calling thread. Requires shared ownership of this
+  /// controller. The reservation owns any grant until claim() transfers it;
+  /// cancellation/destruction refunds an unclaimed grant or removes a waiter.
+  AdmissionReservation reserveAsync(uint64_t resourceUnits);
+
   uint64_t currentResourceUsage() const {
     std::lock_guard<std::mutex> l(mu_);
     return unitsUsed_;
   }
+
+  uint64_t maxResourceUsage() const { return config_.maxLimit; }
 
  private:
   // Called under mu_; subtraction remains valid even at UINT64_MAX.
@@ -68,13 +78,40 @@ class AdmissionController {
     return resourceUnits <= config_.maxLimit - unitsUsed_;
   }
 
-  struct Request {
-    uint64_t unitsRequested;
-    ContinuePromise promise;
-  };
+  friend class AdmissionReservation;
+  struct Request;
+  void drainQueue();
+  void cancel(const std::shared_ptr<Request>& request);
   Config config_;
   mutable std::mutex mu_;
   uint64_t unitsUsed_{0};
-  std::deque<Request> queue_;
+  std::deque<std::shared_ptr<Request>> queue_;
+  // Cancelled requests carry their own completion links; cancelling never
+  // allocates a second queue node while the resource is under pressure.
+  std::shared_ptr<Request> readyHead_;
+  std::shared_ptr<Request> readyTail_;
+  bool draining_{false};
+};
+/// Move-only ownership of a queued or granted admission request. A ready
+/// future includes cancellation: callers must claim the grant before work.
+/// Claim transfers responsibility for release to the consuming operation.
+class AdmissionReservation {
+ public:
+  AdmissionReservation(AdmissionReservation&& other) noexcept;
+  AdmissionReservation& operator=(AdmissionReservation&& other) noexcept;
+  ~AdmissionReservation();
+
+  ContinueFuture takeFuture();
+  bool isGranted() const;
+  bool belongsTo(const AdmissionController* owner) const;
+  uint64_t claim();
+  void cancel();
+
+ private:
+  friend class AdmissionController;
+  AdmissionReservation(std::shared_ptr<AdmissionController> owner,
+      std::shared_ptr<AdmissionController::Request> request);
+  std::shared_ptr<AdmissionController> owner_;
+  std::shared_ptr<AdmissionController::Request> request_;
 };
 } // namespace facebook::velox::common

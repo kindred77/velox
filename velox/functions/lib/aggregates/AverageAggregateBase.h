@@ -21,6 +21,8 @@
 #include "velox/vector/ComplexVector.h"
 #include "velox/vector/DecodedVector.h"
 #include "velox/vector/FlatVector.h"
+#include "velox/vector/VectorTypeUtils.h"
+#include <optional>
 
 namespace facebook::velox::functions::aggregate {
 
@@ -30,16 +32,17 @@ namespace {
 /// vector.
 SelectivityVector translateToInnerRows(
     const DecodedVector& decoded,
-    const SelectivityVector& rows) {
+    const SelectivityVector& rows,
+    memory::MemoryPool* pool) {
   VELOX_DCHECK(!decoded.isIdentityMapping());
   if (decoded.isConstantMapping()) {
     auto constantIndex = decoded.index(rows.begin());
-    SelectivityVector baseRows{constantIndex + 1, false};
+    SelectivityVector baseRows{constantIndex + 1, false, pool};
     baseRows.setValid(constantIndex, true);
     baseRows.updateBounds();
     return baseRows;
   } else {
-    SelectivityVector baseRows{decoded.base()->size(), false};
+    SelectivityVector baseRows{decoded.base()->size(), false, pool};
     rows.applyToSelected(
         [&](auto row) { baseRows.setValid(decoded.index(row), true); });
     baseRows.updateBounds();
@@ -53,10 +56,11 @@ SelectivityVector translateToInnerRows(
 const SelectivityVector* getBaseRows(
     const DecodedVector& decoded,
     const SelectivityVector& rows,
-    SelectivityVector& baseRowsHolder) {
+    SelectivityVector& baseRowsHolder,
+    memory::MemoryPool* pool) {
   const SelectivityVector* baseRows = &rows;
   if (!decoded.isIdentityMapping() && rows.hasSelections()) {
-    baseRowsHolder = translateToInnerRows(decoded, rows);
+    baseRowsHolder = translateToInnerRows(decoded, rows, pool);
     baseRows = &baseRowsHolder;
   }
   return baseRows;
@@ -78,6 +82,16 @@ class AverageAggregateBase : public exec::Aggregate {
  public:
   explicit AverageAggregateBase(TypePtr resultType)
       : exec::Aggregate(resultType) {}
+
+  bool prepareForBoundedInput(bool rawInput, const SelectivityVector& rows,
+      const std::vector<VectorPtr>& args, const VectorPtr& output) override {
+    if (!rawInput || args.size() != 1 || !isDirectlyDecodedScalar(*args[0]) ||
+        (output->size() == 0 && rows.hasSelections()) || !hasFixedWidthVectorBacking(*output)) return false;
+    const auto* row = output->template as<RowVector>();
+    return row && row->childrenSize() == 2 &&
+        row->childAt(0)->template as<FlatVector<TAccumulator>>() &&
+        row->childAt(1)->template as<FlatVector<int64_t>>();
+  }
 
   int32_t accumulatorFixedWidthSize() const override {
     return sizeof(SumCount<TAccumulator>);
@@ -139,31 +153,31 @@ class AverageAggregateBase : public exec::Aggregate {
       const SelectivityVector& rows,
       const std::vector<VectorPtr>& args,
       bool /*mayPushdown*/) override {
-    decodedRaw_.decode(*args[0], rows);
-    if (decodedRaw_.isConstantMapping()) {
-      if (!decodedRaw_.isNullAt(0)) {
-        auto value = decodedRaw_.valueAt<TInput>(0);
+    decodedRaw_->decode(*args[0], rows);
+    if (decodedRaw_->isConstantMapping()) {
+      if (!decodedRaw_->isNullAt(0)) {
+        auto value = decodedRaw_->valueAt<TInput>(0);
         rows.applyToSelected([&](vector_size_t i) {
           updateNonNullValue(groups[i], TAccumulator(value));
         });
       }
-    } else if (decodedRaw_.mayHaveNulls()) {
+    } else if (decodedRaw_->mayHaveNulls()) {
       rows.applyToSelected([&](vector_size_t i) {
-        if (decodedRaw_.isNullAt(i)) {
+        if (decodedRaw_->isNullAt(i)) {
           return;
         }
         updateNonNullValue(
-            groups[i], TAccumulator(decodedRaw_.valueAt<TInput>(i)));
+            groups[i], TAccumulator(decodedRaw_->valueAt<TInput>(i)));
       });
-    } else if (!exec::Aggregate::numNulls_ && decodedRaw_.isIdentityMapping()) {
-      auto data = decodedRaw_.data<TInput>();
+    } else if (!exec::Aggregate::numNulls_ && decodedRaw_->isIdentityMapping()) {
+      auto data = decodedRaw_->data<TInput>();
       rows.applyToSelected([&](vector_size_t i) {
         updateNonNullValue<false>(groups[i], data[i]);
       });
     } else {
       rows.applyToSelected([&](vector_size_t i) {
         updateNonNullValue(
-            groups[i], TAccumulator(decodedRaw_.valueAt<TInput>(i)));
+            groups[i], TAccumulator(decodedRaw_->valueAt<TInput>(i)));
       });
     }
   }
@@ -173,30 +187,30 @@ class AverageAggregateBase : public exec::Aggregate {
       const SelectivityVector& rows,
       const std::vector<VectorPtr>& args,
       bool /*mayPushdown*/) override {
-    decodedRaw_.decode(*args[0], rows);
+    decodedRaw_->decode(*args[0], rows);
 
-    if (decodedRaw_.isConstantMapping()) {
-      if (!decodedRaw_.isNullAt(0)) {
-        const TInput value = decodedRaw_.valueAt<TInput>(0);
+    if (decodedRaw_->isConstantMapping()) {
+      if (!decodedRaw_->isNullAt(0)) {
+        const TInput value = decodedRaw_->valueAt<TInput>(0);
         const auto numRows = rows.countSelected();
         updateNonNullValue(group, numRows, TAccumulator(value) * numRows);
       }
-    } else if (decodedRaw_.mayHaveNulls()) {
+    } else if (decodedRaw_->mayHaveNulls()) {
       rows.applyToSelected([&](vector_size_t i) {
-        if (!decodedRaw_.isNullAt(i)) {
+        if (!decodedRaw_->isNullAt(i)) {
           updateNonNullValue(
-              group, TAccumulator(decodedRaw_.valueAt<TInput>(i)));
+              group, TAccumulator(decodedRaw_->valueAt<TInput>(i)));
         }
       });
-    } else if (!exec::Aggregate::numNulls_ && decodedRaw_.isIdentityMapping()) {
-      const TInput* data = decodedRaw_.data<TInput>();
+    } else if (!exec::Aggregate::numNulls_ && decodedRaw_->isIdentityMapping()) {
+      const TInput* data = decodedRaw_->data<TInput>();
       TAccumulator totalSum(0);
       rows.applyToSelected([&](vector_size_t i) { totalSum += data[i]; });
       updateNonNullValue<false>(group, rows.countSelected(), totalSum);
     } else {
       TAccumulator totalSum(0);
       rows.applyToSelected(
-          [&](vector_size_t i) { totalSum += decodedRaw_.valueAt<TInput>(i); });
+          [&](vector_size_t i) { totalSum += decodedRaw_->valueAt<TInput>(i); });
       updateNonNullValue(group, rows.countSelected(), totalSum);
     }
   }
@@ -206,8 +220,8 @@ class AverageAggregateBase : public exec::Aggregate {
       const SelectivityVector& rows,
       const std::vector<VectorPtr>& args,
       bool /* mayPushdown */) override {
-    decodedPartial_.decode(*args[0], rows);
-    auto baseRowVector = decodedPartial_.base()->template as<RowVector>();
+    decodedPartial_->decode(*args[0], rows);
+    auto baseRowVector = decodedPartial_->base()->template as<RowVector>();
 
     if (validateIntermediateInputs_ &&
         (baseRowVector->childAt(0)->mayHaveNulls() ||
@@ -223,8 +237,8 @@ class AverageAggregateBase : public exec::Aggregate {
       const SelectivityVector& rows,
       const std::vector<VectorPtr>& args,
       bool /* mayPushdown */) override {
-    decodedPartial_.decode(*args[0], rows);
-    auto baseRowVector = decodedPartial_.base()->template as<RowVector>();
+    decodedPartial_->decode(*args[0], rows);
+    auto baseRowVector = decodedPartial_->base()->template as<RowVector>();
 
     if (validateIntermediateInputs_ &&
         (baseRowVector->childAt(0)->mayHaveNulls() ||
@@ -236,6 +250,21 @@ class AverageAggregateBase : public exec::Aggregate {
   }
 
  protected:
+  void setAllocatorInternal(HashStringAllocator* allocator) override {
+    auto* pool = allocator ? allocator->pool() : nullptr;
+    // Same-owner rebinding must preserve decoder capacity. Reconstruct only
+    // on a resource change: vector move assignment retains its old allocator.
+    if (resourcePool() != pool) {
+      decodedRaw_.emplace(pool);
+      decodedPartial_.emplace(pool);
+    }
+    exec::Aggregate::setAllocatorInternal(allocator);
+  }
+
+  memory::MemoryPool* resourcePool() const {
+    return allocator_ ? allocator_->pool() : nullptr;
+  }
+
   /// Partial.
   template <bool tableHasNulls = true>
   inline void updateNonNullValue(char* group, TAccumulator value) {
@@ -265,17 +294,19 @@ class AverageAggregateBase : public exec::Aggregate {
   void addIntermediateResultsImpl(
       char** groups,
       const SelectivityVector& rows) {
-    auto baseRowVector = decodedPartial_.base()->template as<RowVector>();
+    auto baseRowVector = decodedPartial_->base()->template as<RowVector>();
 
-    SelectivityVector baseRowsHolder;
-    auto* baseRows = getBaseRows(decodedPartial_, rows, baseRowsHolder);
+    SelectivityVector baseRowsHolder(0, false, resourcePool());
+    auto* baseRows = getBaseRows(*decodedPartial_, rows, baseRowsHolder, resourcePool());
 
-    DecodedVector baseSumDecoded{*baseRowVector->childAt(0), *baseRows};
-    DecodedVector baseCountDecoded{*baseRowVector->childAt(1), *baseRows};
+    DecodedVector baseSumDecoded(resourcePool());
+    DecodedVector baseCountDecoded(resourcePool());
+    baseSumDecoded.decode(*baseRowVector->childAt(0), *baseRows);
+    baseCountDecoded.decode(*baseRowVector->childAt(1), *baseRows);
 
-    if (decodedPartial_.isConstantMapping()) {
-      if (!decodedPartial_.isNullAt(0)) {
-        auto decodedIndex = decodedPartial_.index(0);
+    if (decodedPartial_->isConstantMapping()) {
+      if (!decodedPartial_->isNullAt(0)) {
+        auto decodedIndex = decodedPartial_->index(0);
         if constexpr (checkNullFields) {
           VELOX_USER_CHECK(
               !baseSumDecoded.isNullAt(decodedIndex) &&
@@ -287,12 +318,12 @@ class AverageAggregateBase : public exec::Aggregate {
           updateNonNullValue(groups[i], count, sum);
         });
       }
-    } else if (decodedPartial_.mayHaveNulls()) {
+    } else if (decodedPartial_->mayHaveNulls()) {
       rows.applyToSelected([&](vector_size_t i) {
-        if (decodedPartial_.isNullAt(i)) {
+        if (decodedPartial_->isNullAt(i)) {
           return;
         }
-        auto decodedIndex = decodedPartial_.index(i);
+        auto decodedIndex = decodedPartial_->index(i);
         if constexpr (checkNullFields) {
           VELOX_USER_CHECK(
               !baseSumDecoded.isNullAt(decodedIndex) &&
@@ -305,7 +336,7 @@ class AverageAggregateBase : public exec::Aggregate {
       });
     } else {
       rows.applyToSelected([&](vector_size_t i) {
-        auto decodedIndex = decodedPartial_.index(i);
+        auto decodedIndex = decodedPartial_->index(i);
         if constexpr (checkNullFields) {
           VELOX_USER_CHECK(
               !baseSumDecoded.isNullAt(decodedIndex) &&
@@ -323,17 +354,19 @@ class AverageAggregateBase : public exec::Aggregate {
   void addSingleGroupIntermediateResultsImpl(
       char* group,
       const SelectivityVector& rows) {
-    auto baseRowVector = decodedPartial_.base()->template as<RowVector>();
+    auto baseRowVector = decodedPartial_->base()->template as<RowVector>();
 
-    SelectivityVector baseRowsHolder;
-    auto* baseRows = getBaseRows(decodedPartial_, rows, baseRowsHolder);
+    SelectivityVector baseRowsHolder(0, false, resourcePool());
+    auto* baseRows = getBaseRows(*decodedPartial_, rows, baseRowsHolder, resourcePool());
 
-    DecodedVector baseSumDecoded{*baseRowVector->childAt(0), *baseRows};
-    DecodedVector baseCountDecoded{*baseRowVector->childAt(1), *baseRows};
+    DecodedVector baseSumDecoded(resourcePool());
+    DecodedVector baseCountDecoded(resourcePool());
+    baseSumDecoded.decode(*baseRowVector->childAt(0), *baseRows);
+    baseCountDecoded.decode(*baseRowVector->childAt(1), *baseRows);
 
-    if (decodedPartial_.isConstantMapping()) {
-      if (!decodedPartial_.isNullAt(0)) {
-        auto decodedIndex = decodedPartial_.index(0);
+    if (decodedPartial_->isConstantMapping()) {
+      if (!decodedPartial_->isNullAt(0)) {
+        auto decodedIndex = decodedPartial_->index(0);
         if constexpr (checkNullFields) {
           VELOX_USER_CHECK(
               !baseSumDecoded.isNullAt(decodedIndex) &&
@@ -347,10 +380,10 @@ class AverageAggregateBase : public exec::Aggregate {
             numRows;
         updateNonNullValue(group, totalCount, totalSum);
       }
-    } else if (decodedPartial_.mayHaveNulls()) {
+    } else if (decodedPartial_->mayHaveNulls()) {
       rows.applyToSelected([&](vector_size_t i) {
-        if (!decodedPartial_.isNullAt(i)) {
-          auto decodedIndex = decodedPartial_.index(i);
+        if (!decodedPartial_->isNullAt(i)) {
+          auto decodedIndex = decodedPartial_->index(i);
           if constexpr (checkNullFields) {
             VELOX_USER_CHECK(
                 !baseSumDecoded.isNullAt(decodedIndex) &&
@@ -366,7 +399,7 @@ class AverageAggregateBase : public exec::Aggregate {
       TAccumulator totalSum(0);
       int64_t totalCount = 0;
       rows.applyToSelected([&](vector_size_t i) {
-        auto decodedIndex = decodedPartial_.index(i);
+        auto decodedIndex = decodedPartial_->index(i);
         if constexpr (checkNullFields) {
           VELOX_USER_CHECK(
               !baseSumDecoded.isNullAt(decodedIndex) &&
@@ -390,8 +423,8 @@ class AverageAggregateBase : public exec::Aggregate {
     }
   }
 
-  DecodedVector decodedRaw_;
-  DecodedVector decodedPartial_;
+  std::optional<DecodedVector> decodedRaw_{std::in_place};
+  std::optional<DecodedVector> decodedPartial_{std::in_place};
 };
 
 template <typename TUnscaledType>

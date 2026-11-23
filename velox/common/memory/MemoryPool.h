@@ -36,6 +36,11 @@ namespace facebook::velox::exec {
 class ParallelMemoryReclaimer;
 }
 
+namespace facebook::velox::common {
+class AdmissionController;
+class AdmissionReservation;
+}
+
 namespace facebook::velox::memory {
 class TestArbitrator;
 class MemoryManager;
@@ -246,6 +251,30 @@ class MemoryPool : public std::enable_shared_from_this<MemoryPool> {
   virtual std::shared_ptr<MemoryPool> addAggregateChild(
       const std::string& name,
       std::unique_ptr<MemoryReclaimer> reclaimer = nullptr);
+
+  /// Bind a shared actual-allocation budget before publishing this leaf or
+  /// allocating from it. Reservation bytes and allocator bytes are distinct.
+  void setAllocationBudget(std::shared_ptr<common::AdmissionController> budget);
+
+  /// Nonblocking preauthorization for a synchronous operation on this thread.
+  /// False never invokes operation. Unspent credit is returned on scope exit;
+  /// allocations retain their charge until actual free. Other threads cannot
+  /// consume this operation's credit even when they use the same leaf pool.
+  bool tryWithAllocationCredit(
+      uint64_t bytes, const std::function<void()>& operation);
+
+  /// Owner of the innermost synchronous credit scope on this thread, if any.
+  /// Only for temporary work within that scope; never retain or cross threads.
+  static MemoryPool* currentAllocationCreditPool();
+
+  /// Consume a granted async reservation from this pool's own budget. Pending,
+  /// cancelled, or mismatched ownership is rejected before invoking operation.
+  void withAllocationCredit(common::AdmissionReservation reservation,
+      const std::function<void()>& operation);
+
+  const std::shared_ptr<common::AdmissionController>& allocationBudget() const {
+    return allocationBudget_;
+  }
 
   /// Allocates a buffer with specified 'size'.
   virtual void* allocate(
@@ -626,6 +655,8 @@ class MemoryPool : public std::enable_shared_from_this<MemoryPool> {
   std::atomic<bool> aborted_{false};
   /// Saves the aborted error exception which is only set if 'aborted_' is true.
   std::exception_ptr abortError_{nullptr};
+
+  std::shared_ptr<common::AdmissionController> allocationBudget_;
 
   mutable folly::SharedMutex poolMutex_;
   std::unordered_map<std::string, std::weak_ptr<MemoryPool>> children_;
@@ -1188,12 +1219,15 @@ class MemoryPoolImpl : public MemoryPool {
   bool debugWarnThresholdExceeded_{false};
 };
 
-/// An Allocator backed by a memory pool for STL containers.
+/// STL allocator with an optional owner. Default construction uses the system
+/// allocator; an explicitly supplied pool must be non-null and outlive storage.
 template <typename T>
 class StlAllocator {
  public:
   typedef T value_type;
-  MemoryPool* pool;
+  MemoryPool* pool{nullptr};
+
+  StlAllocator() noexcept = default;
 
   /* implicit */ StlAllocator(MemoryPool& pool) : pool{&pool} {}
 
@@ -1205,11 +1239,14 @@ class StlAllocator {
   /* implicit */ StlAllocator(const StlAllocator<U>& a) : pool{a.pool} {}
 
   T* allocate(size_t n) {
-    return static_cast<T*>(pool->allocate(checkedMultiply(n, sizeof(T))));
+    const auto bytes = checkedMultiply(n, sizeof(T));
+    if (pool == nullptr) return std::allocator<T>{}.allocate(n);
+    return static_cast<T*>(pool->allocate(bytes));
   }
 
   void deallocate(T* p, size_t n) {
-    pool->free(p, checkedMultiply(n, sizeof(T)));
+    if (pool == nullptr) std::allocator<T>{}.deallocate(p, n);
+    else pool->free(p, checkedMultiply(n, sizeof(T)));
   }
 
   template <typename T1>

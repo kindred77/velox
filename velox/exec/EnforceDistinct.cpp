@@ -39,7 +39,7 @@ EnforceDistinct::EnforceDistinct(
 
   groupingSet_ = GroupingSet::createForDistinct(
       inputType,
-      createVectorHashers(inputType, planNode->distinctKeys()),
+      createVectorHashers(inputType, planNode->distinctKeys(), pool()),
       toChannels(
           inputType,
           std::vector<core::TypedExprPtr>{

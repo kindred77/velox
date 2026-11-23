@@ -329,21 +329,26 @@ void* MallocAllocator::allocateBytesWithoutRetry(
         bytes,
         alignment);
   }
+  void* result = nullptr;
+  if (!testingHasInjectedFailure(InjectedFailure::kAllocate)) {
 #ifdef _WIN32
-  // Both branches must come from the posix_* family on Windows: freeBytes()
-  // releases them through posix_free(), which under GPORCA_POSIX_ALLOC_FAST
-  // (default on) recovers the base pointer from a header stored just before the
-  // returned pointer.  A plain ::malloc() block has no such header, so it must
-  // not be handed to posix_free().  Under the legacy path posix_malloc() is
-  // exactly ::malloc().
-  void* result = (alignment > kMinAlignment)
-      ? ::posix_aligned_alloc(alignment, bytes)
-      : ::posix_malloc(bytes);
+    // Both branches must come from the posix_* family on Windows: freeBytes()
+    // releases them through posix_free(), which under GPORCA_POSIX_ALLOC_FAST
+    // (default on) recovers the base pointer from a header stored just before the
+    // returned pointer.  A plain ::malloc() block has no such header, so it must
+    // not be handed to posix_free().  Under the legacy path posix_malloc() is
+    // exactly ::malloc().
+    result = (alignment > kMinAlignment)
+        ? ::posix_aligned_alloc(alignment, bytes)
+        : ::posix_malloc(bytes);
 #else
-  void* result = (alignment > kMinAlignment) ? ::aligned_alloc(alignment, bytes)
-                                             : ::malloc(bytes);
+    result = (alignment > kMinAlignment) ? ::aligned_alloc(alignment, bytes)
+                                               : ::malloc(bytes);
 #endif
+  }
   if (FOLLY_UNLIKELY(result == nullptr)) {
+    // Failed backing allocation owns no bytes, even if usage was precharged.
+    decrementUsage(bytes);
     VELOX_MEM_LOG(ERROR) << "Failed to allocateBytes " << succinctBytes(bytes)
                          << " with " << alignment << " alignment";
   }
@@ -361,12 +366,17 @@ void* MallocAllocator::allocateZeroFilledWithoutRetry(uint64_t bytes) {
     setAllocatorFailureMessage(errorMsg);
     return nullptr;
   }
+  void* result = nullptr;
+  if (!testingHasInjectedFailure(InjectedFailure::kAllocate)) {
 #ifdef _WIN32
-  void* result = ::posix_calloc(1, bytes); // Use wrapper on Windows
+    result = ::posix_calloc(1, bytes); // Use wrapper on Windows
 #else
-  void* result = ::calloc(1, bytes);
+    result = ::calloc(1, bytes);
 #endif
+  }
   if (FOLLY_UNLIKELY(result == nullptr)) {
+    // Failed backing allocation owns no bytes, even if usage was precharged.
+    decrementUsage(bytes);
     VELOX_MEM_LOG(ERROR) << "Failed to allocateZeroFilled "
                          << succinctBytes(bytes);
   }
@@ -401,15 +411,18 @@ void* MallocAllocator::reallocateBytesWithoutRetry(
     setAllocatorFailureMessage(errorMsg);
     return nullptr;
   }
+  void* result = nullptr;
+  if (!testingHasInjectedFailure(InjectedFailure::kAllocate)) {
 #ifdef _WIN32
-  // Bytes handed out by allocateBytes() come from the posix_* family (either the
-  // self-describing header under GPORCA_POSIX_ALLOC_FAST or the legacy aligned
-  // registry); plain ::realloc() cannot safely handle either, so route through
-  // the wrapper, which knows how to grow such a block.
-  void* result = ::posix_realloc(p, newSize);
+    // Bytes handed out by allocateBytes() come from the posix_* family (either the
+    // self-describing header under GPORCA_POSIX_ALLOC_FAST or the legacy aligned
+    // registry); plain ::realloc() cannot safely handle either, so route through
+    // the wrapper, which knows how to grow such a block.
+    result = ::posix_realloc(p, newSize);
 #else
-  void* result = ::realloc(p, newSize); // NOLINT
+    result = ::realloc(p, newSize); // NOLINT
 #endif
+  }
   if (result == nullptr) {
     // realloc failed. The original pointer is still valid.
     if (delta > 0) {

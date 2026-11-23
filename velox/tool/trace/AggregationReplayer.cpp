@@ -29,17 +29,9 @@ core::PlanNodePtr AggregationReplayer::createPlanNode(
     const core::PlanNodePtr& source) const {
   const auto* aggregationNode =
       dynamic_cast<const core::AggregationNode*>(node);
-  return std::make_shared<core::AggregationNode>(
-      nodeId,
-      aggregationNode->step(),
-      aggregationNode->groupingKeys(),
-      aggregationNode->preGroupedKeys(),
-      aggregationNode->aggregateNames(),
-      aggregationNode->aggregates(),
-      aggregationNode->globalGroupingSets(),
-      aggregationNode->groupId(),
-      aggregationNode->ignoreNullKeys(),
-      aggregationNode->noGroupsSpanBatches(),
-      source);
+  return core::AggregationNode::Builder(*aggregationNode)
+      .id(nodeId)
+      .source(source)
+      .build();
 }
 } // namespace facebook::velox::tool::trace

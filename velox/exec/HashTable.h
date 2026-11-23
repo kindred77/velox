@@ -69,9 +69,11 @@ struct HashLookup {
       const std::vector<std::unique_ptr<VectorHasher>>& h,
       memory::MemoryPool* pool)
       : hashers(h),
+        scratchMemory{DecodedVector(pool), raw_vector<uint64_t>(pool)},
         rows(raw_vector<vector_size_t>(pool)),
         hashes(raw_vector<uint64_t>(pool)),
         hits(raw_vector<char*>(pool)),
+        newGroups(memory::StlAllocator<vector_size_t>(pool)),
         normalizedKeys(raw_vector<uint64_t>(pool)) {}
 
   void reset(vector_size_t size) {
@@ -106,7 +108,7 @@ struct HashLookup {
 
   /// For groupProbe, row numbers for which a new entry was inserted (didn't
   /// exist before the groupProbe). Empty for joinProbe.
-  std::vector<vector_size_t> newGroups;
+  std::vector<vector_size_t, memory::StlAllocator<vector_size_t>> newGroups;
 
   /// If using valueIds, list of concatenated valueIds. 1:1 with 'hashes'.
   /// Populated by groupProbe and joinProbe.
@@ -432,6 +434,18 @@ class BaseHashTable {
   /// follows generic/normalized rehash sizing; value-dependent array mode
   /// transitions require separate allocation authorization.
   virtual uint64_t hashTableSizeIncrease(int32_t numNewDistinct) const = 0;
+
+  /// Additional allocation credit needed by checkSize(), including a complete
+  /// replacement block while the old block remains charged. Unlike net growth,
+  /// this is nonzero for a same-capacity tombstone rebuild. Only describes the
+  /// rehash allocation plan: adaptive hash-mode transitions, hashers, probe
+  /// scratch (including rehash scratch) and payload rows require their own
+  /// authorization.
+  virtual uint64_t hashTableRehashAllocationBytes(int32_t numNewDistinct) const = 0;
+
+  /// Settle generic representation and worst-case probe capacity before updates.
+  virtual void prepareGenericGroupProbeCapacity(
+      int32_t numNew, int8_t spillInputStartPartitionBit) = 0;
 
   /// Returns the estimated new hash table size in bytes with the given number
   /// of distinct entries.
@@ -781,6 +795,11 @@ class HashTable : public BaseHashTable {
 
   uint64_t hashTableSizeIncrease(int32_t numNewDistinct) const override;
 
+  uint64_t hashTableRehashAllocationBytes(int32_t numNewDistinct) const override;
+
+  void prepareGenericGroupProbeCapacity(
+      int32_t numNew, int8_t spillInputStartPartitionBit) override;
+
   uint64_t estimateHashTableSize(uint64_t numDistinct) const override {
     // Take the max of max size in array mode and estimated size in non-array
     // mode.
@@ -902,6 +921,9 @@ class HashTable : public BaseHashTable {
 
   // Same-capacity tombstone cleanup is still an allocation and rehash.
   TableAllocationPlan planTableAllocation(int32_t numNew) const;
+
+  // Shared by allocation and preauthorization; rejects page-rounding overflow.
+  uint64_t tableAllocationBytes(uint64_t capacity) const;
 
   // Returns the number of entries with 'numNew' and existing 'numDistincts'
   // distincts to create a new hash table.

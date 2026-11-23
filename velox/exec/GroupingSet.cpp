@@ -20,6 +20,7 @@
 #include "velox/common/testutil/TestValue.h"
 #include "velox/exec/OperatorUtils.h"
 #include "velox/exec/Task.h"
+#include "velox/vector/VectorTypeUtils.h"
 
 using facebook::velox::common::testutil::TestValue;
 
@@ -84,10 +85,15 @@ GroupingSet::GroupingSet(
       groupingKeyOutputProjections_(std::move(groupingKeyOutputProjections)),
       hashers_(std::move(hashers)),
       aggregates_(std::move(aggregates)),
-      masks_(extractMaskChannels(aggregates_)),
+      masks_(extractMaskChannels(aggregates_), pool_),
       groupIdChannel_(groupIdChannel),
+      activeRows_(0, false, pool_),
       stringAllocator_(pool_),
-      rows_(pool_) {
+      rows_(pool_),
+      mergeSelection_(0, false, pool_),
+      intermediateGroups_(memory::StlAllocator<char*>(pool)),
+      intermediateRowNumbers_(memory::StlAllocator<vector_size_t>(pool)),
+      firstGroup_(memory::StlAllocator<char*>(pool)) {
   VELOX_CHECK_NOT_NULL(nonReclaimableSection_);
   VELOX_CHECK(pool_->trackUsage());
 
@@ -333,7 +339,8 @@ void GroupingSet::addInputForActiveRows(
   if (distinctKeySet_ != nullptr) {
     VELOX_DCHECK(hashers_.size() == 1);
     const auto& keyVector = input->childAt(fastDistinctKeyChannel_);
-    DecodedVector decoded(*keyVector, activeRows_);
+    DecodedVector decoded(pool_);
+    decoded.decode(*keyVector, activeRows_);
     lookup_->newGroups.clear();
     activeRows_.applyToSelected([&](auto row) {
       bool isNew;
@@ -378,7 +385,16 @@ void GroupingSet::addInputForActiveRows(
     return;
   }
 
-  table_->groupProbe(*lookup_, BaseHashTable::kNoSpillInputStartPartitionBit);
+  addInputForPreparedProbe(input, mayPushdown);
+}
+
+void GroupingSet::addInputForPreparedProbe(
+    const RowVectorPtr& input, bool mayPushdown) {
+  // A bounded private run has already materialized its keys during
+  // discardable preparation, before any aggregate state is initialized.
+  if (preparedBoundedInput_ != input.get()) {
+    table_->groupProbe(*lookup_, BaseHashTable::kNoSpillInputStartPartitionBit);
+  }
   masks_.addInput(input, activeRows_);
 
   auto* groups = lookup_->hits.data();
@@ -432,6 +448,145 @@ void GroupingSet::addInputForActiveRows(
     }
     sortedAggregations_->addInput(groups, input);
   }
+}
+
+void GroupingSet::prepareBoundedRun(
+    const RowVectorPtr& input, const RowVectorPtr& output,
+    ConstAggregateInputResourceContracts resources, bool singletonRows) {
+  VELOX_USER_CHECK(isPartial_ && isRawInput_ && !isGlobal_ && !isDistinct() &&
+      preGroupedKeyChannels_.empty() && globalGroupingSets_.empty() &&
+      !spillConfig_ && !sortedAggregations_,
+      "Aggregation has no bounded-run resource contract");
+  for (const auto& aggregate : aggregates_) {
+    VELOX_USER_CHECK(!aggregate.distinct && !aggregate.mask && aggregate.sortingKeys.empty(),
+        "Aggregation modifiers have no bounded-run resource contract");
+  }
+  VELOX_CHECK_EQ(resources.size(), aggregates_.size());
+  for (size_t i = 0; i < resources.size(); ++i) {
+    VELOX_USER_CHECK(resources[i].has_value(),
+        "Aggregate has no bounded-run resource contract");
+    const auto& contract = *resources[i];
+    const auto& function = aggregates_[i].function;
+    VELOX_USER_CHECK(function->isFixedSize() && !function->accumulatorUsesExternalMemory() &&
+        function->accumulatorFixedWidthSize() >= 0 &&
+        function->accumulatorFixedWidthSize() <= contract.stateBytesUpperBound &&
+        function->accumulatorAlignmentSize() > 0 &&
+        (function->accumulatorAlignmentSize() & (function->accumulatorAlignmentSize() - 1)) == 0 &&
+        function->accumulatorAlignmentSize() <= contract.stateAlignmentUpperBound,
+        "Aggregate state exceeds bounded-run resource contract");
+  }
+  const auto size = input->size();
+  const auto prepareOutput = [&](vector_size_t rows) {
+    output->resize(rows);
+    for (auto i = 0; i < output->childrenSize(); ++i) {
+      const auto& type = output->type()->childAt(i);
+      if (type->isVarchar() || type->isVarbinary()) {
+        auto child = BaseVector::create(type, rows, pool_);
+        (void)child->mutableRawNulls();
+        output->childAt(i) = std::move(child);
+      } else {
+        output->childAt(i) = createFixedWidthVector(type, rows, pool_);
+      }
+    }
+  };
+  // Normalize each consumed column once, shared by all aggregate consumers.
+  // Range copy avoids ensureWritable's unowned selector/decoder scratch. The
+  // private input is changed before key decoders can borrow any of its buffers.
+  for (const auto& aggregate : aggregates_) {
+    for (const auto channel : aggregate.inputs) {
+      if (channel == kConstantChannel) continue;
+      auto& child = input->childAt(channel);
+      VELOX_USER_CHECK(!isLazyNotLoaded(*child), "Bounded input must be loaded before preparation");
+      if (isDirectlyDecodedScalar(*child)) continue;
+      VELOX_USER_CHECK(child->type()->isPrimitiveType() && child->type()->isFixedWidth() &&
+          !child->type()->providesCustomComparison(), "Input type has no bounded normalization contract");
+      auto normalized = BaseVector::create(child->type(), size, pool_);
+      normalized->copy(child.get(), 0, 0, size);
+      child = std::move(normalized);
+    }
+  }
+  createHashTable();
+  for (const auto& hasher : table_->hashers()) {
+    VELOX_USER_CHECK(hasher->type()->isPrimitiveType() &&
+        (hasher->type()->isFixedWidth() || hasher->type()->isVarchar() || hasher->type()->isVarbinary()) &&
+        !hasher->type()->providesCustomComparison() &&
+        !isLazyNotLoaded(*input->childAt(hasher->channel())),
+        "Grouping key has no bounded-run resource contract");
+  }
+  activeRows_.resize(size);
+  activeRows_.setAll();
+  if (singletonRows) {
+    prepareOutput(size);
+    abandonPartialAggregation(true);
+    intermediateRows_->reserveRows(size);
+    intermediateGroups_.reserve(size);
+    intermediateRowNumbers_.reserve(size);
+    firstGroup_.reserve(size);
+    for (auto i = 0; i < keyChannels_.size(); ++i) {
+      const auto channel = keyChannels_[groupingKeyOutputProjections_[i]];
+      // toIntermediate shares its input keys. Own that backing in the same
+      // admission domain before any output can outlive this private run.
+      output->childAt(i)->copy(input->childAt(channel).get(), 0, 0, size);
+      input->childAt(channel) = output->childAt(i);
+    }
+  } else {
+    table_->prepareGenericGroupProbeCapacity(size, BaseHashTable::kNoSpillInputStartPartitionBit);
+    lookup_->newGroups.reserve(size);
+    table_->prepareForGroupProbe(*lookup_, input, activeRows_,
+        BaseHashTable::kNoSpillInputStartPartitionBit);
+    table_->rows()->reserveRows(lookup_->rows.size());
+    // Keys and their variable payload belong to this private, discardable
+    // run. Preparing them is safe; initialize/update aggregates only after
+    // the allocation scope has completed successfully.
+    if (!lookup_->rows.empty()) {
+      table_->groupProbe(*lookup_, BaseHashTable::kNoSpillInputStartPartitionBit);
+    }
+    // The table is private and started empty. These are exact groups for this
+    // run, including NULL keys; no aggregate has consumed input yet.
+    VELOX_CHECK_EQ(table_->numDistinct(), lookup_->newGroups.size());
+    VELOX_CHECK_LE(lookup_->newGroups.size(), size);
+    prepareOutput(static_cast<vector_size_t>(lookup_->newGroups.size()));
+    for (auto i = 0; i < keyChannels_.size(); ++i) {
+      const auto& hasher = table_->hashers()[groupingKeyOutputProjections_[i]];
+      if (!hasher->type()->isVarchar() && !hasher->type()->isVarbinary()) continue;
+      auto& decoded = hasher->decodedVector();
+      uint64_t bytes = 0;
+      for (const auto row : lookup_->newGroups) {
+        if (!decoded.isNullAt(row)) {
+          const auto value = decoded.template valueAt<StringView>(row);
+          if (!value.isInline()) bytes = checkedPlus(bytes, uint64_t(value.size()));
+        }
+      }
+      // One representative per actual group bounds extraction. Repeated
+      // input keys need no duplicate output payload reservation.
+      if (bytes != 0) output->childAt(i)->asFlatVector<StringView>()->getBufferWithSpace(bytes, true);
+    }
+  }
+  for (auto i = 0; i < aggregates_.size(); ++i) {
+    populateTempVectors(i, input);
+    VELOX_CHECK_EQ(tempVectors_.size(), resources[i]->argumentCount);
+    VELOX_USER_CHECK(aggregates_[i].function->resultType()->kindEquals(
+        output->childAt(keyChannels_.size() + i)->type()),
+        "Aggregate output type does not match bounded-run output");
+    VELOX_USER_CHECK(aggregates_[i].function->prepareForBoundedInput(
+        isRawInput_, activeRows_, tempVectors_, output->childAt(keyChannels_.size() + i)),
+        "Aggregate has no bounded-run resource contract");
+  }
+  tempVectors_.clear();
+  preparedBoundedInput_ = input.get();
+}
+
+void GroupingSet::addPreparedBoundedInput(const RowVectorPtr& input, RowVectorPtr& output) {
+  VELOX_CHECK(!noMoreInput_);
+  VELOX_CHECK(preparedBoundedInput_ == input.get(), "Prepared input identity changed");
+  numInputRows_ += input->size();
+  if (abandonedPartialAggregation_) {
+    toIntermediate(input, output);
+  } else {
+    VELOX_CHECK(table_);
+    if (!lookup_->rows.empty()) addInputForPreparedProbe(input, false);
+  }
+  preparedBoundedInput_ = nullptr;
 }
 
 void GroupingSet::addRemainingInput() {
@@ -857,12 +1012,20 @@ void GroupingSet::populateTempVectors(
     int32_t aggregateIndex,
     const RowVectorPtr& input) {
   const auto& channels = aggregates_[aggregateIndex].inputs;
-  const auto& constants = aggregates_[aggregateIndex].constantInputs;
+  auto& constants = aggregates_[aggregateIndex].constantInputs;
   tempVectors_.resize(channels.size());
   for (auto i = 0; i < channels.size(); ++i) {
     if (channels[i] == kConstantChannel) {
-      tempVectors_[i] =
-          BaseVector::wrapInConstant(input->size(), 0, constants[i]);
+      if (constants[i]->size() == input->size()) {
+        tempVectors_[i] = constants[i];
+      } else {
+        auto sized = BaseVector::wrapInConstant(input->size(), 0, constants[i]);
+        // Preparation and update share this immutable argument. Rewrapping a
+        // NULL (or non-inline string) can allocate even at the same length.
+        // Keep a nonempty source for a later batch after an empty input.
+        if (input->size() > 0) constants[i] = sized;
+        tempVectors_[i] = std::move(sized);
+      }
     } else {
       // No load of lazy vectors; The aggregate may decide to push down.
       tempVectors_[i] = input->childAt(channels[i]);
@@ -886,9 +1049,10 @@ bool GroupingSet::getOutput(
     int32_t maxOutputRows,
     int32_t maxOutputBytes,
     RowContainerIterator& iterator,
-    RowVectorPtr& result) {
+    RowVectorPtr& result,
+    folly::Range<char**> scratch) {
   VELOX_CHECK(!isDistinct());
-  return getOutputInternal(maxOutputRows, maxOutputBytes, iterator, result);
+  return getOutputInternal(maxOutputRows, maxOutputBytes, iterator, result, scratch);
 }
 
 void GroupingSet::convertFastDistinctToTable() {
@@ -1014,7 +1178,8 @@ bool GroupingSet::getOutputInternal(
     int32_t maxOutputRows,
     int32_t maxOutputBytes,
     RowContainerIterator& iterator,
-    RowVectorPtr& result) {
+    RowVectorPtr& result,
+    folly::Range<char**> scratch) {
   TestValue::adjust("facebook::velox::exec::GroupingSet::getOutput", this);
 
   if (isGlobal_) {
@@ -1024,12 +1189,39 @@ bool GroupingSet::getOutputInternal(
   if (hasSpilled()) {
     return getOutputWithSpill(maxOutputRows, maxOutputBytes, result);
   }
+  if (table_ == nullptr) {
+    return false;
+  }
+  auto* rows = table_->rows();
+  // Private bounded runs request -1 after preparing the complete output.
+  // Keep the ordinary finite byte-batching contract for all other callers.
+  const uint64_t outputByteLimit = maxOutputBytes == -1
+      ? std::numeric_limits<uint64_t>::max() : uint64_t(maxOutputBytes);
+  // A full final batch need not mark the iterator exhausted. Probe a copy
+  // without allocating so EOF can release state even when credit is full.
+  // A fresh traversal of a nonempty table needs no extra probe.
+  if (rows->numRows() == 0 || iterator.allocationIndex != 0 ||
+      iterator.rowOffset != 0) {
+    auto next = iterator;
+    char* nextGroup = nullptr;
+    if (rows->listRows(&next, 1, outputByteLimit, &nextGroup) == 0) {
+      iterator = next;
+      table_->clear(/*freeTable=*/true);
+      return false;
+    }
+  }
   // @lint-ignore CLANGTIDY
-  std::vector<char*> groups(maxOutputRows);
-  const int32_t numGroups = table_
-      ? table_->rows()->listRows(
-            &iterator, maxOutputRows, maxOutputBytes, groups.data())
-      : 0;
+  // Extraction is row-sized query work, including when the consumer retains
+  // earlier output. Charge it before advancing the row iterator.
+  std::vector<char*, memory::StlAllocator<char*>> groups{
+      memory::StlAllocator<char*>(pool_)};
+  if (scratch.empty()) {
+    groups.resize(maxOutputRows);
+    scratch = folly::Range<char**>(groups.data(), groups.size());
+  }
+  VELOX_CHECK_GE(scratch.size(), maxOutputRows);
+  const int32_t numGroups = rows->listRows(
+      &iterator, maxOutputRows, outputByteLimit, scratch.data());
   if (numGroups == 0) {
     if (table_ != nullptr) {
       table_->clear(/*freeTable=*/true);
@@ -1037,7 +1229,7 @@ bool GroupingSet::getOutputInternal(
     return false;
   }
   extractGroups(
-      table_->rows(), folly::Range<char**>(groups.data(), numGroups), result);
+      table_->rows(), folly::Range<char**>(scratch.data(), numGroups), result);
   return true;
 }
 
@@ -1109,6 +1301,7 @@ void GroupingSet::extractDrainedNewGroups(const RowVectorPtr& result) {
 }
 
 void GroupingSet::resetTable(bool freeTable) {
+  preparedBoundedInput_ = nullptr;
   if (distinctKeySet_ != nullptr) {
     distinctKeySet_->clear();
     fastDistinctIterator_ = KeyOnlyDedupSet::Iterator{};
@@ -1754,9 +1947,9 @@ void GroupingSet::updateRow(SpillMergeStream& input, char* row) {
   }
 }
 
-void GroupingSet::abandonPartialAggregation() {
+void GroupingSet::abandonPartialAggregation(bool usePreparedStates) {
   abandonedPartialAggregation_ = true;
-  allSupportToIntermediate_ = true;
+  allSupportToIntermediate_ = !usePreparedStates;
   for (auto& aggregate : aggregates_) {
     if (!aggregate.function->supportsToIntermediate()) {
       allSupportToIntermediate_ = false;
@@ -1767,7 +1960,7 @@ void GroupingSet::abandonPartialAggregation() {
   intermediateRows_ = std::make_unique<RowContainer>(
       table_->rows()->keyTypes(),
       !ignoreNullKeys_,
-      accumulators(true),
+      accumulators(!usePreparedStates),
       std::vector<TypePtr>(),
       false,
       false,
@@ -1776,7 +1969,7 @@ void GroupingSet::abandonPartialAggregation() {
       false,
       false,
       pool_);
-  initializeAggregates(aggregates_, *intermediateRows_, true);
+  initializeAggregates(aggregates_, *intermediateRows_, !usePreparedStates);
   table_.reset();
 }
 
@@ -1832,7 +2025,9 @@ void GroupingSet::toIntermediate(
     recursiveResizeChildren(aggregateVector, input->size());
     const auto& rows = getSelectivityVector(i);
 
-    if (function->supportsToIntermediate()) {
+    // The resource contract covers initialize/update/extract. A function's
+    // optional conversion fast path carries no such allocation promise.
+    if (function->supportsToIntermediate() && preparedBoundedInput_ != input.get()) {
       populateTempVectors(i, input);
       VELOX_DCHECK(aggregateVector);
       function->toIntermediate(rows, tempVectors_, aggregateVector);

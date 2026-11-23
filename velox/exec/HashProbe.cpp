@@ -190,7 +190,7 @@ void HashProbe::initialize() {
   Operator::initialize();
 
   VELOX_CHECK(hashers_.empty());
-  hashers_ = createVectorHashers(probeType_, joinNode_->leftKeys());
+  hashers_ = createVectorHashers(probeType_, joinNode_->leftKeys(), pool());
 
   const auto numKeys = hashers_.size();
   keyChannels_.reserve(numKeys);
@@ -1816,7 +1816,7 @@ SelectivityVector HashProbe::evalFilterForNullAwareJoin(
 void HashProbe::prepareNullKeyProbeHashers() {
   if (nullKeyProbeHashers_.empty()) {
     nullKeyProbeHashers_ =
-        createVectorHashers(probeType_, joinNode_->leftKeys());
+        createVectorHashers(probeType_, joinNode_->leftKeys(), pool());
     // Null-aware joins allow only one join key.
     VELOX_CHECK_EQ(nullKeyProbeHashers_.size(), 1);
     if (table_->hashMode() == BaseHashTable::HashMode::kHash) {

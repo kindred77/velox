@@ -22,10 +22,13 @@ namespace facebook::velox::exec {
 
 class AggregationMasks {
  public:
+  /// @param pool Owner of row-sized selection and decoder backing, if set.
+  /// Must outlive this instance. Null preserves standalone system allocation.
   /// @param maskChannel Index of the 'mask' column for each aggregation.
   /// Aggregations without masks use std::nullopt.
   explicit AggregationMasks(
-      std::vector<std::optional<column_index_t>> maskChannels);
+      std::vector<std::optional<column_index_t>> maskChannels,
+      memory::MemoryPool* pool = nullptr);
 
   /// Process the input batch and prepare selectivity vectors for each mask by
   /// removing masked rows.

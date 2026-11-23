@@ -31,6 +31,7 @@ struct ArrowArrayStream;
 
 namespace facebook::velox::core {
 
+struct AggregationResourcePolicy;
 class PlanNodeVisitor;
 class PlanNodeVisitorContext;
 
@@ -1154,7 +1155,8 @@ class AggregationNode : public PlanNode {
       const std::vector<Aggregate>& aggregates,
       bool ignoreNullKeys,
       bool noGroupsSpanBatches,
-      PlanNodePtr source);
+      PlanNodePtr source,
+      std::shared_ptr<const AggregationResourcePolicy> resourcePolicy = nullptr);
 
   /// @param globalGroupingSets Group IDs of the global grouping sets produced
   /// by the preceding GroupId node
@@ -1176,7 +1178,8 @@ class AggregationNode : public PlanNode {
       const std::optional<FieldAccessTypedExprPtr>& groupId,
       bool ignoreNullKeys,
       bool noGroupsSpanBatches,
-      PlanNodePtr source);
+      PlanNodePtr source,
+      std::shared_ptr<const AggregationResourcePolicy> resourcePolicy = nullptr);
 
   class Builder {
    public:
@@ -1193,6 +1196,7 @@ class AggregationNode : public PlanNode {
       groupId_ = other.groupId();
       ignoreNullKeys_ = other.ignoreNullKeys();
       noGroupsSpanBatches_ = other.noGroupsSpanBatches();
+      resourcePolicy_ = other.resourcePolicy();
       VELOX_CHECK_EQ(other.sources().size(), 1);
       source_ = other.sources()[0];
     }
@@ -1248,6 +1252,11 @@ class AggregationNode : public PlanNode {
       return *this;
     }
 
+    Builder& resourcePolicy(std::shared_ptr<const AggregationResourcePolicy> policy) {
+      resourcePolicy_ = std::move(policy);
+      return *this;
+    }
+
     Builder& source(PlanNodePtr source) {
       source_ = std::move(source);
       return *this;
@@ -1283,7 +1292,8 @@ class AggregationNode : public PlanNode {
           groupId_,
           ignoreNullKeys_.value(),
           noGroupsSpanBatches_,
-          source_.value());
+          source_.value(),
+          resourcePolicy_);
     }
 
    private:
@@ -1298,6 +1308,7 @@ class AggregationNode : public PlanNode {
     std::optional<bool> ignoreNullKeys_;
     bool noGroupsSpanBatches_{false};
     std::optional<PlanNodePtr> source_;
+    std::shared_ptr<const AggregationResourcePolicy> resourcePolicy_;
   };
 
   bool supportsBarrier() const override {
@@ -1383,6 +1394,10 @@ class AggregationNode : public PlanNode {
     return step_ == Step::kSingle;
   }
 
+  const std::shared_ptr<const AggregationResourcePolicy>& resourcePolicy() const {
+    return resourcePolicy_;
+  }
+
   folly::dynamic serialize() const override;
 
   static PlanNodePtr create(const folly::dynamic& obj, void* context);
@@ -1417,6 +1432,7 @@ class AggregationNode : public PlanNode {
 
   const std::vector<PlanNodePtr> sources_;
   const RowTypePtr outputType_;
+  const std::shared_ptr<const AggregationResourcePolicy> resourcePolicy_;
 };
 
 using AggregationNodePtr = std::shared_ptr<const AggregationNode>;

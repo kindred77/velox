@@ -382,6 +382,10 @@ class RowContainer {
   /// Allocates a new row and initializes possible aggregates to null.
   char* newRow();
 
+  /// Back fixed slots without creating live rows or evaluating aggregates.
+  /// Existing free slots count toward 'count'. Not supported by list indexing.
+  void reserveRows(vector_size_t count);
+
   /// Prototype ([Win] 20260923 sort-row bulk allocation, slice 1): allocates
   /// 'numRows' contiguous rows with a single AllocationPool call instead of one
   /// 'newRow()' call per row, and registers them in the row index. Returns the
@@ -895,6 +899,13 @@ class RowContainer {
   /// and variableLengthBytes of out-of-line variable length data.
   int64_t sizeIncrement(vector_size_t numRows, int64_t variableLengthBytes)
       const;
+
+  /// Additional fixed-row backing for consecutive newRow() calls, excluding
+  /// key storage and aggregate updates. The entire container state (including
+  /// free-list and current run), layout, and configuration must stay unchanged
+  /// until the matching request sequence. Indexed rows and bulk newRows() need
+  /// their own complete request contract.
+  uint64_t fixedRowBackingBytesUpperBound(uint64_t count) const;
 
   /// Resets the state to be as after construction. Frees memory for payload.
   void clear();

@@ -324,6 +324,11 @@ class MemoryAllocator : public std::enable_shared_from_this<MemoryAllocator> {
       ReservationCallback reservationCB = nullptr,
       MachinePageCount minSizeClass = 0);
 
+  /// Exact backing bytes for this non-contiguous request, using the same
+  /// size-class plan as allocation. Useful for preauthorizing actual bytes.
+  uint64_t allocationBytes(MachinePageCount numPages,
+      MachinePageCount minSizeClass = 0) const;
+
   /// Frees non-contiguous 'allocation'. 'allocation' is empty on return. The
   /// function returns the actual freed bytes.
   virtual int64_t freeNonContiguous(Allocation& allocation) = 0;

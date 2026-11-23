@@ -17,6 +17,7 @@
 #include "velox/vector/BaseVector.h"
 #include <map>
 #include <vector>
+#include "velox/common/base/CheckedArithmetic.h"
 #include "velox/type/StringView.h"
 #include "velox/type/Type.h"
 #include "velox/type/Variant.h"
@@ -33,6 +34,69 @@
 #include "velox/vector/VectorTypeUtils.h"
 
 namespace facebook::velox {
+
+std::optional<uint64_t> fixedWidthVectorRowBytes(const Type& type) {
+  if (type.providesCustomComparison()) return std::nullopt;
+  if (type.isRow()) {
+    uint64_t bytes = 1;
+    for (const auto& child : type.asRow().children()) {
+      const auto width = fixedWidthVectorRowBytes(*child);
+      if (!width) return std::nullopt;
+      bytes = checkedPlus(bytes, *width);
+    }
+    return bytes;
+  }
+  if (!type.isPrimitiveType() || !type.isFixedWidth() || type.cppSizeInBytes() == 0) {
+    return std::nullopt;
+  }
+  return checkedPlus(uint64_t(type.cppSizeInBytes()), uint64_t(1));
+}
+
+VectorPtr createFixedWidthVector(
+    const TypePtr& type, vector_size_t size, memory::MemoryPool* pool,
+    bool nullableRoot) {
+  VELOX_USER_CHECK(fixedWidthVectorRowBytes(*type).has_value(),
+      "Output type has no fixed-width vector resource contract");
+  auto result = BaseVector::create(type, size, pool);
+  const auto prepare = [](auto&& self, BaseVector& vector, bool nullable) -> void {
+    VELOX_CHECK(vector.isWritable());
+    if (nullable) (void)vector.mutableRawNulls();
+    if (vector.type()->isRow()) {
+      for (const auto& child : vector.asUnchecked<RowVector>()->children()) {
+        VELOX_CHECK_EQ(child.use_count(), 1);
+        self(self, *child, true);
+      }
+    } else {
+      VELOX_CHECK(vector.isFlatEncoding());
+    }
+  };
+  prepare(prepare, *result, nullableRoot);
+  return result;
+}
+
+bool hasFixedWidthVectorBacking(const BaseVector& vector, bool nullableRoot) {
+  if (!fixedWidthVectorRowBytes(*vector.type()) || !vector.isWritable()) return false;
+  if (vector.size() == 0) return true;
+  if (nullableRoot && (!vector.nulls() ||
+      vector.nulls()->capacity() < bits::nbytes(vector.size()))) return false;
+  if (vector.type()->isRow()) {
+    for (const auto& child : vector.asUnchecked<RowVector>()->children()) {
+      if (!child || child->size() < vector.size() || !hasFixedWidthVectorBacking(*child)) return false;
+    }
+    return true;
+  }
+  const auto bytes = vector.typeKind() == TypeKind::BOOLEAN
+      ? uint64_t(bits::nbytes(vector.size()))
+      : checkedMultiply(uint64_t(vector.size()), uint64_t(vector.type()->cppSizeInBytes()));
+  return vector.isFlatEncoding() && vector.values() && vector.values()->capacity() >= bytes;
+}
+
+bool isDirectlyDecodedScalar(const BaseVector& vector) {
+  return vector.type()->isPrimitiveType() && vector.type()->isFixedWidth() &&
+      !vector.type()->providesCustomComparison() && vector.type()->cppSizeInBytes() > 0 && !isLazyNotLoaded(vector) &&
+      (vector.isFlatEncoding() || vector.isConstantEncoding());
+}
+
 namespace {
 
 Variant nullVariant(const TypePtr& type) {
@@ -320,10 +384,9 @@ VectorPtr BaseVector::wrapInSequence(
 
 template <TypeKind kind>
 static VectorPtr
-addConstant(vector_size_t size, vector_size_t index, VectorPtr vector) {
+addConstant(vector_size_t size, vector_size_t index, VectorPtr vector,
+    memory::MemoryPool* pool) {
   using T = typename KindToFlatVector<kind>::WrapperType;
-
-  auto* pool = vector->pool();
 
   if (vector->isNullAt(index)) {
     if constexpr (std::is_same_v<T, ComplexType>) {
@@ -363,14 +426,23 @@ addConstant(vector_size_t size, vector_size_t index, VectorPtr vector) {
       pool, size, index, std::move(vector), SimpleVectorStats<T>{});
 }
 
+VectorPtr wrapInConstant(
+    vector_size_t length,
+    vector_size_t index,
+    VectorPtr vector,
+    memory::MemoryPool* pool) {
+  const auto kind = vector->typeKind();
+  return VELOX_DYNAMIC_TYPE_DISPATCH_ALL(
+      addConstant, kind, length, index, std::move(vector), pool);
+}
+
 // static
 VectorPtr BaseVector::wrapInConstant(
     vector_size_t length,
     vector_size_t index,
     VectorPtr vector) {
-  const auto kind = vector->typeKind();
-  return VELOX_DYNAMIC_TYPE_DISPATCH_ALL(
-      addConstant, kind, length, index, std::move(vector));
+  auto* pool = vector->pool();
+  return facebook::velox::wrapInConstant(length, index, std::move(vector), pool);
 }
 
 std::optional<bool> BaseVector::equalValueAt(

@@ -20,8 +20,35 @@
 
 #include "velox/type/Type.h"
 #include "velox/type/TypeCoercer.h"
+#include <optional>
 
 namespace facebook::velox::exec {
+
+class AggregateFunctionSignature;
+
+/// One bound raw signature and its registered state-to-result adapter.
+struct AggregateExecutionTypes {
+  TypePtr intermediate;
+  TypePtr result;
+  std::string merge_extract;
+  bool adapted_result{false};
+};
+
+std::optional<AggregateExecutionTypes> tryResolveAggregateExecutionTypes(
+    const std::string& name,
+    const std::vector<TypePtr>& rawInputTypes,
+    const TypePtr& expectedResult = nullptr);
+
+AggregateExecutionTypes resolveAggregateExecutionTypes(
+    const std::string& name,
+    const std::vector<TypePtr>& rawInputTypes,
+    const TypePtr& expectedResult = nullptr);
+
+/// Bind a captured signature list. Engaged means a signature matched; its
+/// type may still be null when lambda/generic resolution is incomplete.
+std::optional<TypePtr> tryResolveIntermediateType(
+    const std::vector<std::shared_ptr<AggregateFunctionSignature>>& signatures,
+    const std::vector<TypePtr>& argTypes);
 
 /// Given a name of aggregate function and argument types, returns the result
 /// type if the function exists. Throws if function doesn't exist or doesn't

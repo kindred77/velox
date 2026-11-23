@@ -16,6 +16,8 @@
 #include "velox/common/memory/HashStringAllocator.h"
 #include "velox/common/base/Portability.h"
 #include "velox/common/base/SimdUtil.h"
+#include <folly/ScopeGuard.h>
+#include <type_traits>
 
 namespace facebook::velox {
 
@@ -93,10 +95,16 @@ void HashStringAllocator::clear() {
   for (auto& pair : state_.allocationsFromPool()) {
     const auto size = pair.second;
     pool()->free(pair.first, size);
-    state_.sizeFromPool() -= size;
+    state_.sizeFromPool() -= poolAllocationBytes(size);
     state_.currentBytes() -= size;
   }
-  state_.allocationsFromPool().clear();
+  {
+    auto& registrations = state_.allocationsFromPool();
+    // F14 clear retains capacity (and may reallocate it under ASAN). Release
+    // the registration backing without requesting memory while draining.
+    std::decay_t<decltype(registrations)> empty(registrations.get_allocator());
+    registrations.swap(empty);
+  }
   for (auto i = 0; i < kNumFreeLists; ++i) {
     new (&state_.freeLists()[i]) CompactDoubleList();
   }
@@ -145,10 +153,20 @@ void HashStringAllocator::clear() {
 }
 
 void* HashStringAllocator::allocateFromPool(size_t size) {
-  auto* ptr = pool()->allocate(size);
-  state_.currentBytes() += size;
-  state_.allocationsFromPool()[ptr] = size;
-  state_.sizeFromPool() += size;
+  // Check mutability before acquiring payload, and publish only after its
+  // mandatory registration succeeds under the same owner budget.
+  auto& registrations = state_.allocationsFromPool();
+  auto& currentBytes = state_.currentBytes();
+  auto& retainedBytes = state_.sizeFromPool();
+  const auto chargedBytes = poolAllocationBytes(size);
+  auto* owner = pool();
+  auto* ptr = owner->allocate(static_cast<int64_t>(size));
+  auto rollback = folly::makeGuard([&] { owner->free(ptr, size); });
+  const auto inserted = registrations.emplace(ptr, size).second;
+  VELOX_CHECK(inserted, "Duplicate standalone allocation address");
+  currentBytes += size;
+  retainedBytes += chargedBytes;
+  rollback.dismiss();
   return ptr;
 }
 
@@ -160,7 +178,7 @@ void HashStringAllocator::freeToPool(void* ptr, size_t size) {
   VELOX_CHECK_EQ(
       size, it->second, "Bad size in HashStringAllocator::freeToPool()");
   state_.allocationsFromPool().erase(it);
-  state_.sizeFromPool() -= size;
+  state_.sizeFromPool() -= poolAllocationBytes(size);
   state_.currentBytes() -= size;
   pool()->free(ptr, size);
 }
@@ -324,24 +342,6 @@ void HashStringAllocator::newRange(
 
 void HashStringAllocator::newContiguousRange(int32_t bytes, ByteRange* range) {
   newRange(bytes, nullptr, range, true);
-}
-
-// static
-StringView HashStringAllocator::contiguousString(
-    StringView view,
-    std::string& storage) {
-  if (view.isInline()) {
-    return view;
-  }
-  auto* header = headerOf(view.data());
-  if (view.size() <= header->size()) {
-    return view;
-  }
-
-  InputStream stream(headerOf(view.data()));
-  storage.resize(view.size());
-  stream.ByteInputStream::readBytes(storage.data(), view.size());
-  return StringView(storage);
 }
 
 void HashStringAllocator::freeRestOfBlock(Header* header, int32_t keepBytes) {

@@ -18,6 +18,8 @@
 #include "velox/common/Casts.h"
 #include "velox/common/encode/Base64.h"
 #include "velox/core/PlanNode.h"
+#include "velox/core/AggregationResourcePolicy.h"
+#include <limits>
 
 #include "velox/common/EnumDefine.h"
 #include "velox/core/TableWriteTraits.h"
@@ -170,7 +172,8 @@ AggregationNode::AggregationNode(
     const std::optional<FieldAccessTypedExprPtr>& groupId,
     bool ignoreNullKeys,
     bool noGroupsSpanBatches,
-    PlanNodePtr source)
+    PlanNodePtr source,
+    std::shared_ptr<const AggregationResourcePolicy> resourcePolicy)
     : PlanNode(id),
       step_(step),
       groupingKeys_(groupingKeys),
@@ -185,7 +188,22 @@ AggregationNode::AggregationNode(
       outputType_(getAggregationOutputType(
           groupingKeys_,
           aggregateNames_,
-          aggregates_)) {
+          aggregates_)),
+      resourcePolicy_(resourcePolicy
+          ? std::make_shared<const AggregationResourcePolicy>(*resourcePolicy)
+          : nullptr) {
+  if (resourcePolicy_) {
+    resourcePolicy_->validate();
+    VELOX_USER_CHECK(step_ == Step::kPartial && !groupingKeys_.empty() && !aggregates_.empty() &&
+        preGroupedKeys_.empty() && globalGroupingSets_.empty() && !noGroupsSpanBatches_,
+        "Resource policy requires a grouped raw partial aggregation");
+    VELOX_USER_CHECK_EQ(resourcePolicy_->inputResources.size(), aggregates_.size(),
+        "Resource policy aggregate count does not match the node");
+    for (const auto& aggregate : aggregates_) {
+      VELOX_USER_CHECK(!aggregate.distinct && !aggregate.mask && aggregate.sortingKeys.empty(),
+          "Aggregation modifiers have no bounded-run resource contract");
+    }
+  }
   // Empty grouping keys are used in global aggregation:
   //    SELECT sum(c) FROM t
   // Empty aggregates are used in distinct:
@@ -240,7 +258,8 @@ AggregationNode::AggregationNode(
     const std::vector<Aggregate>& aggregates,
     bool ignoreNullKeys,
     bool noGroupsSpanBatches,
-    PlanNodePtr source)
+    PlanNodePtr source,
+    std::shared_ptr<const AggregationResourcePolicy> resourcePolicy)
     : AggregationNode(
           id,
           step,
@@ -252,7 +271,8 @@ AggregationNode::AggregationNode(
           kDefaultGroupId,
           ignoreNullKeys,
           noGroupsSpanBatches,
-          source) {}
+          source,
+          std::move(resourcePolicy)) {}
 
 namespace {
 void addFields(
@@ -292,6 +312,73 @@ void addVectorSerdeKind(const std::string& kind, std::stringstream& stream) {
   stream << kind;
 }
 } // namespace
+
+void AggregationResourcePolicy::validate() const {
+  VELOX_USER_CHECK_EQ(version, kVersion, "Unknown aggregation resource policy version");
+  VELOX_USER_CHECK(domainId > 0 && domainId <= uint64_t(std::numeric_limits<int64_t>::max()),
+      "Invalid aggregation resource domain id");
+  for (const auto& resource : inputResources) {
+    if (!resource) continue; // Unknown is preserved, never interpreted as authorization.
+    VELOX_USER_CHECK(resource->model == AggregateInputResourceModel::kFixedScalarState ||
+        resource->model == AggregateInputResourceModel::kFixedRowState,
+        "Unknown aggregate resource model");
+    const auto alignment = resource->stateAlignmentUpperBound;
+    VELOX_USER_CHECK(resource->stateBytesUpperBound > 0 && alignment > 0 &&
+        (alignment & (alignment - 1)) == 0 && alignment <= resource->stateBytesUpperBound &&
+        resource->argumentCount <= 1, "Invalid aggregate resource bounds");
+  }
+}
+
+folly::dynamic AggregationResourcePolicy::serialize() const {
+  validate();
+  folly::dynamic obj = folly::dynamic::object("version", version)("domainId", int64_t(domainId));
+  obj["inputResources"] = folly::dynamic::array;
+  for (const auto& resource : inputResources) {
+    if (!resource) {
+      obj["inputResources"].push_back(nullptr);
+      continue;
+    }
+    obj["inputResources"].push_back(folly::dynamic::object
+        ("stateBytesUpperBound", resource->stateBytesUpperBound)
+        ("stateAlignmentUpperBound", resource->stateAlignmentUpperBound)
+        ("argumentCount", resource->argumentCount)
+        ("model", static_cast<int64_t>(resource->model)));
+  }
+  return obj;
+}
+
+std::shared_ptr<const AggregationResourcePolicy> AggregationResourcePolicy::deserialize(
+    const folly::dynamic& obj) {
+  auto policy = std::make_shared<AggregationResourcePolicy>();
+  auto bounded = [](const folly::dynamic& value) -> uint32_t {
+    const auto number = value.asInt();
+    VELOX_USER_CHECK(number >= 0 && uint64_t(number) <= std::numeric_limits<uint32_t>::max(),
+        "Aggregation resource integer is out of range");
+    return static_cast<uint32_t>(number);
+  };
+  policy->version = bounded(obj.at("version"));
+  const auto domain = obj.at("domainId").asInt();
+  VELOX_USER_CHECK_GT(domain, 0, "Invalid aggregation resource domain id");
+  policy->domainId = domain;
+  const auto& resources = obj.at("inputResources");
+  VELOX_USER_CHECK(resources.isArray(), "Aggregation resources must be an array");
+  for (const auto& value : resources) {
+    if (value.isNull()) {
+      policy->inputResources.push_back(std::nullopt);
+    } else {
+      const auto model = bounded(value.at("model"));
+      VELOX_USER_CHECK(model <= static_cast<uint32_t>(AggregateInputResourceModel::kFixedRowState),
+          "Unknown aggregate resource model");
+      policy->inputResources.push_back(AggregateInputResourceContract{
+          bounded(value.at("stateBytesUpperBound")),
+          bounded(value.at("stateAlignmentUpperBound")),
+          bounded(value.at("argumentCount")),
+          static_cast<AggregateInputResourceModel>(model)});
+    }
+  }
+  policy->validate();
+  return policy;
+}
 
 bool AggregationNode::canSpill(const QueryConfig& queryConfig) const {
   // TODO: add spilling for pre-grouped aggregation later:
@@ -382,6 +469,7 @@ folly::dynamic AggregationNode::serialize() const {
   }
   obj["ignoreNullKeys"] = ignoreNullKeys_;
   obj["noGroupsSpanBatches"] = noGroupsSpanBatches_;
+  if (resourcePolicy_) obj["resourcePolicy"] = resourcePolicy_->serialize();
   return obj;
 }
 
@@ -470,8 +558,6 @@ AggregationNode::Aggregate AggregationNode::Aggregate::deserialize(
 
 // static
 PlanNodePtr AggregationNode::create(const folly::dynamic& obj, void* context) {
-  auto source = deserializeSingleSource(obj, context);
-
   auto groupingKeys = deserializeFields(obj["groupingKeys"], context);
   auto preGroupedKeys = deserializeFields(obj["preGroupedKeys"], context);
   auto aggregateNames = deserializeStrings(obj["aggregateNames"]);
@@ -492,6 +578,14 @@ PlanNodePtr AggregationNode::create(const folly::dynamic& obj, void* context) {
         obj["groupId"], context);
   }
 
+  std::shared_ptr<const AggregationResourcePolicy> policy;
+  if (obj.count("resourcePolicy")) {
+    const auto& resources = obj["resourcePolicy"].at("inputResources");
+    VELOX_USER_CHECK(resources.isArray() && resources.size() == aggregates.size(),
+        "Resource policy aggregate count does not match the node");
+    policy = AggregationResourcePolicy::deserialize(obj["resourcePolicy"]);
+  }
+
   return std::make_shared<AggregationNode>(
       deserializePlanNodeId(obj),
       toStep(obj["step"].asString()),
@@ -504,7 +598,8 @@ PlanNodePtr AggregationNode::create(const folly::dynamic& obj, void* context) {
       obj["ignoreNullKeys"].asBool(),
       obj.count("noGroupsSpanBatches") ? obj["noGroupsSpanBatches"].asBool()
                                        : false,
-      deserializeSingleSource(obj, context));
+      deserializeSingleSource(obj, context),
+      std::move(policy));
 }
 
 namespace {

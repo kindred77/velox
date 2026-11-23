@@ -277,7 +277,7 @@ void HashBuild::setupTable() {
   keyHashers.reserve(numKeys);
   for (vector_size_t i = 0; i < numKeys; ++i) {
     keyHashers.emplace_back(
-        VectorHasher::create(tableType_->childAt(i), keyChannels_[i]));
+        VectorHasher::create(tableType_->childAt(i), keyChannels_[i], tableMemoryPool()));
   }
 
   const auto numDependents = tableType_->size() - numKeys;

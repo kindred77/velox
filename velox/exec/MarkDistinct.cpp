@@ -61,7 +61,7 @@ MarkDistinct::MarkDistinct(
     distinctKeyChannels_.push_back(inputType_->getChildIdx(key->name()));
   }
 
-  auto hashers = createVectorHashers(inputType_, planNode->distinctKeys());
+  auto hashers = createVectorHashers(inputType_, planNode->distinctKeys(), pool());
   std::vector<Accumulator> extraAccumulators;
   if (numMasks() > 0) {
     const auto numBytes = static_cast<int32_t>(bits::nbytes(numMasks()));

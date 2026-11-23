@@ -1048,6 +1048,7 @@ void HashTable<ignoreNullKeys>::allocateTables(
     int8_t spillInputStartPartitionBit) {
   VELOX_CHECK(bits::isPowerOfTwo(size), "Size is not a power of two: {}", size);
   VELOX_CHECK_GT(size, 0);
+  const auto allocationBytes = tableAllocationBytes(size);
   capacity_ = size;
   const uint64_t byteSize = capacity_ * tableSlotSize();
   VELOX_CHECK_EQ(byteSize % kBucketSize, 0);
@@ -1061,7 +1062,7 @@ void HashTable<ignoreNullKeys>::allocateTables(
   // tags and 16 * 6 bytes of pointers and a padding of 16 bytes to round up the
   // cache line.
   const auto numPages =
-      memory::AllocationTraits::numPages(size * tableSlotSize());
+      allocationBytes / memory::AllocationTraits::kPageSize;
   const auto before = getThreadLocalRunTimeStatWriter() != nullptr
       ? std::make_optional(rows_->pool()->stats()) : std::nullopt;
   rows_->pool()->allocateContiguous(numPages, tableAllocation_);
@@ -1108,6 +1109,31 @@ HashTable<ignoreNullKeys>::planTableAllocation(int32_t numNew) const {
             true};
   }
   return {uint64_t(capacity_), false, false};
+}
+
+template <bool ignoreNullKeys>
+uint64_t HashTable<ignoreNullKeys>::tableAllocationBytes(uint64_t capacity) const {
+  const auto bytes = checkedMultiply(capacity, uint64_t(tableSlotSize()));
+  constexpr auto pageSize = memory::AllocationTraits::kPageSize;
+  return checkedPlus(bytes, pageSize - 1) / pageSize * pageSize;
+}
+
+template <bool ignoreNullKeys>
+uint64_t HashTable<ignoreNullKeys>::hashTableRehashAllocationBytes(
+    int32_t numNewDistinct) const {
+  const auto allocation = planTableAllocation(numNewDistinct);
+  return allocation.allocate ? tableAllocationBytes(allocation.capacity) : 0;
+}
+
+template <bool ignoreNullKeys>
+void HashTable<ignoreNullKeys>::prepareGenericGroupProbeCapacity(
+    int32_t numNew, int8_t spillInputStartPartitionBit) {
+  VELOX_CHECK_GE(numNew, 0);
+  if (hashMode_ != HashMode::kHash) {
+    setHashMode(HashMode::kHash, numNew, spillInputStartPartitionBit);
+  } else {
+    checkSize(numNew, false, spillInputStartPartitionBit);
+  }
 }
 
 template <bool ignoreNullKeys>

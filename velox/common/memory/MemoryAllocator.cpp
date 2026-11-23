@@ -189,6 +189,11 @@ MachinePageCount pagesToAcquire(
 }
 } // namespace
 
+uint64_t MemoryAllocator::allocationBytes(
+    MachinePageCount numPages, MachinePageCount minSizeClass) const {
+  return AllocationTraits::pageBytes(allocationSize(numPages, minSizeClass).totalPages);
+}
+
 bool MemoryAllocator::allocateNonContiguous(
     MachinePageCount numPages,
     Allocation& out,

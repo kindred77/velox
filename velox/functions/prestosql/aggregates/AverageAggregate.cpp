@@ -159,7 +159,8 @@ void registerAverageAggregate(
           }
         }
       },
-      {.orderSensitive = false},
+      {.orderSensitive = false,
+       .inputResourceModel = core::AggregateInputResourceModel::kFixedRowState},
       withCompanionFunctions,
       overwrite);
 }

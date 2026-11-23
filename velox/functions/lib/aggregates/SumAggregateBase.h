@@ -38,6 +38,11 @@ class SumAggregateBase
  public:
   explicit SumAggregateBase(TypePtr resultType) : BaseAggregate(resultType) {}
 
+  bool prepareForBoundedInput(bool rawInput, const SelectivityVector& rows,
+      const std::vector<VectorPtr>& args, const VectorPtr& output) override {
+    return BaseAggregate::template prepareFixedNumericInput<TAccumulator>(rawInput, rows, args, output);
+  }
+
   int32_t accumulatorFixedWidthSize() const override {
     return sizeof(TAccumulator);
   }

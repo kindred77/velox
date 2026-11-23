@@ -42,8 +42,12 @@ std::vector<AggregateInfo> toAggregateInfo(
     const OperatorCtx& operatorCtx,
     uint32_t numKeys,
     std::shared_ptr<core::ExpressionEvaluator>& expressionEvaluator,
-    bool isStreaming) {
+    bool isStreaming,
+    AggregateInputResourceContracts resources) {
   const auto numAggregates = aggregationNode.aggregates().size();
+  VELOX_CHECK(resources.empty() || resources.size() == numAggregates);
+  VELOX_USER_CHECK(resources.empty() || isRawInput(aggregationNode.step()),
+      "Aggregate has no bounded-run resource contract");
   std::vector<AggregateInfo> aggregates;
   aggregates.reserve(numAggregates);
 
@@ -54,6 +58,36 @@ std::vector<AggregateInfo> toAggregateInfo(
   for (auto i = 0; i < numAggregates; i++) {
     const auto& aggregate = aggregationNode.aggregates()[i];
     AggregateInfo info;
+    const auto& name = aggregate.call->name();
+
+    AggregateResourceConstructionInfo construction;
+    if (resources.empty()) {
+      info.intermediateType = resolveIntermediateType(name, aggregate.rawInputTypes);
+    }
+
+    // Setup aggregation mask: convert the Variable Reference name to the
+    // channel (projection) index, if there is a mask.
+    if (const auto& mask = aggregate.mask) {
+      info.mask = inputType->asRow().getChildIdx(mask->name());
+    } else {
+      info.mask = std::nullopt;
+    }
+
+    auto index = numKeys + i;
+    const auto& aggResultType = outputType->childAt(index);
+    info.function = Aggregate::create(
+        name,
+        isPartialOutput(step) ? core::AggregationNode::Step::kPartial
+                              : core::AggregationNode::Step::kSingle,
+        aggregate.rawInputTypes,
+        aggResultType,
+        operatorCtx.driverCtx()->queryConfig(),
+        resources.empty() ? nullptr : &construction);
+    if (!resources.empty()) {
+      info.intermediateType = std::move(construction.intermediateType);
+      resources[i] = construction.inputResources;
+    }
+
     // Populate input.
     auto& channels = info.inputs;
     auto& constants = info.constantInputs;
@@ -81,29 +115,6 @@ std::vector<AggregateInfo> toAggregateInfo(
             arg->toString());
       }
     }
-    const auto& name = aggregate.call->name();
-
-    info.intermediateType =
-        resolveIntermediateType(name, aggregate.rawInputTypes);
-
-    // Setup aggregation mask: convert the Variable Reference name to the
-    // channel (projection) index, if there is a mask.
-    if (const auto& mask = aggregate.mask) {
-      info.mask = inputType->asRow().getChildIdx(mask->name());
-    } else {
-      info.mask = std::nullopt;
-    }
-
-    auto index = numKeys + i;
-    const auto& aggResultType = outputType->childAt(index);
-    info.function = Aggregate::create(
-        name,
-        isPartialOutput(step) ? core::AggregationNode::Step::kPartial
-                              : core::AggregationNode::Step::kSingle,
-        aggregate.rawInputTypes,
-        aggResultType,
-        operatorCtx.driverCtx()->queryConfig());
-
     // Pass constant inputs to the aggregate so it can read constant arguments
     // (e.g., flags) at initialization time.
     if (!constants.empty()) {
@@ -123,8 +134,8 @@ std::vector<AggregateInfo> toAggregateInfo(
     //    if aggregate function is not sensitive to duplicates.
     // 2. Ignore sorting properties
     //    if aggregate function is not sensitive to the order of inputs.
-    auto* entry = getAggregateFunctionEntry(name);
-    const auto& metadata = entry->metadata;
+    const auto metadata = resources.empty()
+        ? getAggregateFunctionEntry(name)->metadata : construction.metadata;
     info.distinct = !metadata.ignoreDuplicates && aggregate.distinct;
     if (metadata.orderSensitive) {
       // Sorting keys and orders.
