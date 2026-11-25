@@ -351,6 +351,17 @@ TEST(DecimalTest, computeAverage) {
 }
 
 TEST(DecimalAggregateTest, adjustSumForOverflow) {
+  const auto minimum = std::numeric_limits<int128_t>::min();
+  const auto maximum = std::numeric_limits<int128_t>::max();
+  EXPECT_EQ(DecimalUtil::adjustSumForOverflow(minimum, 1), int128_t(0));
+  EXPECT_EQ(DecimalUtil::adjustSumForOverflow(-1, 1), maximum);
+  EXPECT_EQ(DecimalUtil::adjustSumForOverflow(maximum, -1), int128_t(-1));
+  EXPECT_EQ(DecimalUtil::adjustSumForOverflow(1, -1), minimum + 1);
+  EXPECT_EQ(DecimalUtil::adjustSumForOverflow(42, 0), int128_t(42));
+  EXPECT_FALSE(DecimalUtil::adjustSumForOverflow(1, 1).has_value());
+  EXPECT_FALSE(DecimalUtil::adjustSumForOverflow(-1, -1).has_value());
+  EXPECT_FALSE(DecimalUtil::adjustSumForOverflow(-1, 2).has_value());
+
   struct SumWithOverflow {
     int128_t sum{0};
     int64_t overflow{0};
@@ -827,6 +838,54 @@ TEST(DecimalTest, castFromStringNegativeExponent) {
       38,
       0,
       std::vector<int128_t>{1, 0, 1, 0, 1, 0, -1, 0, 1, 0, 0, 1, 1, 0});
+}
+
+TEST(DecimalTest, castFromStringSingleRounding) {
+  const std::vector<std::string> integerInputs{
+      "14.95e-1", "-14.95e-1", "1.495", "-1.495", "15e-1", "-15e-1"};
+  testCastFromString<int64_t>(
+      integerInputs, 18, 0, std::vector<int64_t>{1, -1, 1, -1, 2, -2});
+  testCastFromString<int128_t>(
+      integerInputs, 38, 0, std::vector<int128_t>{1, -1, 1, -1, 2, -2});
+
+  const std::vector<std::string> fractionalInputs{
+      "144.99e-2", "-144.99e-2", "145e-2", "-145e-2"};
+  testCastFromString<int64_t>(
+      fractionalInputs, 18, 1, std::vector<int64_t>{14, -14, 15, -15});
+  testCastFromString<int128_t>(
+      fractionalInputs, 38, 1, std::vector<int128_t>{14, -14, 15, -15});
+
+  const std::vector<std::string> carryInputs{"99.95e-1", "-99.95e-1"};
+  testCastFromString<int64_t>(
+      carryInputs, 18, 2, std::vector<int64_t>{1000, -1000});
+  testCastFromString<int128_t>(
+      carryInputs, 38, 2, std::vector<int128_t>{1000, -1000});
+}
+
+TEST(DecimalTest, castFromStringExtremeExponent) {
+  const std::vector<std::string> inputs{
+      "1e-2147483648", "-1.00e-2147483648", "0e2147483647", "0.00e2147483647"};
+  testCastFromString<int128_t>(
+      inputs,
+      38,
+      2,
+      std::vector<int128_t>{0, 0, 0, 0});
+  testCastFromString<int64_t>(inputs, 18, 2, std::vector<int64_t>{0, 0, 0, 0});
+  testCastFromString<int128_t>("1e2147483647", 38, 2, "Value too large.");
+  testCastFromString<int64_t>("-1.00e2147483647", 18, 2, "Value too large.");
+}
+
+TEST(DecimalTest, castFromStringLongFractionExponent) {
+  const auto zeros = std::string(50, '0');
+  const std::vector<std::string> inputs{
+      "0." + zeros + "1e50", "-0." + zeros + "1e50",
+      "0." + zeros + "1", zeros + "1.25"};
+  testCastFromString<int128_t>(
+      inputs,
+      38,
+      2,
+      std::vector<int128_t>{10, -10, 0, 125});
+  testCastFromString<int64_t>(inputs, 18, 2, std::vector<int64_t>{10, -10, 0, 125});
 }
 } // namespace
 } // namespace facebook::velox
