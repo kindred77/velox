@@ -120,6 +120,10 @@ template <>
 Variant variantAtTyped<TypeKind::VARBINARY>(
     const BaseVector* vector,
     vector_size_t row) {
+  if (vector->type()->providesCustomComparison()) {
+    return Variant::typeWithCustomComparison<TypeKind::VARBINARY>(
+        vector->as<SimpleVector<StringView>>()->valueAt(row), vector->type());
+  }
   return Variant::binary(
       std::string(vector->as<SimpleVector<StringView>>()->valueAt(row)));
 }

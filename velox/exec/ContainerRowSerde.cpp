@@ -15,6 +15,7 @@
  */
 
 #include "velox/exec/ContainerRowSerde.h"
+#include "velox/common/memory/MemoryPool.h"
 #include "velox/type/FloatingPointUtil.h"
 #include "velox/vector/ComplexVector.h"
 #include "velox/vector/FlatVector.h"
@@ -377,6 +378,23 @@ void deserializeSwitch(
       deserializeOne, result.typeKind(), in, index, result);
 }
 
+// A custom comparator needs the whole value. Charge any multipart copy to
+// the current operation's credit, as RowContainer does for stored strings.
+using CustomStringScratch = std::basic_string<char, std::char_traits<char>, memory::StlAllocator<char>>;
+
+template <bool customComparison>
+auto makeStringScratch() {
+  if constexpr (customComparison) {
+    auto* pool = memory::MemoryPool::currentAllocationCreditPool();
+    return CustomStringScratch(pool ? memory::StlAllocator<char>(pool) : memory::StlAllocator<char>());
+  } else {
+    return std::string{};
+  }
+}
+
+template <class Storage>
+StringView readStringView(ByteInputStream& stream, Storage& storage);
+
 // Comparison of serialization and vector.
 template <bool typeProvidesCustomComparison>
 std::optional<int32_t> compareSwitch(
@@ -446,7 +464,16 @@ std::optional<int32_t> compare(
     const BaseVector& right,
     vector_size_t index,
     CompareFlags flags) {
-  auto result = compareStringAsc(left, right, index, flags.equalsOnly);
+  int32_t result;
+  if constexpr (typeProvidesCustomComparison) {
+    auto storage = makeStringScratch<true>();
+    const auto leftValue = readStringView(left, storage);
+    const auto rightValue = right.asUnchecked<SimpleVector<StringView>>()->valueAt(index);
+    result = SimpleVector<StringView>::template comparePrimitiveAscWithCustomComparison<Kind>(
+        right.type().get(), leftValue, rightValue);
+  } else {
+    result = compareStringAsc(left, right, index, flags.equalsOnly);
+  }
   return flags.ascending ? result : result * -1;
 }
 
@@ -459,7 +486,16 @@ std::optional<int32_t> compare(
     const BaseVector& right,
     vector_size_t index,
     CompareFlags flags) {
-  auto result = compareStringAsc(left, right, index, flags.equalsOnly);
+  int32_t result;
+  if constexpr (typeProvidesCustomComparison) {
+    auto storage = makeStringScratch<true>();
+    const auto leftValue = readStringView(left, storage);
+    const auto rightValue = right.asUnchecked<SimpleVector<StringView>>()->valueAt(index);
+    result = SimpleVector<StringView>::template comparePrimitiveAscWithCustomComparison<Kind>(
+        right.type().get(), leftValue, rightValue);
+  } else {
+    result = compareStringAsc(left, right, index, flags.equalsOnly);
+  }
   return flags.ascending ? result : result * -1;
 }
 
@@ -666,7 +702,8 @@ std::optional<int32_t> compareSwitch(
 // Returns a view over a serialized string with the string as a
 // contiguous array of bytes. This may use 'storage' for a temporary
 // copy.
-StringView readStringView(ByteInputStream& stream, std::string& storage) {
+template <class Storage>
+StringView readStringView(ByteInputStream& stream, Storage& storage) {
   int32_t size = stream.read<int32_t>();
   auto view = stream.nextView(size);
   if (view.size() == size) {
@@ -676,7 +713,7 @@ StringView readStringView(ByteInputStream& stream, std::string& storage) {
   storage.resize(size);
   memcpy(storage.data(), view.data(), view.size());
   stream.readBytes(storage.data() + view.size(), size - view.size());
-  return StringView(storage);
+  return StringView(storage.data(), storage.size());
 }
 
 // Comparison of two serializations.
@@ -720,12 +757,17 @@ template <
 std::optional<int32_t> compare(
     ByteInputStream& left,
     ByteInputStream& right,
-    const Type* /*type*/,
+    const Type* type,
     CompareFlags flags) {
-  std::string leftStorage;
-  std::string rightStorage;
+  auto leftStorage = makeStringScratch<typeProvidesCustomComparison>();
+  auto rightStorage = makeStringScratch<typeProvidesCustomComparison>();
   StringView leftValue = readStringView(left, leftStorage);
   StringView rightValue = readStringView(right, rightStorage);
+  if constexpr (typeProvidesCustomComparison) {
+    const auto result = SimpleVector<StringView>::template comparePrimitiveAscWithCustomComparison<Kind>(
+        type, leftValue, rightValue);
+    return flags.ascending ? result : -result;
+  }
   return flags.ascending ? leftValue.compare(rightValue)
                          : rightValue.compare(leftValue);
 }
@@ -737,12 +779,17 @@ template <
 std::optional<int32_t> compare(
     ByteInputStream& left,
     ByteInputStream& right,
-    const Type* /*type*/,
+    const Type* type,
     CompareFlags flags) {
-  std::string leftStorage;
-  std::string rightStorage;
+  auto leftStorage = makeStringScratch<typeProvidesCustomComparison>();
+  auto rightStorage = makeStringScratch<typeProvidesCustomComparison>();
   StringView leftValue = readStringView(left, leftStorage);
   StringView rightValue = readStringView(right, rightStorage);
+  if constexpr (typeProvidesCustomComparison) {
+    const auto result = SimpleVector<StringView>::template comparePrimitiveAscWithCustomComparison<Kind>(
+        type, leftValue, rightValue);
+    return flags.ascending ? result : -result;
+  }
   return flags.ascending ? leftValue.compare(rightValue)
                          : rightValue.compare(leftValue);
 }
@@ -913,18 +960,26 @@ template <
     bool typeProvidesCustomComparison,
     TypeKind Kind,
     std::enable_if_t<Kind == TypeKind::VARCHAR, int32_t> = 0>
-uint64_t hashOne(ByteInputStream& stream, const Type* /*type*/) {
-  std::string storage;
-  return folly::hasher<StringView>()(readStringView(stream, storage));
+uint64_t hashOne(ByteInputStream& stream, const Type* type) {
+  auto storage = makeStringScratch<typeProvidesCustomComparison>();
+  const auto value = readStringView(stream, storage);
+  if constexpr (typeProvidesCustomComparison) {
+    return static_cast<const CanProvideCustomComparisonType<Kind>*>(type)->hash(value);
+  }
+  return folly::hasher<StringView>()(value);
 }
 
 template <
     bool typeProvidesCustomComparison,
     TypeKind Kind,
     std::enable_if_t<Kind == TypeKind::VARBINARY, int32_t> = 0>
-uint64_t hashOne(ByteInputStream& stream, const Type* /*type*/) {
-  std::string storage;
-  return folly::hasher<StringView>()(readStringView(stream, storage));
+uint64_t hashOne(ByteInputStream& stream, const Type* type) {
+  auto storage = makeStringScratch<typeProvidesCustomComparison>();
+  const auto value = readStringView(stream, storage);
+  if constexpr (typeProvidesCustomComparison) {
+    return static_cast<const CanProvideCustomComparisonType<Kind>*>(type)->hash(value);
+  }
+  return folly::hasher<StringView>()(value);
 }
 
 template <bool elementTypeProvidesCustomComparison, typename TFunc>

@@ -978,6 +978,16 @@ int32_t RowContainer::compareComplexType(
   return compareComplexType(left, right, type, offset, offset, flags);
 }
 
+int32_t RowContainer::compareCustomStringAsc(const Type* type, StringView left, StringView right) {
+  // Multipart row strings need contiguous, pool-accounted scratch for the
+  // registered value comparator; ordinary strings keep their streaming path.
+  auto leftStorage = makeRowStringScratch();
+  auto rightStorage = makeRowStringScratch();
+  return SimpleVector<StringView>::comparePrimitiveAscWithCustomComparison(
+      type, HashStringAllocator::contiguousString(left, leftStorage),
+      HashStringAllocator::contiguousString(right, rightStorage));
+}
+
 template <bool typeProvidesCustomComparison, TypeKind Kind>
 void RowContainer::hashTyped(
     const Type* type,
@@ -1005,7 +1015,11 @@ void RowContainer::hashTyped(
           if (!storage) storage.emplace(makeRowStringScratch());
           view = HashStringAllocator::contiguousString(view, *storage);
         }
-        hash = folly::hasher<StringView>()(view);
+        if constexpr (typeProvidesCustomComparison) {
+          hash = static_cast<const CanProvideCustomComparisonType<Kind>*>(type)->hash(view);
+        } else {
+          hash = folly::hasher<StringView>()(view);
+        }
       } else if constexpr (is_nested_kind(Kind)) {
         auto in = prepareRead(row, offset);
         hash = ContainerRowSerde::hash(in, type);

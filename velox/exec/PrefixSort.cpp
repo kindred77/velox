@@ -172,6 +172,11 @@ PrefixSortLayout PrefixSortLayout::generate(
 
   bool lastPrefixKeyPartial{false};
   for (auto i = 0; i < numKeys; ++i) {
+    // Physical prefixes do not preserve a registered custom value order.
+    // Keep earlier normalized keys, then use the RowContainer comparator.
+    if (types[i]->providesCustomComparison()) {
+      break;
+    }
     const std::optional<uint32_t> encodedSize = PrefixSortEncoder::encodedSize(
         types[i]->kind(),
         maxStringLengths[i].has_value()

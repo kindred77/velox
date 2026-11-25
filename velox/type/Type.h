@@ -718,7 +718,8 @@ template <TypeKind KIND>
 struct kindCanProvideCustomComparison<
     KIND,
     std::enable_if_t<
-        TypeTraits<KIND>::isPrimitiveType && TypeTraits<KIND>::isFixedWidth>>
+        TypeTraits<KIND>::isPrimitiveType &&
+        (TypeTraits<KIND>::isFixedWidth || is_string_kind(KIND))>>
     : std::true_type {};
 
 struct ProvideCustomComparison {
@@ -735,7 +736,7 @@ class TypeBase : public Type {
   constexpr explicit TypeBase(ProvideCustomComparison tag) : Type{KIND, true} {
     static_assert(
         kindCanProvideCustomComparison<KIND>::value,
-        "Custom comparisons are only supported for primitive types that are fixed width.");
+        "Custom comparisons require a fixed-width primitive or a string primitive.");
   }
 
   bool isPrimitiveType() const override {
