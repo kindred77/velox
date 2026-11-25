@@ -15,6 +15,7 @@
  */
 
 #include <velox/type/Type.h>
+#include "velox/type/TypeOutput.h"
 
 #include <folly/dynamic.h>
 
@@ -1274,6 +1275,10 @@ getTypeFactory(const std::string& name) {
   }
 
   return nullptr;
+}
+
+const CustomTypeOutput* getCustomTypeOutput(const Type& type) {
+  return dynamic_cast<const CustomTypeOutput*>(getTypeFactory(type.name()));
 }
 
 TypePtr getCustomType(

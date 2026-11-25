@@ -401,6 +401,8 @@ struct TypeFactory;
   }
 
 class Type;
+// Shared logical display for registered custom string-backed types.
+std::string formatStringValue(const Type& type, const StringView& value);
 using TypePtr = std::shared_ptr<const Type>;
 
 /// Represents the parameters for a BigintEnumType.
@@ -2631,6 +2633,9 @@ template <typename T>
 std::string Type::valueToString(T value) const {
   if constexpr (std::is_same_v<T, bool>) {
     return value ? "true" : "false";
+
+  } else if constexpr (std::is_same_v<T, StringView>) {
+    return formatStringValue(*this, value);
 
   } else if constexpr (std::is_same_v<T, std::shared_ptr<void>>) {
     return "<opaque>";

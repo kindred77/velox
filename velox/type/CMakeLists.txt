@@ -34,6 +34,7 @@ velox_add_library(
   TimestampConversion.cpp
   Tokenizer.cpp
   Type.cpp
+  TypeOutput.cpp
   TypeCoercer.cpp
   TypeEncodingUtil.cpp
   TypeUtil.cpp
@@ -58,6 +59,7 @@ velox_add_library(
   Tokenizer.h
   Tree.h
   Type.h
+  TypeOutput.h
   TypeCoercer.h
   TypeEncodingUtil.h
   TypeSerde.h
