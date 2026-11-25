@@ -1162,9 +1162,12 @@ ExprPtr CastCallToSpecialForm::constructSpecialForm(
       "CAST statements expect exactly 1 argument, received {}.",
       compiledChildren.size());
   const auto inputKind = compiledChildren[0]->type()->kind();
+  // A registered custom cast owns its semantics regardless of its byte-backed
+  // storage. The primitive binary restriction applies only without that ability.
   if (type->kind() == TypeKind::VARBINARY &&
       (inputKind == TypeKind::TINYINT || inputKind == TypeKind::SMALLINT ||
-       inputKind == TypeKind::INTEGER || inputKind == TypeKind::BIGINT)) {
+       inputKind == TypeKind::INTEGER || inputKind == TypeKind::BIGINT) &&
+      getCustomTypeCastOperator(type->name()) == nullptr) {
     VELOX_UNSUPPORTED(
         "Cannot cast {} to VARBINARY.",
         compiledChildren[0]->type()->toString());
