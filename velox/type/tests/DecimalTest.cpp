@@ -875,6 +875,58 @@ TEST(DecimalTest, castFromStringExtremeExponent) {
   testCastFromString<int64_t>("-1.00e2147483647", 18, 2, "Value too large.");
 }
 
+TEST(DecimalTest, castFromStringWideExponent) {
+  for (const auto* input : {"0e2147483648", "0.00e9223372036854775807",
+                           "1e-9223372036854775808", "-1.00e-9223372036854775808"}) {
+    SCOPED_TRACE(input);
+    EXPECT_NO_THROW({
+      int64_t actual = 1;
+      const auto status = DecimalUtil::castFromString<int64_t>(StringView(input), 18, 2, actual);
+      EXPECT_TRUE(status.ok());
+      if (status.ok()) EXPECT_EQ(actual, 0);
+    });
+    EXPECT_NO_THROW({
+      int128_t actual = 1;
+      const auto status = DecimalUtil::castFromString<int128_t>(StringView(input), 38, 2, actual);
+      EXPECT_TRUE(status.ok());
+      if (status.ok()) EXPECT_EQ(actual, 0);
+    });
+  }
+}
+
+TEST(DecimalTest, castFromStringLongMantissa) {
+  struct Case { const char* input; int precision; int scale; const char* unscaled; };
+  const Case cases[] = {
+      {"123455e-3",4,1,"1235"},
+      {"-123455e-3",4,1,"-1235"},
+      {"12345678555e-3",9,1,"123456786"},
+      {"9007199254740993011e-3",18,2,"900719925474099301"},
+      {"-9007199254740993011e-3",18,2,"-900719925474099301"},
+      {"1234567890123456789012345678901234567895e-4",38,2,"12345678901234567890123456789012345679"},
+      {"-1234567890123456789012345678901234567895e-4",38,2,"-12345678901234567890123456789012345679"},
+      {"0.0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000125e102",10,2,"1250"},
+      {"0.00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000005e100",10,0,"1"},
+      {"-0.00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000005e100",10,0,"-1"},
+  };
+  for (const auto& test : cases) {
+    SCOPED_TRACE(test.input);
+    const auto expected = HugeInt::parse(test.unscaled);
+    if (test.precision <= 18) {
+      int64_t actual = 0;
+      auto status = DecimalUtil::castFromString<int64_t>(
+          StringView(test.input), test.precision, test.scale, actual);
+      EXPECT_TRUE(status.ok()) << status.message();
+      if (status.ok()) EXPECT_EQ(expected, actual);
+    } else {
+      int128_t actual = 0;
+      auto status = DecimalUtil::castFromString<int128_t>(
+          StringView(test.input), test.precision, test.scale, actual);
+      EXPECT_TRUE(status.ok()) << status.message();
+      if (status.ok()) EXPECT_EQ(expected, actual);
+    }
+  }
+}
+
 TEST(DecimalTest, castFromStringLongFractionExponent) {
   const auto zeros = std::string(50, '0');
   const std::vector<std::string> inputs{

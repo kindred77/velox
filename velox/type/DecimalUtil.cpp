@@ -244,7 +244,7 @@ namespace {
 struct DecimalComponents {
   std::string_view wholeDigits;
   std::string_view fractionalDigits;
-  std::optional<int32_t> exponent = std::nullopt;
+  std::optional<int64_t> exponent = std::nullopt;
   int8_t sign = 1;
 };
 
@@ -252,7 +252,7 @@ struct DecimalComponents {
 std::string_view extractDigits(const char* s, size_t start, size_t size) {
   size_t pos = start;
   for (; pos < size; ++pos) {
-    if (!std::isdigit(s[pos])) {
+    if (!std::isdigit(static_cast<unsigned char>(s[pos]))) {
       break;
     }
   }
@@ -315,12 +315,16 @@ parseDecimalComponents(const char* s, size_t size, DecimalComponents& out) {
     // Make sure all chars after sign are digits, as folly::tryTo allows
     // leading and trailing whitespaces.
     for (auto i = static_cast<size_t>(withSign); i < size - pos; ++i) {
-      if (!std::isdigit(s[pos + i])) {
+      if (!std::isdigit(static_cast<unsigned char>(s[pos + i]))) {
         return Status::UserError(
             "Non-digit character is not allowed in the exponent part.");
       }
     }
-    out.exponent = folly::to<int32_t>(std::string_view(s + pos, size - pos));
+    const auto parsed = folly::tryTo<int64_t>(std::string_view(s + pos, size - pos));
+    if (parsed.hasError()) {
+      return Status::UserError("The exponent is out of range.");
+    }
+    out.exponent = parsed.value();
     return Status::OK();
   }
   return pos == size ? Status::OK() : Status::UserError("Chars are invalid.");
@@ -437,114 +441,74 @@ Status DecimalUtil::parseStringToDecimalComponents(
     return Status::UserError("Value is not a number. " + status.message());
   }
 
-  // Count number of significant digits (without leading zeros).
-  const size_t firstNonZero =
-      decimalComponents.wholeDigits.find_first_not_of('0');
-  size_t significantDigits = decimalComponents.fractionalDigits.size();
-  if (firstNonZero != std::string::npos) {
-    significantDigits += decimalComponents.wholeDigits.size() - firstNonZero;
-  }
-  if (significantDigits > std::numeric_limits<int32_t>::max()) {
+  if (toScale < 0 || toScale > LongDecimalType::kMaxPrecision) {
     return Status::UserError("Value too large.");
   }
-  parsedPrecision = static_cast<int32_t>(significantDigits);
-  decimalComponents.wholeDigits.remove_prefix(
-      firstNonZero == std::string::npos
-          ? decimalComponents.wholeDigits.size()
-          : firstNonZero);
-
-  int64_t scale = 0;
-  bool roundUp = false;
-  const int64_t fractionSize = decimalComponents.fractionalDigits.size();
-  if (!decimalComponents.exponent.has_value()) {
-    if (fractionSize > toScale) {
-      if (decimalComponents.fractionalDigits[toScale] >= '5') {
-        roundUp = true;
-      }
-      scale = toScale;
-      decimalComponents.fractionalDigits =
-          std::string_view(decimalComponents.fractionalDigits.data(), toScale);
-    } else {
-      scale = fractionSize;
-    }
-  } else {
-    const int64_t exponent = decimalComponents.exponent.value();
-    scale = -exponent + fractionSize;
-    // Truncate the fractionalDigits.
-    if (scale > toScale) {
-      if (-exponent >= toScale) {
-        // Round here only when dropping the fraction reaches the target scale.
-        // Otherwise rescaling the whole digits makes the final rounding decision;
-        // rounding twice can turn 14.95e-1 into 2 instead of 1.
-        if (-exponent == toScale && fractionSize > 0 &&
-            decimalComponents.fractionalDigits[0] >= '5') {
-          roundUp = true;
-        }
-        decimalComponents.fractionalDigits = "";
-        scale -= fractionSize;
-      } else {
-        const auto reduceDigits = exponent + toScale;
-        if (fractionSize > reduceDigits &&
-            decimalComponents.fractionalDigits[reduceDigits] >= '5') {
-          roundUp = true;
-        }
-        decimalComponents.fractionalDigits = std::string_view(
-            decimalComponents.fractionalDigits.data(),
-            std::min(reduceDigits, fractionSize));
-        scale -= fractionSize - decimalComponents.fractionalDigits.size();
-      }
-    }
-  }
-
-  VELOX_RETURN_NOT_OK(parseHugeInt(decimalComponents, out));
-
-  if (roundUp) {
-#ifdef _WIN32
-    bool overflow =
-        facebook::velox::windows::builtin_add_overflow(out, int128_t(1), &out);
-#else
-    bool overflow = __builtin_add_overflow(out, 1, &out);
-#endif
-    if (UNLIKELY(overflow)) {
-      return Status::UserError("Value too large.");
-    }
-  }
-  out *= decimalComponents.sign;
-
-  if (out == 0 || scale > std::numeric_limits<int32_t>::max()) {
-    // A bounded int128 coefficient at a scale beyond int32 rounds to zero
-    // for every supported target scale. Do not narrow or expand that scale.
-    out = 0;
-    parsedScale = toScale;
+  const auto whole = decimalComponents.wholeDigits;
+  const auto fraction = decimalComponents.fractionalDigits;
+  const int64_t wholeSize = whole.size();
+  const int64_t totalDigits = wholeSize + static_cast<int64_t>(fraction.size());
+  const auto firstWhole = whole.find_first_not_of('0');
+  const auto firstFraction = firstWhole == std::string_view::npos
+      ? fraction.find_first_not_of('0') : std::string_view::npos;
+  const int64_t first = firstWhole != std::string_view::npos
+      ? static_cast<int64_t>(firstWhole)
+      : firstFraction != std::string_view::npos
+      ? wholeSize + static_cast<int64_t>(firstFraction)
+      : totalDigits;
+  parsedScale = toScale;
+  parsedPrecision = 1;
+  out = 0;
+  if (first == totalDigits) {
     return Status::OK();
   }
 
-  if (scale < 0) {
-    // Force the scale to be zero, to avoid negative scales (due to
-    // compatibility issues with external systems such as databases).
-    const auto shift = -scale + toScale;
-    if (shift > LongDecimalType::kMaxPrecision) {
-      return Status::UserError("Value too large.");
-    }
-
-#ifdef _WIN32
-    bool overflow = facebook::velox::windows::builtin_mul_overflow(
-        out, kPowersOfTen[shift], &out);
-#else
-    bool overflow =
-        __builtin_mul_overflow(out, kPowersOfTen[shift], &out);
-#endif
-    if (UNLIKELY(overflow)) {
-      return Status::UserError("Value too large.");
-    }
-    const auto precision = static_cast<int64_t>(parsedPrecision) - scale;
-    if (precision > std::numeric_limits<int32_t>::max()) {
-      return Status::UserError("Value too large.");
-    }
-    parsedPrecision = static_cast<int32_t>(precision);
-    scale = toScale;
+  // Retain only the final coefficient and one rounding digit. Parsing the
+  // entire mantissa first rejects valid values such as a 40-digit integer
+  // followed by e-4, even though its rounded DECIMAL(38,2) coefficient fits.
+  const int64_t base = wholeSize + toScale;
+  const auto exponent = decimalComponents.exponent.value_or(0);
+  if (exponent > std::numeric_limits<int64_t>::max() - base) {
+    return Status::UserError("Value too large.");
   }
-  parsedScale = static_cast<int32_t>(scale);
+  const int64_t keep = base + exponent;
+  if (keep < 0) return Status::OK();
+  if (keep - first > LongDecimalType::kMaxPrecision) {
+    return Status::UserError("Value too large.");
+  }
+  const auto digitAt = [&](int64_t position) {
+    return position < wholeSize ? whole[position] : fraction[position - wholeSize];
+  };
+  const bool roundUp = keep >= 0 && keep < totalDigits && digitAt(keep) >= '5';
+  const int64_t end = std::min(keep, totalDigits);
+  if (end > first) {
+    parsedPrecision = static_cast<int32_t>(keep - first);
+    if (first < wholeSize) {
+      decimalComponents.wholeDigits = whole.substr(first, std::min(end, wholeSize) - first);
+      decimalComponents.fractionalDigits = end > wholeSize
+          ? fraction.substr(0, end - wholeSize) : std::string_view{};
+    } else {
+      decimalComponents.wholeDigits = {};
+      decimalComponents.fractionalDigits = fraction.substr(first - wholeSize, end - first);
+    }
+    VELOX_RETURN_NOT_OK(parseHugeInt(decimalComponents, out));
+    if (keep > totalDigits) {
+      const auto zeros = keep - totalDigits;
+#ifdef _WIN32
+      const bool overflow = facebook::velox::windows::builtin_mul_overflow(
+          out, kPowersOfTen[zeros], &out);
+#else
+      const bool overflow = __builtin_mul_overflow(out, kPowersOfTen[zeros], &out);
+#endif
+      if (UNLIKELY(overflow)) return Status::UserError("Value too large.");
+    }
+  }
+  if (roundUp) {
+    // At most 38 retained digits: even a carry to 10^38 fits int128.
+    // The existing final rescale validates the requested precision.
+    ++out;
+  }
+  out *= decimalComponents.sign;
   return Status::OK();
 }
 
