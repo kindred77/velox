@@ -223,7 +223,8 @@ class SequenceVector : public SimpleVector<T> {
   bool checkLoadRange(size_t idx, size_t count) const;
 
   uint64_t retainedSizeImpl(uint64_t& totalStringBufferSize) const override {
-    return sequenceValues_->retainedSize(totalStringBufferSize) +
+    return BaseVector::retainedSizeImpl() +
+        sequenceValues_->retainedSize(totalStringBufferSize) +
         sequenceLengths_->capacity();
   }
 

@@ -32,8 +32,85 @@
 #include "velox/vector/VectorEncoding.h"
 #include "velox/vector/VectorPool.h"
 #include "velox/vector/VectorTypeUtils.h"
+#include "velox/vector/VectorUtil.h"
 
 namespace facebook::velox {
+
+std::optional<uint64_t> retainedVectorBytes(const BaseVector& vector) {
+  // A view can retain a larger parent or an external cache pin. Its visible
+  // capacity is not evidence of complete ownership; do not load or copy here.
+  const auto owned = [](const BufferPtr& buffer) {
+    return !buffer || !buffer->isView();
+  };
+  const auto measurable = [&owned](auto&& self, const BaseVector& current) -> bool {
+    if (current.typeKind() == TypeKind::OPAQUE || !owned(current.nulls())) {
+      return false;
+    }
+    switch (current.encoding()) {
+      case VectorEncoding::Simple::FLAT:
+        if (!current.type()->isPrimitiveType() || !owned(current.values())) {
+          return false;
+        }
+        if (current.typeKind() == TypeKind::VARCHAR ||
+            current.typeKind() == TypeKind::VARBINARY) {
+          for (const auto& buffer :
+               current.asUnchecked<FlatVector<StringView>>()->stringBuffers()) {
+            if (!owned(buffer)) return false;
+          }
+        }
+        return true;
+      case VectorEncoding::Simple::BIASED:
+        return current.type()->isPrimitiveType() && owned(current.values());
+      case VectorEncoding::Simple::CONSTANT: {
+        const auto& value = current.valueVector();
+        if (value) return self(self, *value);
+        if (current.typeKind() == TypeKind::VARCHAR ||
+            current.typeKind() == TypeKind::VARBINARY) {
+          return owned(current.asUnchecked<ConstantVector<StringView>>()->getStringBuffer());
+        }
+        return current.type()->isPrimitiveType();
+      }
+      case VectorEncoding::Simple::DICTIONARY:
+      case VectorEncoding::Simple::SEQUENCE: {
+        const auto& value = current.valueVector();
+        return owned(current.wrapInfo()) && value && self(self, *value);
+      }
+      case VectorEncoding::Simple::ROW:
+        for (const auto& child : current.asUnchecked<RowVector>()->children()) {
+          if (child && !self(self, *child)) return false;
+        }
+        return true;
+      case VectorEncoding::Simple::ARRAY: {
+        const auto* array = current.asUnchecked<ArrayVector>();
+        return owned(array->offsets()) && owned(array->sizes()) &&
+            array->elements() && self(self, *array->elements());
+      }
+      case VectorEncoding::Simple::MAP: {
+        const auto* map = current.asUnchecked<MapVector>();
+        return owned(map->offsets()) && owned(map->sizes()) &&
+            map->mapKeys() && map->mapValues() &&
+            self(self, *map->mapKeys()) && self(self, *map->mapValues());
+      }
+      case VectorEncoding::Simple::FLAT_MAP: {
+        const auto* map = current.asUnchecked<FlatMapVector>();
+        if (map->distinctKeys() && !self(self, *map->distinctKeys())) return false;
+        for (const auto& values : map->mapValues()) {
+          if (values && !self(self, *values)) return false;
+        }
+        for (const auto& buffer : map->inMaps()) {
+          if (!owned(buffer)) return false;
+        }
+        return true;
+      }
+      default:
+        // A LAZY wrapper can retain a loader even after loading. Do not unwrap
+        // it here or trigger I/O to turn missing evidence into authorization.
+        return false;
+    }
+  };
+  return measurable(measurable, vector)
+      ? std::optional<uint64_t>{vector.retainedSize()} : std::nullopt;
+}
 
 std::optional<uint64_t> fixedWidthVectorRowBytes(const Type& type) {
   if (type.providesCustomComparison()) return std::nullopt;

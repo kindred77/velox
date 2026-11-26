@@ -481,14 +481,15 @@ class ConstantVector final : public SimpleVector<T> {
 
   uint64_t retainedSizeImpl(uint64_t& totalStringBufferSize) const override {
     VELOX_DCHECK(initialized_);
+    const auto ownNulls = BaseVector::retainedSizeImpl();
     if (valueVector_) {
-      return valueVector_->retainedSize(totalStringBufferSize);
+      return ownNulls + valueVector_->retainedSize(totalStringBufferSize);
     }
     if (stringBuffer_) {
       totalStringBufferSize += stringBuffer_->capacity();
-      return stringBuffer_->capacity();
+      return ownNulls + stringBuffer_->capacity();
     }
-    return sizeof(T);
+    return ownNulls + sizeof(T);
   }
 
   // 'valueVector_' element 'index_' represents a complex constant

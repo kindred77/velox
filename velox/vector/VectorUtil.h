@@ -16,11 +16,25 @@
 
 #pragma once
 
+#include <cstdint>
+#include <optional>
+
 #include "velox/buffer/Buffer.h"
 #include "velox/common/base/Exceptions.h"
 #include "velox/type/Type.h"
 
 namespace facebook::velox {
+
+class BaseVector;
+
+/// Current vector-owned buffer retention, only when the entire representation
+/// tree is measurable without loading or allocating. Lazy loaders (including
+/// loaded LAZY wrappers), opaque payloads, function captures and unknown
+/// encodings and external buffer views return unknown. Shared buffers may be
+/// counted more than once; object/STL metadata is excluded. Known zero is
+/// distinct from unknown. This does
+/// not bound producer/reader memory, a future copy or query peak allocation.
+std::optional<uint64_t> retainedVectorBytes(const BaseVector& vector);
 
 template <typename T>
 static inline BufferPtr copyToBuffer(

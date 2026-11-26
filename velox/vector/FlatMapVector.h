@@ -413,13 +413,18 @@ class FlatMapVector : public BaseVector {
       vector_size_t wrappedOtherIndex,
       CompareFlags flags) const;
 
-  uint64_t retainedSizeImpl(
-      uint64_t& /*totalStringBufferSize*/) const override {
-    // TODO: since FlatMapVector didn't override BaseVector::retainedSize(),
-    // this override of retainedSizeImpl keeps the original behavior of
-    // FlatMapVector::retainedSize(). We should update this method to reflect
-    // the actual memory usage of FlatMapVector.
-    return BaseVector::retainedSizeImpl();
+  uint64_t retainedSizeImpl(uint64_t& totalStringBufferSize) const override {
+    // Retain every represented channel, including absent logical map entries.
+    // Shared buffers may be counted more than once, as in Row/MapVector.
+    auto size = BaseVector::retainedSizeImpl();
+    if (distinctKeys_) size += distinctKeys_->retainedSize(totalStringBufferSize);
+    for (const auto& values : mapValues_) {
+      if (values) size += values->retainedSize(totalStringBufferSize);
+    }
+    for (const auto& buffer : inMaps_) {
+      if (buffer) size += buffer->capacity();
+    }
+    return size;
   }
 
   // Vector containing the distinct map keys.

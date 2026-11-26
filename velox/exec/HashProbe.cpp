@@ -15,6 +15,7 @@
  */
 
 #include "velox/exec/HashProbe.h"
+#include "velox/vector/VectorUtil.h"
 #include <folly/ScopeGuard.h>
 #include "velox/common/base/Counters.h"
 #include "velox/common/base/StatsReporter.h"
@@ -773,14 +774,15 @@ void HashProbe::decodeAndDetectNonNullKeys() {
 void HashProbe::addInput(RowVectorPtr input) {
   if (joinNode_->probeFirst() && !probeInputReported_) {
     if (input->size() == 0) return;
-    const auto retainedBytes = input->retainedSize();
-    VELOX_CHECK_LE(retainedBytes, joinNode_->probeFirstMaxBytes(),
+    const auto retainedBytes = retainedVectorBytes(*input);
+    VELOX_CHECK(retainedBytes.has_value(), "Probe head has unaccounted retained state");
+    VELOX_CHECK_LE(*retainedBytes, joinNode_->probeFirstMaxBytes(),
                    "Probe head exceeds its authorized input-retention bound");
-    // Record observed heads, not the authorization ceiling. Lazy vectors
-    // report only their currently retained buffers; this is not a bound on
-    // future materialization or a query memory peak. One sample per driver.
+    // Only accounted representation trees may be retained. Record actual
+    // owned buffers, not the authorization ceiling or a query memory peak.
+    // A known zero is valid; unknown lazy/external ownership was rejected.
     addRuntimeStat("probeFirstInputRetainedBytes",
-                   RuntimeCounter(retainedBytes, RuntimeCounter::Unit::kBytes));
+                   RuntimeCounter(*retainedBytes, RuntimeCounter::Unit::kBytes));
     addRuntimeStat("probeFirstInputRows", RuntimeCounter(input->size()));
     prefetchedInput_ = std::move(input);
     probeInputReported_ = true;
