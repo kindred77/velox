@@ -896,7 +896,7 @@ bool Variant::lessThan(const Variant& other) const {
   if constexpr (kindCanProvideCustomComparison<KIND>::value) {
     if (usesCustomComparison_) {
       return customComparisonType<KIND>()->compare(
-                 value<KIND>(), other.value<KIND>()) < 0;
+                 T(value<KIND>()), T(other.value<KIND>())) < 0;
     }
   }
 
@@ -924,7 +924,7 @@ bool Variant::equals(const Variant& other) const {
   if constexpr (kindCanProvideCustomComparison<KIND>::value) {
     if (usesCustomComparison_) {
       return customComparisonType<KIND>()->compare(
-                 value<KIND>(), other.value<KIND>()) == 0;
+                 T(value<KIND>()), T(other.value<KIND>())) == 0;
     }
   }
 
@@ -961,7 +961,7 @@ uint64_t Variant::hash() const {
 
   if constexpr (kindCanProvideCustomComparison<KIND>::value) {
     if (usesCustomComparison_) {
-      return customComparisonType<KIND>()->hash(value<KIND>());
+      return customComparisonType<KIND>()->hash(T(value<KIND>()));
     }
   }
 

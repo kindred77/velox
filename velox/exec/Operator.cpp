@@ -51,7 +51,7 @@ memory::MemoryPool* OperatorCtx::customPool(std::string_view tag) const {
 core::ExecCtx* OperatorCtx::execCtx() const {
   if (!execCtx_) {
     execCtx_ = std::make_unique<core::ExecCtx>(
-        pool_, driverCtx_->task->queryCtx().get());
+        pool_, driverCtx_->task->queryCtx().get(), driverCtx_->task->getCancellationToken());
   }
   return execCtx_.get();
 }
@@ -70,7 +70,7 @@ OperatorCtx::createConnectorQueryCtx(
       spillConfig,
       driverCtx_->prefixSortConfig(),
       std::make_unique<SimpleExpressionEvaluator>(
-          execCtx()->queryCtx(), execCtx()->pool()),
+          execCtx()->queryCtx(), execCtx()->pool(), execCtx()->cancellationToken()),
       task->queryCtx()->cache(),
       task->queryCtx()->queryId(),
       taskId(),

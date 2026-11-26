@@ -884,14 +884,10 @@ class DecimalUtil {
       int64_t overflow) {
     // Value is valid if the conditions below are true.
     if ((overflow == 1 && sum < 0) || (overflow == -1 && sum > 0)) {
-#ifdef _MSC_VER
-      // On Windows, construct int128_t from UInt128 using high() and low()
-      return int128_t(
-          int128_t(static_cast<int64_t>(DecimalUtil::kOverflowMultiplier.high()), DecimalUtil::kOverflowMultiplier.low()) * overflow + sum);
-#else
-      // On Linux, kOverflowMultiplier is __uint128_t which can be used directly
-      return int128_t(kOverflowMultiplier) * overflow + sum;
-#endif
+      // Each result is in signed range. Avoid first forming +2^127 or
+      // overflowing min * -1 / min + negative in an intermediate expression.
+      const auto minimum = std::numeric_limits<int128_t>::min();
+      return overflow == 1 ? sum - minimum : sum + minimum;
     }
     if (overflow != 0) {
       // The actual overflow occurred.

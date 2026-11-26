@@ -206,7 +206,12 @@ std::optional<Coercion> TypeCoercer::coerce(
 std::optional<Coercion> TypeCoercer::coerceTypeBase(
     const TypePtr& fromType,
     const TypePtr& toType) const {
-  if (fromType->name() == toType->name()) {
+  // A shared name does not imply equal custom parameters. Non-equivalent
+  // custom types must use registered coercion rules and their validators.
+  // DECIMAL parameters retain their existing signature/common-domain binding.
+  if (fromType->name() == toType->name() &&
+      (fromType->equivalent(*toType) ||
+       (fromType->isDecimal() && toType->isDecimal()))) {
     return Coercion{.type = fromType, .cost = 0};
   }
 

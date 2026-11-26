@@ -1070,8 +1070,13 @@ bool unregisterExprSetListener(
 
 class SimpleExpressionEvaluator : public core::ExpressionEvaluator {
  public:
-  SimpleExpressionEvaluator(core::QueryCtx* queryCtx, memory::MemoryPool* pool)
-      : queryCtx_(queryCtx), pool_(pool) {}
+  SimpleExpressionEvaluator(
+      core::QueryCtx* queryCtx,
+      memory::MemoryPool* pool,
+      folly::CancellationToken cancellationToken = {})
+      : queryCtx_(queryCtx),
+        pool_(pool),
+        cancellationToken_(std::move(cancellationToken)) {}
 
   std::unique_ptr<ExprSet> compile(
       const core::TypedExprPtr& expression) override {
@@ -1105,6 +1110,7 @@ class SimpleExpressionEvaluator : public core::ExpressionEvaluator {
 
   core::QueryCtx* const queryCtx_;
   memory::MemoryPool* const pool_;
+  const folly::CancellationToken cancellationToken_;
   std::unique_ptr<core::ExecCtx> execCtx_;
 };
 

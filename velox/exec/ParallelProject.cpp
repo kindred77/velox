@@ -67,7 +67,8 @@ void ParallelProject::initialize() {
   int32_t unitSize = exprGroups[unitIdx].size();
   work_.emplace_back();
   work_.back().execCtx = std::make_unique<core::ExecCtx>(
-      operatorCtx_->pool(), operatorCtx_->driverCtx()->task->queryCtx().get());
+      operatorCtx_->pool(), operatorCtx_->driverCtx()->task->queryCtx().get(),
+      operatorCtx_->execCtx()->cancellationToken());
 
   std::vector<core::TypedExprPtr> unitExprs;
   for (column_index_t i = 0; i < node_->exprNames().size(); i++) {
@@ -85,6 +86,9 @@ void ParallelProject::initialize() {
       // It may be that the only work is loading lazies.
       auto tempExprs =
           makeExprSetFromFlag(std::move(unitExprs), operatorCtx_->execCtx());
+      // ExprSet compiles from a const reference; moving into the factory does
+      // not consume this vector. Each work unit must contain only its group.
+      unitExprs.clear();
       std::shared_ptr<ExprSet> shared(tempExprs.release());
       work_.back().exprSet = std::move(shared);
       ++unitIdx;
@@ -96,7 +100,8 @@ void ParallelProject::initialize() {
       work_.emplace_back();
       work_.back().execCtx = std::make_unique<core::ExecCtx>(
           operatorCtx_->pool(),
-          operatorCtx_->driverCtx()->task->queryCtx().get());
+          operatorCtx_->driverCtx()->task->queryCtx().get(),
+          operatorCtx_->execCtx()->cancellationToken());
     }
   }
 

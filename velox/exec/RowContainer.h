@@ -1393,8 +1393,13 @@ class RowContainer {
         Kind == TypeKind::MAP) {
       return compareComplexType(row, column.offset(), decoded, index, flags);
     } else if constexpr (is_string_kind(Kind)) {
-      auto result = compareStringAsc(
-          valueAt<StringView>(row, column.offset()), decoded, index);
+      int32_t result;
+      if constexpr (typeProvidesCustomComparison) {
+        result = compareCustomStringAsc(decoded.base()->type().get(),
+            valueAt<StringView>(row, column.offset()), decoded.valueAt<StringView>(index));
+      } else {
+        result = compareStringAsc(valueAt<StringView>(row, column.offset()), decoded, index);
+      }
       return flags.ascending ? result : result * -1;
     } else {
       auto left = valueAt<T>(row, column.offset());
@@ -1476,7 +1481,9 @@ class RowContainer {
     } else if constexpr (is_string_kind(Kind)) {
       auto leftValue = valueAt<StringView>(left, leftOffset);
       auto rightValue = valueAt<StringView>(right, rightOffset);
-      auto result = compareStringAsc(leftValue, rightValue);
+      const auto result = typeProvidesCustomComparison
+          ? compareCustomStringAsc(type, leftValue, rightValue)
+          : compareStringAsc(leftValue, rightValue);
       return flags.ascending ? result : result * -1;
     } else {
       auto leftValue = valueAt<T>(left, leftOffset);
@@ -1573,6 +1580,8 @@ class RowContainer {
       vector_size_t index);
 
   static int32_t compareStringAsc(StringView left, StringView right);
+
+  static int32_t compareCustomStringAsc(const Type* type, StringView left, StringView right);
 
   int32_t compareComplexType(
       const char* row,

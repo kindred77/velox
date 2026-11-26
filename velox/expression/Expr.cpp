@@ -2452,7 +2452,7 @@ void SimpleExpressionEvaluator::evaluate(
 
 core::ExecCtx* SimpleExpressionEvaluator::ensureExecCtx() {
   if (!execCtx_) {
-    execCtx_ = std::make_unique<core::ExecCtx>(pool_, queryCtx_);
+    execCtx_ = std::make_unique<core::ExecCtx>(pool_, queryCtx_, cancellationToken_);
   }
   return execCtx_.get();
 }
