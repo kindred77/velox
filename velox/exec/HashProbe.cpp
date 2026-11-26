@@ -773,8 +773,15 @@ void HashProbe::decodeAndDetectNonNullKeys() {
 void HashProbe::addInput(RowVectorPtr input) {
   if (joinNode_->probeFirst() && !probeInputReported_) {
     if (input->size() == 0) return;
-    VELOX_CHECK_LE(input->retainedSize(), joinNode_->probeFirstMaxBytes(),
+    const auto retainedBytes = input->retainedSize();
+    VELOX_CHECK_LE(retainedBytes, joinNode_->probeFirstMaxBytes(),
                    "Probe head exceeds its authorized input-retention bound");
+    // Record observed heads, not the authorization ceiling. Lazy vectors
+    // report only their currently retained buffers; this is not a bound on
+    // future materialization or a query memory peak. One sample per driver.
+    addRuntimeStat("probeFirstInputRetainedBytes",
+                   RuntimeCounter(retainedBytes, RuntimeCounter::Unit::kBytes));
+    addRuntimeStat("probeFirstInputRows", RuntimeCounter(input->size()));
     prefetchedInput_ = std::move(input);
     probeInputReported_ = true;
     joinBridge_->reportProbeInput(probeInputParticipant_, true);
