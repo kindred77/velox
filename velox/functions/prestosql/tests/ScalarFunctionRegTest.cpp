@@ -33,7 +33,7 @@ TEST_F(ScalarFunctionRegTest, prefix) {
 
   // Register without prefix and memorize function maps.
   prestosql::registerAllScalarFunctions();
-  const std::unordered_map<std::string, exec::VectorFunctionEntry>
+  const std::unordered_map<std::string, std::vector<exec::VectorFunctionEntry>>
       scalarVectorFuncMapBase = *(exec::vectorFunctionFactories().rlock());
   std::unordered_set<std::string> scalarSimpleFuncBaseNames;
   for (const auto& funcName : exec::simpleFunctions().getFunctionNames()) {
@@ -50,7 +50,7 @@ TEST_F(ScalarFunctionRegTest, prefix) {
   const std::string prefix{"test.abc_schema."};
   const auto prefixSize = prefix.size();
   prestosql::registerAllScalarFunctions(prefix);
-  std::unordered_map<std::string, exec::VectorFunctionEntry>
+  std::unordered_map<std::string, std::vector<exec::VectorFunctionEntry>>
       scalarVectorFuncMap = *(exec::vectorFunctionFactories().rlock());
 
   // Remove special form functions - they don't have any prefix.
