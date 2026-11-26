@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include "velox/common/base/LikePattern.h"
 #include <fmt/format.h>
 #include <re2/re2.h>
 
@@ -2415,72 +2416,7 @@ class NegatedBytesValues final : public Filter {
   std::unique_ptr<BytesValues> nonNegated_;
 };
 
-namespace detail {
 
-/// Converts a SQL LIKE pattern to an anchored RE2 regular expression,
-/// mirroring the engine's `like` expression semantics
-/// (velox/functions/lib/Re2Functions.cpp::likePatternToRe2). `%` matches any
-/// sequence, `_` matches a single character; `escapeChar` (when present)
-/// escapes `%`, `_` and itself. Sets `validPattern` to false for a trailing
-/// escape or an escaped character that is not `%`, `_` or the escape
-/// character.
-inline std::string likePatternToRe2(
-    StringView pattern,
-    std::optional<char> escapeChar,
-    bool& validPattern) {
-  std::string regex;
-  validPattern = true;
-  regex.reserve(pattern.size() * 2);
-  regex.append("^");
-  bool escaped = false;
-  for (const char c : pattern) {
-    if (escaped && !(c == '%' || c == '_' || c == escapeChar)) {
-      validPattern = false;
-    }
-    if (!escaped && c == escapeChar) {
-      escaped = true;
-    } else {
-      switch (c) {
-        case '%':
-          regex.append(escaped ? "%" : ".*");
-          escaped = false;
-          break;
-        case '_':
-          regex.append(escaped ? "_" : ".");
-          escaped = false;
-          break;
-        // Escape all the meta characters in re2.
-        case '\\':
-        case '|':
-        case '^':
-        case '$':
-        case '.':
-        case '*':
-        case '+':
-        case '?':
-        case '(':
-        case ')':
-        case '[':
-        case ']':
-        case '{':
-        case '}':
-          regex.append("\\"); // Append the meta character after the escape.
-          [[fallthrough]];
-        default:
-          regex.append(1, c);
-          escaped = false;
-      }
-    }
-  }
-  if (escaped) {
-    validPattern = false;
-  }
-
-  regex.append("$");
-  return regex;
-}
-
-} // namespace detail
 
 /// SQL LIKE pattern filter ('%' matches any sequence, '_' matches a single
 /// character, optional escape character). Used for exact scan-level pushdown
@@ -2580,8 +2516,8 @@ class LikeFilter final : public Filter {
     RE2::Options options{RE2::Quiet};
     options.set_dot_nl(true);
     re_ = std::make_unique<RE2>(
-        detail::likePatternToRe2(
-            StringView(pattern_), escapeChar_, validPattern),
+        ::facebook::velox::common::sql::likePatternToRe2(
+            std::string_view(pattern_), escapeChar_, validPattern),
         options);
     VELOX_CHECK(validPattern, "Invalid LIKE pattern '{}'", pattern_);
     VELOX_CHECK(

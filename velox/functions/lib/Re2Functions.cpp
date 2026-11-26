@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "velox/common/base/LikePattern.h"
 #include "velox/functions/lib/Re2Functions.h"
 #include "velox/functions/lib/string/StringImpl.h"
 #include "velox/type/Filter.h"
@@ -803,8 +804,8 @@ class LikeWithRe2 final : public exec::VectorFunction {
     opt.set_dot_nl(true);
     re_.emplace(
         toStringPiece(
-            common::detail::likePatternToRe2(
-                pattern, escapeChar, validPattern_)),
+            ::facebook::velox::common::sql::likePatternToRe2(
+                std::string_view(pattern.data(), pattern.size()), escapeChar, validPattern_)),
         opt);
   }
 
@@ -997,8 +998,8 @@ class LikeGeneric final : public exec::VectorFunction {
         "Max number of regex reached");
 
     bool validEscapeUsage;
-    auto regex = common::detail::likePatternToRe2(
-        pattern, escapeChar, validEscapeUsage);
+    auto regex = ::facebook::velox::common::sql::likePatternToRe2(
+        std::string_view(pattern.data(), pattern.size()), escapeChar, validEscapeUsage);
     VELOX_USER_CHECK(
         validEscapeUsage,
         "Escape character must be followed by '%', '_' or the escape character itself");
