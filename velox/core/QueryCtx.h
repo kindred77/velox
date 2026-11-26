@@ -17,6 +17,7 @@
 #pragma once
 
 #include <folly/Executor.h>
+#include <folly/CancellationToken.h>
 #include <folly/Synchronized.h>
 #include <folly/container/F14Map.h>
 #include <deque>
@@ -541,9 +542,13 @@ class QueryCtx : public std::enable_shared_from_this<QueryCtx> {
 // Represents the state of one thread of query execution.
 class ExecCtx {
  public:
-  ExecCtx(memory::MemoryPool* pool, QueryCtx* queryCtx)
+  ExecCtx(
+      memory::MemoryPool* pool,
+      QueryCtx* queryCtx,
+      folly::CancellationToken cancellationToken = {})
       : pool_(pool),
         queryCtx_(queryCtx),
+        cancellationToken_(std::move(cancellationToken)),
         optimizationParams_(queryCtx),
         vectorPool_(
             optimizationParams_.exprEvalCacheEnabled
@@ -602,6 +607,16 @@ class ExecCtx {
 
   QueryCtx* queryCtx() const {
     return queryCtx_;
+  }
+
+  // Task-local control token: long expression work can stop without depending
+  // on exec::Task or consulting process-global driver state.
+  const folly::CancellationToken& cancellationToken() const {
+    return cancellationToken_;
+  }
+
+  void checkCancellation() const {
+    VELOX_CHECK(!cancellationToken_.isCancellationRequested(), "Cancelled");
   }
 
   /// Returns an uninitialized  SelectivityVector from a pool. Allocates new one
@@ -707,6 +722,7 @@ class ExecCtx {
   // Pool for all Buffers for this thread.
   memory::MemoryPool* const pool_;
   QueryCtx* const queryCtx_;
+  const folly::CancellationToken cancellationToken_;
 
   const OptimizationParams optimizationParams_;
   // A pool of preallocated DecodedVectors for use by expressions and
