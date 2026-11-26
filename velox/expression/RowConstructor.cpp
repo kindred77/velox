@@ -37,10 +37,13 @@ ExprPtr RowConstructorCallToSpecialForm::constructSpecialForm(
                                        VectorFunctionMetadata> {
         auto functionIterator = functionMap.find(expression::kRowConstructor);
         if (functionIterator != functionMap.end()) {
+          VELOX_CHECK_EQ(functionIterator->second.size(), 1,
+                         "Row constructor requires a single provider");
+          const auto& entry = functionIterator->second.front();
           return {
-              functionIterator->second.factory(
+              entry.factory(
                   expression::kRowConstructor, {}, config),
-              functionIterator->second.metadata};
+              entry.metadata};
         } else {
           VELOX_FAIL(
               "Function {} is not registered.", expression::kRowConstructor);

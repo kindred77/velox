@@ -265,7 +265,7 @@ struct VectorFunctionEntry {
 
 // TODO: Use folly::Singleton here
 using VectorFunctionMap =
-    folly::Synchronized<std::unordered_map<std::string, VectorFunctionEntry>>;
+    folly::Synchronized<std::unordered_map<std::string, std::vector<VectorFunctionEntry>>>;
 
 VectorFunctionMap& vectorFunctionFactories();
 
@@ -296,6 +296,14 @@ bool registerStatefulVectorFunction(
     VectorFunctionFactory factory,
     VectorFunctionMetadata metadata = {},
     bool overwrite = true);
+
+// Appends a provider without replacing existing overloads. Duplicate signatures
+// or inconsistent companion-function metadata reject the entire registration.
+bool registerStatefulVectorFunctionOverload(
+    std::string_view name,
+    std::vector<FunctionSignaturePtr> signatures,
+    VectorFunctionFactory factory,
+    VectorFunctionMetadata metadata = {});
 
 } // namespace facebook::velox::exec
 

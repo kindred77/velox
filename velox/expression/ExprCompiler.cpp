@@ -519,19 +519,14 @@ std::unordered_set<std::string> collectFlatteningCandidates(
     collectCallNames(expr, names);
   }
 
-  return vectorFunctionFactories().withRLock([&](auto& functionMap) {
-    std::unordered_set<std::string> flatteningCandidates;
-    for (const auto& name : names) {
-      auto it = functionMap.find(name);
-      if (it != functionMap.end()) {
-        const auto& metadata = it->second.metadata;
-        if (metadata.supportsFlattening) {
-          flatteningCandidates.insert(name);
-        }
-      }
+  std::unordered_set<std::string> flatteningCandidates;
+  for (const auto& name : names) {
+    auto metadata = getVectorFunctionMetadata(name);
+    if (metadata && metadata->supportsFlattening) {
+      flatteningCandidates.insert(name);
     }
-    return flatteningCandidates;
-  });
+  }
+  return flatteningCandidates;
 }
 } // namespace
 

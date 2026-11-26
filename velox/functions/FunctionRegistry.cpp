@@ -33,17 +33,15 @@ namespace facebook::velox {
 namespace {
 
 void populateVectorFunctionSignatures(FunctionSignatureMap& map) {
-  auto vectorFunctions = exec::vectorFunctionFactories();
+  auto& vectorFunctions = exec::vectorFunctionFactories();
   vectorFunctions.withRLock([&map](const auto& locked) {
     for (const auto& it : locked) {
-      const auto& allSignatures = it.second.signatures;
       auto& curSignatures = map[it.first];
-      std::transform(
-          allSignatures.begin(),
-          allSignatures.end(),
-          std::back_inserter(curSignatures),
-          [](std::shared_ptr<exec::FunctionSignature> signature)
-              -> exec::FunctionSignature* { return signature.get(); });
+      for (const auto& entry : it.second) {
+        for (const auto& signature : entry.signatures) {
+          curSignatures.push_back(signature.get());
+        }
+      }
     }
   });
 }
@@ -69,8 +67,10 @@ std::vector<const exec::FunctionSignature*> getFunctionSignatures(
   vectorFunctions.withRLock([&](const auto& functions) {
     auto it = functions.find(functionName);
     if (it != functions.end()) {
-      for (const auto& signature : it->second.signatures) {
-        signatures.push_back(signature.get());
+      for (const auto& entry : it->second) {
+        for (const auto& signature : entry.signatures) {
+          signatures.push_back(signature.get());
+        }
       }
     }
   });
