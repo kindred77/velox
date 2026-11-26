@@ -1775,6 +1775,9 @@ VELOX_DEFINE_ENUM_NAME(JoinType, joinTypeNames)
 
 void HashJoinNode::addDetails(std::stringstream& stream) const {
   AbstractJoinNode::addDetails(stream);
+  if (probeFirst_) {
+    stream << ", probe first, head bound " << probeFirstMaxBytes_ << " bytes";
+  }
   if (nullAware_) {
     stream << ", null aware";
   }
@@ -1789,6 +1792,8 @@ void HashJoinNode::addDetails(std::stringstream& stream) const {
 folly::dynamic HashJoinNode::serialize() const {
   auto obj = serializeBase();
   obj["nullAware"] = nullAware_;
+  obj["probeFirst"] = probeFirst_;
+  obj["probeFirstMaxBytes"] = probeFirstMaxBytes_;
   obj["nullAsValue"] = nullAsValue_;
   obj["useHashTableCache"] = useHashTableCache_;
   if (cacheKey_.has_value()) {
@@ -1812,6 +1817,9 @@ PlanNodePtr HashJoinNode::create(const folly::dynamic& obj, void* context) {
   VELOX_CHECK_EQ(2, sources.size());
 
   auto nullAware = obj["nullAware"].asBool();
+  const auto probeFirst = obj.getDefault("probeFirst", false).asBool();
+  const auto probeFirstMaxBytes = obj.getDefault("probeFirstMaxBytes", 0).asInt();
+  VELOX_USER_CHECK_GE(probeFirstMaxBytes, 0);
   auto nullAsValue = obj.getDefault("nullAsValue", false).asBool();
   auto useHashTableCache = obj.getDefault("useHashTableCache", false).asBool();
   std::optional<std::string> cacheKey = std::nullopt;
@@ -1847,7 +1855,9 @@ PlanNodePtr HashJoinNode::create(const folly::dynamic& obj, void* context) {
       useHashTableCache,
       nullAsValue,
       std::move(cacheKey),
-      std::move(postJoinFilter));
+      std::move(postJoinFilter),
+      probeFirst,
+      static_cast<uint64_t>(probeFirstMaxBytes));
 }
 
 MergeJoinNode::MergeJoinNode(

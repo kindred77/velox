@@ -75,6 +75,7 @@ BlockingReason fromStateToBlockingReason(HashBuild::State state) {
     case HashBuild::State::kWaitForBuild:
       return BlockingReason::kWaitForJoinBuild;
     case HashBuild::State::kWaitForProbe:
+    case HashBuild::State::kWaitForProbeInput:
       return BlockingReason::kWaitForJoinProbe;
     default:
       VELOX_UNREACHABLE(HashBuild::stateName(state));
@@ -113,6 +114,8 @@ HashBuild::HashBuild(
       keyChannelMap_(joinNode_->rightKeys().size()) {
   VELOX_CHECK(pool()->trackUsage());
   VELOX_CHECK_NOT_NULL(joinBridge_);
+  VELOX_USER_CHECK(!joinNode_->probeFirst() || operatorCtx_->task()->isUngroupedExecution(),
+                   "Probe-first currently requires ungrouped execution");
 
   joinBridge_->addBuilder();
 
@@ -1253,6 +1256,23 @@ void HashBuild::addRuntimeStats() {
 }
 
 BlockingReason HashBuild::isBlocked(ContinueFuture* future) {
+  if (joinNode_->probeFirst() && !probeInputResolved_) {
+    auto empty = joinBridge_->probeInputOrFuture(&future_);
+    if (!empty.has_value()) {
+      if (isRunning()) setState(State::kWaitForProbeInput);
+      *future = std::move(future_);
+      return BlockingReason::kWaitForJoinProbe;
+    }
+    probeInputResolved_ = true;
+    if (state_ == State::kWaitForProbeInput) setRunning();
+    if (*empty) {
+      addRuntimeStat("probeFirstEmptyInput", RuntimeCounter(1));
+      // Reuse normal table publication and peer/spill completion. Driver
+      // closes the upstream pipeline without ever requesting its splits.
+      noMoreInput();
+    }
+  }
+
   switch (state_) {
     case State::kRunning:
       if (isInputFromSpill()) {
@@ -1316,11 +1336,13 @@ void HashBuild::checkStateTransition(State state) {
   switch (state) {
     case State::kRunning:
       if (!canSpill()) {
-        VELOX_CHECK_EQ(state_, State::kWaitForBuild);
+        VELOX_CHECK(state_ == State::kWaitForBuild || state_ == State::kWaitForProbeInput);
       } else {
         VELOX_CHECK_NE(state_, State::kFinish);
       }
       break;
+    case State::kWaitForProbeInput:
+      [[fallthrough]];
     case State::kWaitForBuild:
       [[fallthrough]];
     case State::kWaitForProbe:
@@ -1344,6 +1366,8 @@ std::string HashBuild::stateName(State state) {
       return "WAIT_FOR_BUILD";
     case State::kWaitForProbe:
       return "WAIT_FOR_PROBE";
+    case State::kWaitForProbeInput:
+      return "WAIT_FOR_PROBE_INPUT";
     case State::kFinish:
       return "FINISH";
     default:

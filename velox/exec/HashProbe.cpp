@@ -184,6 +184,11 @@ HashProbe::HashProbe(
       filterResult_(1),
       outputTableRowsCapacity_(outputBatchSize_) {
   VELOX_CHECK_NOT_NULL(joinBridge_);
+  if (joinNode_->probeFirst()) {
+    VELOX_USER_CHECK(operatorCtx_->task()->isUngroupedExecution(),
+                     "Probe-first currently requires ungrouped execution");
+    probeInputParticipant_ = joinBridge_->addProbeInput();
+  }
 }
 
 void HashProbe::initialize() {
@@ -475,7 +480,8 @@ void HashProbe::pushdownDynamicFilters() {
   //  * build side has no dependent columns.
   if (keyChannels_.size() == 1 && !table_->hasDuplicateKeys() &&
       tableOutputProjections_.empty() && !filter_ && numFilters > 0 &&
-      !table_->hashers()[0]->getBloomFilter() && !isRightJoin(joinType_)) {
+      !table_->hashers()[0]->getBloomFilter() && !isRightJoin(joinType_) &&
+      !joinNode_->probeFirst()) {
     canReplaceWithDynamicFilter_ = true;
   }
 }
@@ -698,6 +704,10 @@ void HashProbe::prepareInputIndicesBuffers(
 }
 
 BlockingReason HashProbe::isBlocked(ContinueFuture* future) {
+  // Until a bounded head or true EOF is observed, the probe must not wait on
+  // the build that is itself waiting for this evidence.
+  if (joinNode_->probeFirst() && !probeInputReported_) return BlockingReason::kNotBlocked;
+
   switch (state_) {
     case ProbeOperatorState::kWaitForBuild:
       VELOX_CHECK_NULL(table_);
@@ -722,6 +732,17 @@ BlockingReason HashProbe::isBlocked(ContinueFuture* future) {
     default:
       VELOX_UNREACHABLE(probeOperatorStateName(state_));
       break;
+  }
+
+  if (joinNode_->probeFirst() && isRunning() && table_) {
+    if (prefetchedInput_) {
+      auto head = std::move(prefetchedInput_);
+      if (!noMoreInput_) addInput(std::move(head));
+    }
+    if (probeInputEndedBeforeBuild_) {
+      probeInputEndedBeforeBuild_ = false;
+      noMoreInputInternal();
+    }
   }
 
   if (future_.valid()) {
@@ -750,6 +771,16 @@ void HashProbe::decodeAndDetectNonNullKeys() {
 }
 
 void HashProbe::addInput(RowVectorPtr input) {
+  if (joinNode_->probeFirst() && !probeInputReported_) {
+    if (input->size() == 0) return;
+    VELOX_CHECK_LE(input->retainedSize(), joinNode_->probeFirstMaxBytes(),
+                   "Probe head exceeds its authorized input-retention bound");
+    prefetchedInput_ = std::move(input);
+    probeInputReported_ = true;
+    joinBridge_->reportProbeInput(probeInputParticipant_, true);
+    return;
+  }
+
   if (skipInput_) {
     VELOX_CHECK_NULL(input_);
     return;
@@ -1156,6 +1187,7 @@ void HashProbe::checkStateTransition(ProbeOperatorState state) {
 }
 
 RowVectorPtr HashProbe::getOutput() {
+  if (joinNode_->probeFirst() && !probeInputReported_) return nullptr;
   // Release the extra unused memory reserved for output processing.
   SCOPE_EXIT {
     pool()->release();
@@ -2062,6 +2094,14 @@ void HashProbe::ensureLoaded(column_index_t channel) {
 }
 
 void HashProbe::noMoreInput() {
+  if (joinNode_->probeFirst() && !probeInputReported_) {
+    Operator::noMoreInput();
+    probeInputReported_ = true;
+    probeInputEndedBeforeBuild_ = true;
+    joinBridge_->reportProbeInput(probeInputParticipant_, false);
+    return;
+  }
+  probeInputEndedBeforeBuild_ = false;
   Operator::noMoreInput();
   noMoreInputInternal();
 }
@@ -2582,6 +2622,7 @@ void HashProbe::checkMaxSpillLevel(
 }
 
 void HashProbe::close() {
+  prefetchedInput_.reset();
   Operator::close();
 
   // Free up major memory usage.

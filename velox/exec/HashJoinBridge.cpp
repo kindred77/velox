@@ -69,6 +69,44 @@ void HashJoinBridge::addBuilder() {
   ++numBuilders_;
 }
 
+uint32_t HashJoinBridge::addProbeInput() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  VELOX_CHECK(!started_);
+  const auto id = static_cast<uint32_t>(probeInputs_.size());
+  probeInputs_.push_back(ProbeInputState::kUnknown);
+  return id;
+}
+
+void HashJoinBridge::reportProbeInput(uint32_t participant, bool hasRows) {
+  std::vector<ContinuePromise> promises;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    VELOX_CHECK(started_);
+    VELOX_CHECK(!cancelled_, "Reporting probe input after join is aborted");
+    VELOX_CHECK_LT(participant, probeInputs_.size());
+    VELOX_CHECK(probeInputs_[participant] == ProbeInputState::kUnknown);
+    probeInputs_[participant] = hasRows ? ProbeInputState::kNonEmpty : ProbeInputState::kEmpty;
+    if (!hasRows) ++emptyProbeInputs_;
+    if (!probeInputReady_ && (hasRows || emptyProbeInputs_ == probeInputs_.size())) {
+      probeInputReady_ = true;
+      probeInputEmpty_ = !hasRows;
+      promises.swap(promises_);
+    }
+  }
+  notify(std::move(promises));
+}
+
+std::optional<bool> HashJoinBridge::probeInputOrFuture(ContinueFuture* future) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  VELOX_CHECK(started_);
+  VELOX_CHECK(!cancelled_, "Waiting for probe input after join is aborted");
+  VELOX_CHECK(!probeInputs_.empty());
+  if (probeInputReady_) return probeInputEmpty_;
+  promises_.emplace_back("HashJoinBridge::probeInputOrFuture");
+  *future = promises_.back().getSemiFuture();
+  return std::nullopt;
+}
+
 void HashJoinBridge::reclaim() {
   std::lock_guard<std::mutex> l(mutex_);
   VELOX_CHECK(tableSpillFunc_ == nullptr || !probeStarted_);

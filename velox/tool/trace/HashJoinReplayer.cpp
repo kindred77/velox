@@ -28,21 +28,23 @@ core::PlanNodePtr HashJoinReplayer::createPlanNode(
     const core::PlanNodeId& nodeId,
     const core::PlanNodePtr& source) const {
   const auto* hashJoinNode = dynamic_cast<const core::HashJoinNode*>(node);
-  return std::make_shared<core::HashJoinNode>(
-      nodeId,
-      hashJoinNode->joinType(),
-      hashJoinNode->isNullAware(),
-      hashJoinNode->leftKeys(),
-      hashJoinNode->rightKeys(),
-      hashJoinNode->filter(),
-      source,
-      PlanBuilder(planNodeIdGenerator_)
+  VELOX_CHECK_NOT_NULL(hashJoinNode);
+  // SQL semantics follow the captured node. TraceScan is a different input
+  // producer: its batches do not inherit the original peek bound, and replay
+  // must perform the build rather than reuse an unrelated runtime cache.
+  return core::HashJoinNode::Builder(*hashJoinNode)
+      .id(nodeId)
+      .left(source)
+      .right(PlanBuilder(planNodeIdGenerator_)
           .traceScan(
               nodeTraceDir_,
-              pipelineIds_.at(1), // Build side
+              pipelineIds_.at(1),
               driverIds_,
               exec::trace::getDataType(planFragment_, nodeId_, 1))
-          .planNode(),
-      hashJoinNode->outputType());
+          .planNode())
+      .useHashTableCache(false)
+      .cacheKey(std::nullopt)
+      .probeFirst(0)
+      .build();
 }
 } // namespace facebook::velox::tool::trace

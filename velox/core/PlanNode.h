@@ -3441,7 +3441,9 @@ class HashJoinNode : public AbstractJoinNode {
       bool useHashTableCache = false,
       bool nullAsValue = false,
       std::optional<std::string> cacheKey = std::nullopt,
-      TypedExprPtr postJoinFilter = nullptr)
+      TypedExprPtr postJoinFilter = nullptr,
+      bool probeFirst = false,
+      uint64_t probeFirstMaxBytes = 0)
       : AbstractJoinNode(
             id,
             joinType,
@@ -3455,8 +3457,20 @@ class HashJoinNode : public AbstractJoinNode {
         nullAsValue_{nullAsValue},
         useHashTableCache_{useHashTableCache},
         cacheKey_{std::move(cacheKey)},
-        postJoinFilter_{std::move(postJoinFilter)} {
+        postJoinFilter_{std::move(postJoinFilter)},
+        probeFirst_{probeFirst},
+        probeFirstMaxBytes_{probeFirstMaxBytes} {
     validate();
+    VELOX_USER_CHECK(
+        !probeFirst_ ||
+            ((isInnerJoin() || isLeftSemiFilterJoin() || isRightSemiFilterJoin()) &&
+             !nullAware_ && !useHashTableCache_),
+        "Probe-first requires an empty-probe-preserving, uncached hash join");
+    VELOX_USER_CHECK(
+        (probeFirst_ && probeFirstMaxBytes_ > 0 &&
+         probeFirstMaxBytes_ <= std::numeric_limits<int64_t>::max()) ||
+            (!probeFirst_ && probeFirstMaxBytes_ == 0),
+        "Probe-first requires a positive bounded input-retention contract");
 
     VELOX_USER_CHECK(
         !nullAware || !nullAsValue,
@@ -3500,6 +3514,8 @@ class HashJoinNode : public AbstractJoinNode {
       useHashTableCache_ = other.useHashTableCache();
       cacheKey_ = other.cacheKey();
       postJoinFilter_ = other.postJoinFilter();
+      probeFirst_ = other.probeFirst();
+      probeFirstMaxBytes_ = other.probeFirstMaxBytes();
     }
 
     Builder& nullAware(bool value) {
@@ -3524,6 +3540,14 @@ class HashJoinNode : public AbstractJoinNode {
 
     Builder& postJoinFilter(TypedExprPtr value) {
       postJoinFilter_ = std::move(value);
+      return *this;
+    }
+
+    // A zero bound selects the ordinary build-first strategy. Keep the mode
+    // and its required resource contract canonical at the shared copy API.
+    Builder& probeFirst(uint64_t maxBytes) {
+      probeFirst_ = maxBytes != 0;
+      probeFirstMaxBytes_ = maxBytes;
       return *this;
     }
 
@@ -3557,7 +3581,9 @@ class HashJoinNode : public AbstractJoinNode {
           useHashTableCache_.value_or(false),
           nullAsValue_.value_or(false),
           cacheKey_,
-          postJoinFilter_.value_or(nullptr));
+          postJoinFilter_.value_or(nullptr),
+          probeFirst_.value_or(false),
+          probeFirstMaxBytes_.value_or(0));
     }
 
    private:
@@ -3566,6 +3592,8 @@ class HashJoinNode : public AbstractJoinNode {
     std::optional<bool> useHashTableCache_;
     std::optional<std::string> cacheKey_;
     std::optional<TypedExprPtr> postJoinFilter_;
+    std::optional<bool> probeFirst_;
+    std::optional<uint64_t> probeFirstMaxBytes_;
   };
 
   std::string_view name() const override {
@@ -3618,6 +3646,11 @@ class HashJoinNode : public AbstractJoinNode {
     return postJoinFilter_;
   }
 
+  // Explicit planner authorization: observe a bounded probe head before
+  // consuming build input. The input producer must guarantee this bound.
+  bool probeFirst() const { return probeFirst_; }
+  uint64_t probeFirstMaxBytes() const { return probeFirstMaxBytes_; }
+
   folly::dynamic serialize() const override;
 
   static PlanNodePtr create(const folly::dynamic& obj, void* context);
@@ -3630,6 +3663,8 @@ class HashJoinNode : public AbstractJoinNode {
   const bool useHashTableCache_;
   const std::optional<std::string> cacheKey_;
   const TypedExprPtr postJoinFilter_;
+  const bool probeFirst_;
+  const uint64_t probeFirstMaxBytes_;
 };
 
 using HashJoinNodePtr = std::shared_ptr<const HashJoinNode>;

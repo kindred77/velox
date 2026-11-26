@@ -54,6 +54,8 @@ class HashBuild final : public Operator {
     kWaitForProbe = 4,
     /// The finishing state.
     kFinish = 5,
+    /// Initial planner-authorized wait, separate from spill restoration.
+    kWaitForProbeInput = 6,
   };
   static std::string stateName(State state);
 
@@ -305,6 +307,7 @@ class HashBuild final : public Operator {
   tsan_atomic<bool> exceededMaxSpillLevelLimit_{false};
 
   State state_{State::kRunning};
+  bool probeInputResolved_{false};
 
   // For hash table caching: the resolved cache key from HashJoinNode.
   // If set, this operator coordinates via HashTableCache.

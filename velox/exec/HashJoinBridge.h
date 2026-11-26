@@ -48,6 +48,15 @@ class HashJoinBridge : public JoinBridge {
   /// HashBuild operators to parallelize the restoring operation.
   void addBuilder();
 
+  // Register the fixed initial probe participants before start. Each reports
+  // exactly one nonempty head or complete EOF; absent splits are not EOF.
+  uint32_t addProbeInput();
+  void reportProbeInput(uint32_t participant, bool hasRows);
+  // nullopt means wait; true means every probe input is empty. Uses the
+  // existing bridge promise/cancellation lifecycle shared with table waiters.
+  std::optional<bool> probeInputOrFuture(ContinueFuture* future);
+
+
   void reclaim();
 
   /// Invoked by the build operator to set the built hash table.
@@ -160,6 +169,11 @@ class HashJoinBridge : public JoinBridge {
       SpillPartitionSet&& spillPartitionSet);
 
   uint32_t numBuilders_{0};
+  enum class ProbeInputState : uint8_t { kUnknown, kNonEmpty, kEmpty };
+  std::vector<ProbeInputState> probeInputs_;
+  uint32_t emptyProbeInputs_{0};
+  bool probeInputReady_{false};
+  bool probeInputEmpty_{false};
 
   // The result of the build side. It is set by the last build operator when
   // build is done.

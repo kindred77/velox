@@ -268,18 +268,11 @@ core::PlanNodePtr getTraceNode(
   VELOX_CHECK_NOT_NULL(traceNode, "Failed to find node with id {}", nodeId);
   if (const auto* hashJoinNode =
           dynamic_cast<const core::HashJoinNode*>(traceNode)) {
-    return std::make_shared<core::HashJoinNode>(
-        nodeId,
-        hashJoinNode->joinType(),
-        hashJoinNode->isNullAware(),
-        hashJoinNode->leftKeys(),
-        hashJoinNode->rightKeys(),
-        hashJoinNode->filter(),
-        std::make_shared<DummySourceNode>(
-            hashJoinNode->sources()[0]->outputType()),
-        std::make_shared<DummySourceNode>(
-            hashJoinNode->sources()[1]->outputType()),
-        hashJoinNode->outputType());
+    return core::HashJoinNode::Builder(*hashJoinNode)
+        .id(nodeId)
+        .left(std::make_shared<DummySourceNode>(hashJoinNode->sources()[0]->outputType()))
+        .right(std::make_shared<DummySourceNode>(hashJoinNode->sources()[1]->outputType()))
+        .build();
   }
 
   if (const auto* mergeJoinNode =

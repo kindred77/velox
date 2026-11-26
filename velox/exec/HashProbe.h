@@ -47,14 +47,13 @@ class HashProbe : public Operator {
         noMoreSpillInput_ || input_ != nullptr) {
       return false;
     }
+    if (joinNode_->probeFirst() && !probeInputReported_) return true;
     if (table_) {
       return true;
     }
-    // NOTE: if we can't apply dynamic filtering, then we can start early to
-    // read input even before the hash table has been built.
-    return operatorCtx_->driverCtx()
-        ->driver->canPushdownFilters(this, keyChannels_)
-        .empty();
+    // The ordinary strategy waits in isBlocked() until its table is ready.
+    // Only explicit probe-first authorization above can accept an early head.
+    return false;
   }
 
   void addInput(RowVectorPtr input) override;
@@ -438,6 +437,10 @@ class HashProbe : public Operator {
   std::shared_ptr<HashJoinBridge> joinBridge_;
 
   ProbeOperatorState state_{ProbeOperatorState::kWaitForBuild};
+  uint32_t probeInputParticipant_{0};
+  bool probeInputReported_{false};
+  bool probeInputEndedBeforeBuild_{false};
+  RowVectorPtr prefetchedInput_;
 
   // Used for synchronization with the hash probe operators of the same pipeline
   // to handle the last probe processing for certain types of join and notify
