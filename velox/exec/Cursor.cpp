@@ -158,7 +158,10 @@ RowVectorPtr TaskQueue::dequeue(velox::ContinueFuture* future) {
       queue_.pop_front();
       totalBytes_ -= result.bytes;
       vector = std::move(result.vector);
-      if (totalBytes_ < maxBytes_ / 2) {
+      // Empty queues must always release producer credit. For a zero- or
+      // one-byte bound, integer division rounds the low watermark to zero;
+      // a strict comparison alone would strand producers after draining.
+      if (totalBytes_ == 0 || totalBytes_ < maxBytes_ / 2) {
         mayContinue = std::move(producerUnblockPromises_);
       }
     } else if (
