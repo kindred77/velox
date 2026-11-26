@@ -689,6 +689,51 @@ TEST_F(MemoryPoolAdmissionTest, selectionRefusalPreservesSelectionAndRealCharge)
   EXPECT_EQ(shared->currentResourceUsage(), 0);
 }
 
+TEST_F(MemoryPoolAdmissionTest, selectionMoveRefusalKeepsDestinationChargeAndSource) {
+  auto shared = budget(4096);
+  auto work = root_->addLeafChild("selection-move-refusal");
+  work->setAllocationBudget(shared);
+  {
+    SelectivityVector rows(65, true, work.get());
+    rows.setValid(32, false); rows.updateBounds();
+    const auto charged = work->usedBytes();
+    SelectivityVector large(1 << 20);
+    EXPECT_THROW(rows = std::move(large), std::exception);
+    // Test charge first: the old implementation empties the bits and leaves
+    // stale scalar bounds, so reading destination bits would itself crash.
+    EXPECT_EQ(work->usedBytes(), charged);
+    EXPECT_EQ(shared->currentResourceUsage(), charged);
+    EXPECT_EQ(large.size(), 1 << 20);
+    EXPECT_EQ(large.countSelected(), 1 << 20);
+    if (work->usedBytes() == charged) {
+      EXPECT_EQ(rows.size(), 65);
+      EXPECT_EQ(rows.countSelected(), 64);
+      EXPECT_FALSE(rows.isValid(32));
+    }
+  }
+  EXPECT_EQ(shared->currentResourceUsage(), 0);
+}
+
+TEST_F(MemoryPoolAdmissionTest, selectionMoveCommitsValuesAndValidEmptySource) {
+  auto shared = budget(4096);
+  auto work = root_->addLeafChild("selection-move-success");
+  work->setAllocationBudget(shared);
+  {
+    SelectivityVector source(65);
+    source.setValid(32, false); source.updateBounds();
+    SelectivityVector target(1, true, work.get());
+    target = std::move(source);
+    EXPECT_EQ(target.size(), 65); EXPECT_EQ(target.countSelected(), 64);
+    EXPECT_FALSE(target.isValid(32));
+    EXPECT_EQ(source.size(), 0); EXPECT_EQ(source.countSelected(), 0);
+    SelectivityVector moved(std::move(target));
+    EXPECT_EQ(moved.countSelected(), 64);
+    EXPECT_EQ(target.size(), 0); EXPECT_EQ(target.countSelected(), 0);
+    EXPECT_EQ(shared->currentResourceUsage(), work->usedBytes());
+  }
+  EXPECT_EQ(shared->currentResourceUsage(), 0);
+}
+
 TEST_F(MemoryPoolAdmissionTest, selectionValueCopyOutlivesSourcePool) {
   std::optional<SelectivityVector> copy;
   auto owner = root_->addLeafChild("selection-copy-source");
@@ -1014,6 +1059,48 @@ TEST_F(MemoryPoolAdmissionTest, reversiblePreparationRefinesOnlyItsOwnCredit) {
     EXPECT_EQ(preparation.grantedBytes(), required);
   }));
   EXPECT_EQ(shared->currentResourceUsage(), 192);
+}
+
+TEST_F(MemoryPoolAdmissionTest, preparationLimitBoundsAndRestoresNestedCredit) {
+  auto pool = root_->addLeafChild("bounded-preparation");
+  auto shared = budget(4096);
+  pool->setAllocationBudget(shared);
+  ASSERT_TRUE(pool->tryWithAllocationCredit(0, [&] {
+    AllocationPreparationScope outer(pool.get(), 256);
+    void* first = nullptr;
+    auto freeFirst = folly::makeGuard([&] { if (first) pool->free(first, 64); });
+    {
+      AllocationPreparationScope inner(pool.get(), 64);
+      first = pool->allocate(64);
+      const auto allocations = pool->stats().cumulativeBytes;
+      try {
+        (void)pool->allocate(128);
+        FAIL() << "the complete demand must exceed the operation cap";
+      } catch (const AllocationPreparationDemand& demand) {
+        EXPECT_EQ(demand.requiredBytes(), 192);
+        EXPECT_EQ(demand.pool(), pool.get());
+      }
+      EXPECT_EQ(pool->stats().cumulativeBytes, allocations);
+      EXPECT_EQ(pool->usedBytes(), 64);
+    }
+    auto* second = pool->allocate(128); // restored outer limit
+    pool->free(second, 128);
+  }));
+  EXPECT_EQ(pool->usedBytes(), 0);
+  EXPECT_EQ(shared->currentResourceUsage(), 0);
+  ASSERT_TRUE(pool->tryWithAllocationCredit(0, [&] {
+    AllocationPreparationScope outer(pool.get(), 128);
+    AllocationPreparationScope inner(pool.get(), 1024);
+    const auto allocations = pool->stats().cumulativeBytes;
+    EXPECT_THROW((void)pool->allocate(256), AllocationPreparationDemand);
+    EXPECT_EQ(pool->stats().cumulativeBytes, allocations);
+  }));
+  ASSERT_TRUE(pool->tryWithAllocationCredit(256, [&] {
+    EXPECT_THROW(AllocationPreparationScope(pool.get(), 64), AllocationPreparationDemand);
+    auto* value = pool->allocate(64); // failed construction preserves the old scope
+    pool->free(value, 64);
+  }));
+  EXPECT_EQ(shared->currentResourceUsage(), 0);
 }
 
 TEST_F(MemoryPoolAdmissionTest, reservedRowsAreNotLiveAndNeedNoUpdateCredit) {

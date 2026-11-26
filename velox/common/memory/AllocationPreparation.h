@@ -17,6 +17,7 @@
 
 #include <cstdint>
 #include <exception>
+#include <limits>
 
 namespace facebook::velox::memory {
 class MemoryPool;
@@ -25,14 +26,16 @@ class MemoryPool;
 /// This is not an allocator failure and must never authorize replay of updates.
 class AllocationPreparationDemand final : public std::exception {
  public:
-  explicit AllocationPreparationDemand(uint64_t required)
-      : required_(required) {}
+  explicit AllocationPreparationDemand(uint64_t required, const MemoryPool* pool = nullptr)
+      : required_(required), pool_(pool) {}
   uint64_t requiredBytes() const { return required_; }
+  const MemoryPool* pool() const { return pool_; }
   const char* what() const noexcept override {
     return "Reversible allocation preparation needs additional credit";
   }
  private:
   uint64_t required_;
+  const MemoryPool* pool_;
 };
 
 /// Refines the existing credit scope; creates neither a budget nor a ledger.
@@ -43,7 +46,10 @@ class AllocationPreparationDemand final : public std::exception {
 /// A nested, ordinary credit scope remains strict.
 class AllocationPreparationScope {
  public:
-  explicit AllocationPreparationScope(MemoryPool* pool);
+  // Bounds this scope's total granted credit, including any initial grant.
+  // Refusal unwinds discardable work before allocating the denied block.
+  explicit AllocationPreparationScope(MemoryPool* pool,
+      uint64_t maxBytes = std::numeric_limits<uint64_t>::max());
   ~AllocationPreparationScope();
   uint64_t grantedBytes() const;
   AllocationPreparationScope(const AllocationPreparationScope&) = delete;
@@ -51,5 +57,6 @@ class AllocationPreparationScope {
  private:
   void* credit_;
   bool previous_;
+  uint64_t previousLimit_;
 };
 } // namespace facebook::velox::memory

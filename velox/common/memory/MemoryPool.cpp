@@ -170,6 +170,7 @@ struct AllocationCreditScope {
   uint64_t granted;
   AllocationCreditScope* previous;
   bool preparing{false};
+  uint64_t preparationLimit{std::numeric_limits<uint64_t>::max()};
 
   AllocationCreditScope(MemoryPool* owner,
       std::shared_ptr<common::AdmissionController> admission, uint64_t bytes)
@@ -210,8 +211,8 @@ class AllocationBudgetCharge {
       if (bytes_ > credit->remaining && credit->preparing) {
         const auto additional = bytes_ - credit->remaining;
         const auto required = checkedPlus(credit->granted, additional);
-        if (!budget_->tryAccept(additional)) {
-          throw AllocationPreparationDemand(required);
+        if (required > credit->preparationLimit || !budget_->tryAccept(additional)) {
+          throw AllocationPreparationDemand(required, pool_);
         }
         credit->remaining += additional;
         credit->granted = required;
@@ -281,16 +282,22 @@ std::string capacityToString(int64_t capacity) {
   }
 } // namespace
 
-AllocationPreparationScope::AllocationPreparationScope(MemoryPool* pool) {
+AllocationPreparationScope::AllocationPreparationScope(MemoryPool* pool, uint64_t maxBytes) {
   auto* credit = allocationCreditFor(pool);
   VELOX_CHECK_NOT_NULL(credit, "Preparation requires an existing allocation credit scope");
+  const auto limit = std::min(credit->preparationLimit, maxBytes);
+  if (credit->granted > limit) throw AllocationPreparationDemand(credit->granted, pool);
   credit_ = credit;
   previous_ = credit->preparing;
+  previousLimit_ = credit->preparationLimit;
   credit->preparing = true;
+  credit->preparationLimit = limit;
 }
 
 AllocationPreparationScope::~AllocationPreparationScope() {
-  static_cast<AllocationCreditScope*>(credit_)->preparing = previous_;
+  auto* credit = static_cast<AllocationCreditScope*>(credit_);
+  credit->preparing = previous_;
+  credit->preparationLimit = previousLimit_;
 }
 
 uint64_t AllocationPreparationScope::grantedBytes() const {

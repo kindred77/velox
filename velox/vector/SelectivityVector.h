@@ -56,9 +56,45 @@ class SelectivityVector {
   /// Value copies are independent of the source pool's lifetime. Assignment
   /// keeps the destination resource, including assignment from empty().
   SelectivityVector(const SelectivityVector& other) { *this = other; }
-  SelectivityVector& operator=(const SelectivityVector&) = default;
-  SelectivityVector(SelectivityVector&&) = default;
-  SelectivityVector& operator=(SelectivityVector&&) = default;
+  SelectivityVector& operator=(const SelectivityVector& other) {
+    if (this != &other) {
+      // vector copy assignment may discard old storage before an allocation
+      // throws. Reserve first so refusal preserves bits and scalar bounds.
+      bits_.reserve(other.bits_.size());
+      bits_ = other.bits_;
+      size_ = other.size_;
+      begin_ = other.begin_;
+      end_ = other.end_;
+      allSelected_ = other.allSelected_;
+    }
+    return *this;
+  }
+  SelectivityVector(SelectivityVector&& other) noexcept
+      : bits_(std::move(other.bits_)), size_(other.size_), begin_(other.begin_),
+        end_(other.end_), allSelected_(other.allSelected_) {
+    other.size_ = other.begin_ = other.end_ = 0;
+    other.allSelected_ = false;
+  }
+  SelectivityVector& operator=(SelectivityVector&& other) {
+    if (this != &other) {
+      if (bits_.get_allocator() == other.bits_.get_allocator()) {
+        bits_ = std::move(other.bits_);
+      } else {
+        // Unequal resources cannot steal storage. Keep both operands intact
+        // until destination admission succeeds, then commit the value move.
+        bits_.reserve(other.bits_.size());
+        bits_.assign(other.bits_.begin(), other.bits_.end());
+        other.bits_.clear();
+      }
+      size_ = other.size_;
+      begin_ = other.begin_;
+      end_ = other.end_;
+      allSelected_ = other.allSelected_;
+      other.size_ = other.begin_ = other.end_ = 0;
+      other.allSelected_ = false;
+    }
+    return *this;
+  }
 
   // Returns a statically allocated reference to an empty selectivity vector
   // (size zero).
