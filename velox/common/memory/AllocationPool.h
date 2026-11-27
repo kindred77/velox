@@ -18,9 +18,9 @@
 #include "velox/common/memory/Memory.h"
 
 namespace facebook::velox::memory {
-/// A set of Allocations holding the fixed width payload ows. The Runs are
-/// filled to the end except for the last one. This is used for iterating over
-/// the payload for rehashing, returning results etc. This is used via
+/// A set of Allocations holding fixed width payload rows. Each range exposes
+/// only its used prefix, including when a run is explicitly replaced. This is
+/// used for iterating over the payload for rehashing, returning results etc. This is used via
 /// HashStringAllocator for variable length allocation for backing ByteStreams
 /// for complex objects. In that case, there is a current run that is appended
 /// to and when this is exhausted a new run is started.
@@ -53,13 +53,12 @@ class AllocationPool {
   void newRun(int64_t preferredSize);
 
   int32_t numRanges() const {
-    return allocations_.size() + largeAllocations_.size();
+    return ranges_.size();
   }
 
-  /// Returns the indexth contiguous range. If the range is a large allocation,
-  /// returns the hugepage aligned range of contiguous huge pages in the range.
-  /// For the last range, i.e. the one allocations come from, the size is the
-  /// distance from start to first byte after last allocation.
+  /// Returns the indexth used contiguous range in allocation order. Large
+  /// ranges start at a huge-page boundary. Sizes exclude unused backing and
+  /// uncommitted address space, for both current and completed runs.
   folly::Range<char*> rangeAt(int32_t index) const;
 
   int64_t currentOffset() const {
@@ -75,7 +74,7 @@ class AllocationPool {
     if (largeAllocations_.empty()) {
       return freeAddressableBytes();
     }
-    return largeAllocations_.back().size() - currentOffset_;
+    return endOfReservedRun() - currentOffset_;
   }
 
   // Returns pointer to first unallocated byte in the current run.
@@ -120,15 +119,18 @@ class AllocationPool {
   static constexpr int64_t kDefaultHugePageThreshold = 256 * 1024;
   static constexpr int64_t kMaxMmapBytes = 512 << 20; // 512 MB
 
-  // Returns the offset from 'startOfRun_' after which the last large
-  // allocation must be grown. There are mapped addresses all the way
-  // to 'bytesInRun_' ut they are not marked used by the
-  // pool/allocator. So use growContiguous() to update this.
-  int64_t endOfReservedRun() {
+  // Committed/admitted frontier relative to the current run's aligned start.
+  // A large mapping can skip a prefix before its first huge-page boundary.
+  int64_t endOfReservedRun() const {
     if (largeAllocations_.empty()) {
       return bytesInRun_;
     }
-    return largeAllocations_.back().size();
+    const auto& allocation = largeAllocations_.back();
+    if (startOfRun_ != allocation.hugePageRange()->data()) {
+      // A high threshold can switch back to a small run after a large one.
+      return bytesInRun_;
+    }
+    return allocation.size() - (startOfRun_ - allocation.data<char>());
   }
 
   // Returns the number of bytes between first unallocated and the end of the
@@ -148,6 +150,10 @@ class AllocationPool {
   memory::MemoryPool* pool_;
   std::vector<memory::Allocation> allocations_;
   std::vector<memory::ContiguousAllocation> largeAllocations_;
+
+  // Non-owning used prefixes in allocation order. The current range length is
+  // read from currentOffset_; freeze it only when starting the next run.
+  std::vector<folly::Range<char*>> ranges_;
 
   // Points to the start of the run from which allocations are being made.
   char* startOfRun_{nullptr};

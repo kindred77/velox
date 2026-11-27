@@ -283,11 +283,12 @@ void HashStringAllocator::newSlab() {
       : kUnitSize;
   auto* run = state_.pool().allocateFixed(needed);
   VELOX_CHECK_NOT_NULL(run);
-  // We check we got exactly the requested amount. checkConsistency() depends on
-  // slabs made here coinciding with ranges from AllocationPool::rangeAt().
-  // Sometimes the last range can be several huge pages for severl huge page
-  // sized arenas but checkConsistency() can interpret that.
-  VELOX_CHECK_EQ(state_.pool().freeBytes(), 0);
+  // checkConsistency() walks complete slabs in each used range. Backing can
+  // have alignment/commit rounding slack, so validate the used extent rather
+  // than requiring the admitted backing to be exhausted (yihudb).
+  const auto range = state_.pool().rangeAt(state_.pool().numRanges() - 1);
+  VELOX_CHECK_EQ(range.end(), run + needed);
+  VELOX_CHECK_EQ(range.size() % needed, 0);
   const auto available = needed - kHeaderSize - kSimdPadding;
   VELOX_CHECK_GT(available, 0);
 

@@ -15,6 +15,8 @@
  */
 
 #include "velox/common/memory/MallocAllocator.h"
+#include <cstdlib>
+#include "velox/common/memory/PageMapping.h"
 #include <folly/system/HardwareConcurrency.h>
 #include "velox/common/base/windows/FollyConcurrencyCompat.h"
 #include "velox/common/memory/Memory.h"
@@ -27,6 +29,18 @@
 #endif
 
 namespace facebook::velox::memory {
+namespace {
+// Keep virtual expansion capacity separate from committed, admitted pages.
+// Explicit zero restores the historical full-range mmap for diagnosis.
+bool lazyCommitEnabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("YIHUDB_MALLOC_LAZY_COMMIT");
+    return value == nullptr || std::atoi(value) != 0;
+  }();
+  return enabled;
+}
+} // namespace
+
 MallocAllocator::MallocAllocator(const Options& options)
     : kind_(MemoryAllocator::Kind::kMalloc),
       mallocContiguousEnabled_(options.mallocContiguousEnabled),
@@ -188,6 +202,13 @@ bool MallocAllocator::allocateContiguousImpl(
   numExternalMapped_.fetch_add(numPages);
   const auto maxBytes = AllocationTraits::pageBytes(maxPages);
   void* data = dispatchAllocateContiguous(maxBytes);
+  if (data != nullptr && !mallocContiguousEnabled_ && lazyCommitEnabled() &&
+      !PageMapping::commit(data, totalBytes)) {
+    if (!PageMapping::release(data, maxBytes)) {
+      VELOX_MEM_LOG(ERROR) << "Failed to release contiguous reservation after commit failure";
+    }
+    data = nullptr;
+  }
   if (FOLLY_UNLIKELY(data == nullptr)) {
     numAllocated_.fetch_sub(numPages);
     numMapped_.fetch_sub(numPages);
@@ -258,14 +279,17 @@ void* MallocAllocator::dispatchAllocateContiguous(size_t maxBytes) {
     return ::aligned_alloc(AllocationTraits::kPageSize, maxBytes);
 #endif
   }
-  // TODO: add handling of MAP_FAILED.
-  return ::mmap(
+  if (lazyCommitEnabled()) {
+    return PageMapping::reserve(maxBytes);
+  }
+  void* data = ::mmap(
       nullptr,
       maxBytes,
       PROT_READ | PROT_WRITE,
       MAP_PRIVATE | MAP_ANONYMOUS,
       -1,
       0);
+  return data == MAP_FAILED ? nullptr : data;
 }
 
 void MallocAllocator::dispatchFreeContiguous(ContiguousAllocation& allocation) {
@@ -277,7 +301,10 @@ void MallocAllocator::dispatchFreeContiguous(ContiguousAllocation& allocation) {
 #endif
   } else {
     useHugePages(allocation, false);
-    if (::munmap(allocation.data(), allocation.maxSize()) < 0) {
+    const bool released = lazyCommitEnabled()
+        ? PageMapping::release(allocation.data(), allocation.maxSize())
+        : ::munmap(allocation.data(), allocation.maxSize()) == 0;
+    if (!released) {
       VELOX_MEM_LOG(ERROR) << "Error for munmap(" << allocation.data() << ", "
                            << succinctBytes(allocation.size()) << "): '"
                            << folly::errnoStr(errno) << "'";
@@ -298,6 +325,17 @@ bool MallocAllocator::growContiguousWithoutRetry(
     setAllocatorFailureMessage(errorMsg);
     VELOX_MEM_LOG_EVERY_MS(WARNING, 1000) << errorMsg;
     return false;
+  }
+  if (increment != 0 && !mallocContiguousEnabled_ && lazyCommitEnabled()) {
+    auto* next = allocation.data<uint8_t>() + allocation.size();
+    const auto bytes = AllocationTraits::pageBytes(increment);
+    if (testingHasInjectedFailure(InjectedFailure::kAllocate) ||
+        !PageMapping::commit(next, bytes)) {
+      decrementUsage(bytes);
+      setAllocatorFailureMessage(fmt::format(
+          "Failed to commit {} additional contiguous bytes", bytes));
+      return false;
+    }
   }
   numAllocated_ += increment;
   numMapped_ += increment;

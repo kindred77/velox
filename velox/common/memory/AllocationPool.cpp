@@ -15,6 +15,7 @@
  */
 
 #include "velox/common/memory/AllocationPool.h"
+#include <folly/ScopeGuard.h>
 #include "velox/common/base/BitUtil.h"
 #include "velox/common/base/CheckedArithmetic.h"
 #if defined(_MSC_VER)
@@ -31,24 +32,17 @@ constexpr int64_t kMinimumLargeMapBytes = 16 * AllocationTraits::kHugePageSize;
 
 
 folly::Range<char*> AllocationPool::rangeAt(int32_t index) const {
-  if (index < allocations_.size()) {
-    auto run = allocations_[index].runAt(0);
-    return folly::Range<char*>(
-        run.data<char>(),
-        run.data<char>() == startOfRun_ ? currentOffset_ : run.numBytes());
-  }
-  const auto largeIndex = index - allocations_.size();
-  if (largeIndex < largeAllocations_.size()) {
-    auto range = largeAllocations_[largeIndex].hugePageRange().value();
-    if (range.data() == startOfRun_) {
-      return folly::Range<char*>(range.data(), currentOffset_);
-    }
-    return range;
+  if (index >= 0 && index < ranges_.size()) {
+    const auto range = ranges_[index];
+    return index == ranges_.size() - 1
+        ? folly::Range<char*>(range.data(), currentOffset_)
+        : range;
   }
   VELOX_FAIL("Out of range index for rangeAt(): {}", index);
 }
 
 void AllocationPool::clear() {
+  ranges_.clear();
   allocations_.clear();
   largeAllocations_.clear();
   startOfRun_ = nullptr;
@@ -120,13 +114,14 @@ uint64_t AllocationPool::fixedAllocationBytesUpperBound(
 
   const uint64_t payload = checkedMultiply(count, stride);
   // Every fresh large map has at least this many addressable bytes after
-  // worst-case alignment at both ends. Each used run rounds backing by < huge;
-  // an existing partially filled large run can contribute one extra rounding.
+  // alignment at both ends. Backing can include a skipped aligned prefix and
+  // a final growth rounding, each smaller than one huge page. An existing
+  // partially filled large run can contribute another such allowance.
   constexpr uint64_t minRange = kMinimumLargeMapBytes - 2 * huge;
   const uint64_t entriesPerRun = std::max<uint64_t>(1, minRange / stride);
   uint64_t largeRuns = 1 + (count - 1) / entriesPerRun;
   if (!largeAllocations_.empty()) largeRuns = checkedPlus(largeRuns, uint64_t(1));
-  const uint64_t bound = checkedPlus(payload, checkedMultiply(largeRuns, huge));
+  const uint64_t bound = checkedPlus(payload, checkedMultiply(largeRuns, 2 * huge));
   return checkedPlus(smallBytes, bound);
 }
 
@@ -172,6 +167,14 @@ void AllocationPool::maybeGrowLastAllocation(uint64_t bytesRequested) {
 }
 
 void AllocationPool::newRunImpl(MachinePageCount numPages) {
+  // Reserve metadata before acquiring backing. If allocation fails, the old
+  // current run and its cursor remain intact. No per-entry hot-path update is
+  // needed: only a run transition freezes its used extent.
+  if (!ranges_.empty()) {
+    ranges_.back() = folly::Range<char*>(startOfRun_, currentOffset_);
+  }
+  ranges_.emplace_back();
+  auto rollbackRange = folly::makeGuard([&] { ranges_.pop_back(); });
   if (usedBytes_ >= hugePageThreshold_ ||
       numPages > pool_->sizeClasses().back()) {
     // At least 16 huge pages, no more than kMaxMmapBytes. The next is
@@ -203,11 +206,13 @@ void AllocationPool::newRunImpl(MachinePageCount numPages) {
         pagesToAlloc, largeAlloc, AllocationTraits::numPages(nextSize));
 
     auto range = largeAlloc.hugePageRange().value();
+    largeAllocations_.emplace_back(std::move(largeAlloc));
     startOfRun_ = range.data();
     bytesInRun_ = range.size();
-    largeAllocations_.emplace_back(std::move(largeAlloc));
+    ranges_.back() = folly::Range<char*>(startOfRun_, size_t{0});
     currentOffset_ = 0;
     usedBytes_ += AllocationTraits::pageBytes(pagesToAlloc);
+    rollbackRange.dismiss();
     return;
   }
 
@@ -215,11 +220,13 @@ void AllocationPool::newRunImpl(MachinePageCount numPages) {
   auto roundedPages = std::max<int32_t>(kMinPages, numPages);
   pool_->allocateNonContiguous(roundedPages, allocation, roundedPages);
   VELOX_CHECK_EQ(allocation.numRuns(), 1);
-  startOfRun_ = allocation.runAt(0).data<char>();
-  bytesInRun_ = allocation.runAt(0).numBytes();
-  currentOffset_ = 0;
   allocations_.push_back(std::move(allocation));
+  startOfRun_ = allocations_.back().runAt(0).data<char>();
+  bytesInRun_ = allocations_.back().runAt(0).numBytes();
+  ranges_.back() = folly::Range<char*>(startOfRun_, size_t{0});
+  currentOffset_ = 0;
   usedBytes_ += bytesInRun_;
+  rollbackRange.dismiss();
 }
 
 void AllocationPool::newRun(int64_t preferredSize) {
