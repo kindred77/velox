@@ -52,6 +52,16 @@ namespace facebook::velox::exec {
 
 namespace {
 
+// Rebuilding array indices does not require a new block when the physical
+// page count is unchanged. Keep the original allocator path for A/B or rollback.
+bool hashArrayStorageReuseEnabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("GPORCA_HASH_ARRAY_STORAGE_REUSE");
+    return value == nullptr || std::strcmp(value, "0") != 0;
+  }();
+  return enabled;
+}
+
 // Allocation events preserve transient modes that later capacity samples lose.
 // The existing driver-local writer attributes each event to its owning operator.
 void recordHashTableAllocation(
@@ -1975,9 +1985,13 @@ void HashTable<ignoreNullKeys>::setHashMode(
   if (mode == HashMode::kArray) {
     const auto bytes = capacity_ * tableSlotSize();
     const auto numPages = memory::AllocationTraits::numPages(bytes);
-    const auto before = getThreadLocalRunTimeStatWriter() != nullptr
+    const bool reuse = hashArrayStorageReuseEnabled() &&
+        tableAllocation_.numPages() == numPages;
+    const auto before = !reuse && getThreadLocalRunTimeStatWriter() != nullptr
         ? std::make_optional(rows_->pool()->stats()) : std::nullopt;
-    rows_->pool()->allocateContiguous(numPages, tableAllocation_);
+    if (!reuse) {
+      rows_->pool()->allocateContiguous(numPages, tableAllocation_);
+    }
     table_ = tableAllocation_.data<char*>();
     memset(table_, 0, bytes);
     if (before) {
