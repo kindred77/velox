@@ -31,7 +31,9 @@ namespace {
 bool partialArrayBudgetEnabled() {
   static const bool enabled = [] {
     const char* value = std::getenv("YIHUDB_PARTIAL_ARRAY_BUDGET");
-    return value != nullptr && std::atoi(value) != 0;
+    // Apply the existing sparse-array contraction policy before allocating.
+    // Dense arrays retain their ordinary adaptive selection and budget.
+    return value == nullptr || std::atoi(value) != 0;
   }();
   return enabled;
 }
