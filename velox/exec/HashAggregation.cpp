@@ -698,8 +698,19 @@ RowVectorPtr HashAggregation::getOutput() {
     }
 
     const auto& queryConfig = operatorCtx_->driverCtx()->queryConfig();
-    const auto maxOutputRows =
+    auto maxOutputRows =
         isGlobal_ ? 1 : outputBatchRows(estimatedOutputRowSize_);
+    const char* groupBound = std::getenv("YIHUDB_AGG_OUTPUT_GROUP_BOUND");
+    if (!isGlobal_ && !groupingSet_->hasSpilled() &&
+        (groupBound == nullptr || std::strcmp(groupBound, "0") != 0)) {
+      // Resident groups bound this extraction, including partial flushes.
+      // Size output buffers and row-pointer scratch before allocating them;
+      // shrinking vector lengths afterwards retains the original backing.
+      // Spilled runs are not bounded by the current resident table. Global
+      // aggregates and empty grouping-set defaults keep their own paths.
+      maxOutputRows = static_cast<vector_size_t>(std::min<int64_t>(
+          maxOutputRows, std::max<int64_t>(1, groupingSet_->numDistinct())));
+    }
     // Reuse output vectors if possible.
     prepareOutput(maxOutputRows);
 
