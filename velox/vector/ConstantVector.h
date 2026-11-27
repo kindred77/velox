@@ -481,7 +481,7 @@ class ConstantVector final : public SimpleVector<T> {
 
   uint64_t retainedSizeImpl(uint64_t& totalStringBufferSize) const override {
     VELOX_DCHECK(initialized_);
-    const auto ownNulls = BaseVector::retainedSizeImpl();
+    const auto ownNulls = SimpleVector<T>::retainedSizeImpl();
     if (valueVector_) {
       return ownNulls + valueVector_->retainedSize(totalStringBufferSize);
     }
