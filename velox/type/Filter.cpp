@@ -54,6 +54,7 @@ const auto& filterKindNames() {
       {FilterKind::kBytesValues, "BytesValues"},
       {FilterKind::kNegatedBytesValues, "NegatedBytesValues"},
       {FilterKind::kLike, "Like"},
+      {FilterKind::kConjunction, "Conjunction"},
       {FilterKind::kBigintMultiRange, "BigintMultiRange"},
       {FilterKind::kMultiRange, "MultiRange"},
       {FilterKind::kHugeintRange, "HugeintRange"},
@@ -139,6 +140,7 @@ void Filter::registerSerDe() {
   registry.Register("BigintMultiRange", BigintMultiRange::create);
   registry.Register("NegatedBytesValues", NegatedBytesValues::create);
   registry.Register("Like", LikeFilter::create);
+  registry.Register("Conjunction", ConjunctionFilter::create);
   registry.Register("MultiRange", MultiRange::create);
   registry.Register("TimestampRange", TimestampRange::create);
 }
@@ -148,6 +150,295 @@ folly::dynamic Filter::serializeBase() const {
   obj["name"] = kindName();
   obj["nullAllowed"] = nullAllowed_;
   return obj;
+}
+
+std::unique_ptr<Filter> Filter::mergeWith(const Filter* other) const {
+  return ConjunctionFilter::intersect(*this, *other);
+}
+
+void ConjunctionFilter::append(
+    const Filter& filter,
+    std::vector<std::unique_ptr<Filter>>& terms) {
+  VELOX_CHECK(
+      filter.isDeterministic(), "Conjunction requires deterministic terms");
+  if (filter.kind() == FilterKind::kConjunction) {
+    for (const auto& term : filter.as<ConjunctionFilter>()->filters_) {
+      append(*term, terms);
+    }
+    return;
+  }
+  for (const auto& term : terms) {
+    if (term->testingEquals(filter)) {
+      return;
+    }
+  }
+  terms.push_back(filter.clone());
+}
+
+ConjunctionFilter::ConjunctionFilter(
+    std::vector<std::unique_ptr<Filter>> filters,
+    bool nullAllowed)
+    : Filter(true, nullAllowed, FilterKind::kConjunction),
+      filters_(std::move(filters)) {
+  VELOX_CHECK(!filters_.empty(), "Conjunction requires at least one term");
+  bool nested = false;
+  for (const auto& filter : filters_) {
+    VELOX_CHECK_NOT_NULL(filter);
+    VELOX_CHECK(
+        filter->isDeterministic(), "Conjunction requires deterministic terms");
+    nested |= filter->kind() == FilterKind::kConjunction;
+  }
+  if (nested) {
+    std::vector<std::unique_ptr<Filter>> flat;
+    for (const auto& filter : filters_) {
+      append(*filter, flat);
+    }
+    filters_ = std::move(flat);
+  }
+}
+
+std::unique_ptr<Filter> ConjunctionFilter::intersect(
+    const Filter& left,
+    const Filter& right) {
+  std::vector<std::unique_ptr<Filter>> terms;
+  append(left, terms);
+  append(right, terms);
+  return std::make_unique<ConjunctionFilter>(
+      std::move(terms), left.testNull() && right.testNull());
+}
+
+std::unique_ptr<Filter> ConjunctionFilter::mergeWith(
+    const Filter* other) const {
+  auto merged = intersect(*this, *other);
+  auto& terms = merged->as<ConjunctionFilter>()->filters_;
+  // Keep repeated TopN range updates bounded, without replacing specialized
+  // mergers or recursively building a binary AND tree.
+  for (size_t i = 0; i < terms.size(); ++i) {
+    for (size_t j = i + 1; j < terms.size();) {
+      // Only coalesce kinds with an existing exact same-kind merger. Other
+      // terms (including probabilistic Bloom filters) remain independent.
+      const auto kind = terms[i]->kind();
+      const bool compactable = kind == FilterKind::kBigintRange ||
+          kind == FilterKind::kBytesRange || kind == FilterKind::kDoubleRange ||
+          kind == FilterKind::kFloatRange ||
+          kind == FilterKind::kTimestampRange ||
+          kind == FilterKind::kBytesValues ||
+          kind == FilterKind::kBigintValuesUsingHashTable ||
+          kind == FilterKind::kBigintValuesUsingBitmask;
+      if (compactable && kind == terms[j]->kind()) {
+        auto compact = terms[i]->mergeWith(terms[j].get());
+        if (compact->kind() != FilterKind::kConjunction) {
+          terms[i] = std::move(compact);
+          terms.erase(terms.begin() + j);
+          continue;
+        }
+      }
+      ++j;
+    }
+  }
+  return merged;
+}
+
+folly::dynamic ConjunctionFilter::serialize() const {
+  auto obj = serializeBase();
+  obj["filters"] = folly::dynamic::array;
+  for (const auto& filter : filters_) {
+    obj["filters"].push_back(filter->serialize());
+  }
+  return obj;
+}
+
+std::unique_ptr<Filter> ConjunctionFilter::create(const folly::dynamic& obj) {
+  std::vector<std::unique_ptr<Filter>> terms;
+  for (const auto& term : obj["filters"]) {
+    terms.push_back(ISerializable::deserialize<Filter>(term)->clone());
+  }
+  return std::make_unique<ConjunctionFilter>(
+      std::move(terms), deserializeNullAllowed(obj));
+}
+
+std::unique_ptr<Filter> ConjunctionFilter::clone(
+    std::optional<bool> nullAllowed) const {
+  std::vector<std::unique_ptr<Filter>> terms;
+  for (const auto& term : filters_) {
+    terms.push_back(term->clone());
+  }
+  return std::make_unique<ConjunctionFilter>(
+      std::move(terms), nullAllowed.value_or(nullAllowed_));
+}
+
+bool ConjunctionFilter::testingEquals(const Filter& other) const {
+  const auto* conjunction = testingBaseEquals<ConjunctionFilter>(other);
+  if (!conjunction || filters_.size() != conjunction->filters_.size()) {
+    return false;
+  }
+  for (size_t i = 0; i < filters_.size(); ++i) {
+    if (!filters_[i]->testingEquals(*conjunction->filters_[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ConjunctionFilter::testNonNull() const {
+  for (const auto& filter : filters_) {
+    if (!filter->testNonNull()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ConjunctionFilter::testBool(bool value) const {
+  for (const auto& filter : filters_) {
+    if (!filter->testBool(value)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ConjunctionFilter::testInt64(int64_t value) const {
+  for (const auto& filter : filters_) {
+    if (!filter->testInt64(value)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ConjunctionFilter::testInt128(const int128_t& value) const {
+  for (const auto& filter : filters_) {
+    if (!filter->testInt128(value)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ConjunctionFilter::testFloat(float value) const {
+  for (const auto& filter : filters_) {
+    if (!filter->testFloat(value)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ConjunctionFilter::testDouble(double value) const {
+  for (const auto& filter : filters_) {
+    if (!filter->testDouble(value)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ConjunctionFilter::testBytes(const char* value, int32_t length) const {
+  for (const auto& filter : filters_) {
+    if (!filter->testBytes(value, length)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ConjunctionFilter::testTimestamp(const Timestamp& value) const {
+  for (const auto& filter : filters_) {
+    if (!filter->testTimestamp(value)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ConjunctionFilter::hasTestLength() const {
+  for (const auto& filter : filters_) {
+    if (filter->hasTestLength()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool ConjunctionFilter::testLength(int32_t length) const {
+  for (const auto& filter : filters_) {
+    if (filter->hasTestLength() && !filter->testLength(length)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ConjunctionFilter::testInt64Range(int64_t min, int64_t max, bool hasNull)
+    const {
+  if (hasNull && nullAllowed_) {
+    return true;
+  }
+  for (const auto& filter : filters_) {
+    if (!filter->testInt64Range(min, max, false)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ConjunctionFilter::testInt128Range(
+    const int128_t& min,
+    const int128_t& max,
+    bool hasNull) const {
+  if (hasNull && nullAllowed_) {
+    return true;
+  }
+  for (const auto& filter : filters_) {
+    if (!filter->testInt128Range(min, max, false)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ConjunctionFilter::testDoubleRange(double min, double max, bool hasNull)
+    const {
+  if (hasNull && nullAllowed_) {
+    return true;
+  }
+  for (const auto& filter : filters_) {
+    if (!filter->testDoubleRange(min, max, false)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ConjunctionFilter::testBytesRange(
+    std::optional<std::string_view> min,
+    std::optional<std::string_view> max,
+    bool hasNull) const {
+  if (hasNull && nullAllowed_) {
+    return true;
+  }
+  for (const auto& filter : filters_) {
+    if (!filter->testBytesRange(min, max, false)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ConjunctionFilter::testTimestampRange(
+    const Timestamp& min,
+    const Timestamp& max,
+    bool hasNull) const {
+  if (hasNull && nullAllowed_) {
+    return true;
+  }
+  for (const auto& filter : filters_) {
+    if (!filter->testTimestampRange(min, max, false)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 folly::dynamic AlwaysFalse::serialize() const {
@@ -1511,6 +1802,9 @@ bool MultiRange::testDoubleRange(double min, double max, bool hasNull) const {
 
 std::unique_ptr<Filter> MultiRange::mergeWith(const Filter* other) const {
   switch (other->kind()) {
+    case FilterKind::kLike:
+    case FilterKind::kConjunction:
+      return other->mergeWith(this);
     // Rules of MultiRange with IsNull/IsNotNull
     // 1. MultiRange(nullAllowed=true) AND IS NULL => IS NULL
     // 2. MultiRange(nullAllowed=true) AND IS NOT NULL =>
@@ -1643,6 +1937,8 @@ std::unique_ptr<Filter> IsNull::mergeWith(const Filter* other) const {
 
 std::unique_ptr<Filter> IsNotNull::mergeWith(const Filter* other) const {
   switch (other->kind()) {
+    case FilterKind::kConjunction:
+      return other->mergeWith(this);
     case FilterKind::kAlwaysTrue:
     case FilterKind::kIsNotNull:
       return this->clone();
@@ -1656,6 +1952,8 @@ std::unique_ptr<Filter> IsNotNull::mergeWith(const Filter* other) const {
 
 std::unique_ptr<Filter> BoolValue::mergeWith(const Filter* other) const {
   switch (other->kind()) {
+    case FilterKind::kConjunction:
+      return other->mergeWith(this);
     case FilterKind::kAlwaysTrue:
     case FilterKind::kAlwaysFalse:
     case FilterKind::kIsNull:
@@ -1828,6 +2126,8 @@ std::vector<std::unique_ptr<BigintRange>> negatedValuesToRanges(
 
 std::unique_ptr<Filter> BigintRange::mergeWith(const Filter* other) const {
   switch (other->kind()) {
+    case FilterKind::kConjunction:
+      return other->mergeWith(this);
     case FilterKind::kAlwaysTrue:
     case FilterKind::kAlwaysFalse:
     case FilterKind::kIsNull:
@@ -1896,6 +2196,8 @@ std::unique_ptr<Filter> BigintRange::mergeWith(const Filter* other) const {
 
 std::unique_ptr<Filter> TimestampRange::mergeWith(const Filter* other) const {
   switch (other->kind()) {
+    case FilterKind::kConjunction:
+      return other->mergeWith(this);
     case FilterKind::kAlwaysTrue:
     case FilterKind::kAlwaysFalse:
     case FilterKind::kIsNull:
@@ -1923,6 +2225,8 @@ std::unique_ptr<Filter> TimestampRange::mergeWith(const Filter* other) const {
 std::unique_ptr<Filter> NegatedBigintRange::mergeWith(
     const Filter* other) const {
   switch (other->kind()) {
+    case FilterKind::kConjunction:
+      return other->mergeWith(this);
     case FilterKind::kAlwaysTrue:
     case FilterKind::kAlwaysFalse:
     case FilterKind::kIsNull:
@@ -2021,6 +2325,8 @@ std::unique_ptr<Filter> NegatedBigintRange::mergeWith(
 std::unique_ptr<Filter> BigintValuesUsingHashTable::mergeWith(
     const Filter* other) const {
   switch (other->kind()) {
+    case FilterKind::kConjunction:
+      return other->mergeWith(this);
     case FilterKind::kAlwaysTrue:
     case FilterKind::kAlwaysFalse:
     case FilterKind::kIsNull:
@@ -2113,6 +2419,8 @@ std::unique_ptr<Filter> BigintValuesUsingHashTable::mergeWith(
 std::unique_ptr<Filter> BigintValuesUsingBitmask::mergeWith(
     const Filter* other) const {
   switch (other->kind()) {
+    case FilterKind::kConjunction:
+      return other->mergeWith(this);
     case FilterKind::kAlwaysTrue:
     case FilterKind::kAlwaysFalse:
     case FilterKind::kIsNull:
@@ -2271,6 +2579,8 @@ std::unique_ptr<Filter> NegatedBigintValuesUsingBitmask::mergeWith(
 
 std::unique_ptr<Filter> BigintMultiRange::mergeWith(const Filter* other) const {
   switch (other->kind()) {
+    case FilterKind::kConjunction:
+      return other->mergeWith(this);
     case FilterKind::kAlwaysTrue:
     case FilterKind::kAlwaysFalse:
     case FilterKind::kIsNull:
@@ -2345,6 +2655,8 @@ std::unique_ptr<Filter> BigintMultiRange::mergeWith(const Filter* other) const {
 std::unique_ptr<Filter> BigintValuesUsingBloomFilter::mergeWith(
     const Filter* other) const {
   switch (other->kind()) {
+    case FilterKind::kConjunction:
+      return other->mergeWith(this);
     case FilterKind::kAlwaysFalse:
     case FilterKind::kAlwaysTrue:
     case FilterKind::kIsNull:
@@ -2416,6 +2728,9 @@ bool mergeExclusive(int compareResult, bool left, bool right) {
 
 std::unique_ptr<Filter> BytesRange::mergeWith(const Filter* other) const {
   switch (other->kind()) {
+    case FilterKind::kLike:
+    case FilterKind::kConjunction:
+      return other->mergeWith(this);
     case FilterKind::kAlwaysTrue:
     case FilterKind::kAlwaysFalse:
     case FilterKind::kIsNull:
@@ -2495,6 +2810,9 @@ std::unique_ptr<Filter> BytesRange::mergeWith(const Filter* other) const {
 std::unique_ptr<Filter> NegatedBytesRange::mergeWith(
     const Filter* other) const {
   switch (other->kind()) {
+    case FilterKind::kLike:
+    case FilterKind::kConjunction:
+      return other->mergeWith(this);
     case FilterKind::kAlwaysTrue:
     case FilterKind::kAlwaysFalse:
     case FilterKind::kIsNull:
@@ -2517,6 +2835,9 @@ std::unique_ptr<Filter> NegatedBytesRange::mergeWith(
 
 std::unique_ptr<Filter> BytesValues::mergeWith(const Filter* other) const {
   switch (other->kind()) {
+    case FilterKind::kLike:
+    case FilterKind::kConjunction:
+      return other->mergeWith(this);
     case FilterKind::kAlwaysTrue:
     case FilterKind::kAlwaysFalse:
     case FilterKind::kIsNull:
@@ -2629,6 +2950,9 @@ std::unique_ptr<Filter> BytesValues::mergeWith(const Filter* other) const {
 std::unique_ptr<Filter> NegatedBytesValues::mergeWith(
     const Filter* other) const {
   switch (other->kind()) {
+    case FilterKind::kLike:
+    case FilterKind::kConjunction:
+      return other->mergeWith(this);
     case FilterKind::kAlwaysTrue:
     case FilterKind::kAlwaysFalse:
     case FilterKind::kIsNull:

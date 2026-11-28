@@ -63,10 +63,21 @@ class ScanSpec {
     return filterDisabled_ ? nullptr : filter_.get();
   }
 
-  /// Sets 'filter_'. May be used at initialization or when adding a
-  /// pushed down filter, e.g. top k cutoff.
+  /// Replaces the stored filter, e.g. during initialization. Use addFilter
+  /// when receiving an additional runtime conjunct.
   void setFilter(std::shared_ptr<Filter> filter) {
     filter_ = std::move(filter);
+  }
+
+  /// YihuDB: merge into the stored predicate, including one hidden by delta
+  /// updates. Preserve the mask; the owner invalidates reader caches as usual.
+  void addFilter(const std::shared_ptr<Filter>& filter) {
+    VELOX_CHECK_NOT_NULL(filter);
+    if (filter_) {
+      filter_ = filter_->mergeWith(filter.get());
+    } else {
+      filter_ = filter;
+    }
   }
 
   void setMaxArrayElementsCount(vector_size_t count) {

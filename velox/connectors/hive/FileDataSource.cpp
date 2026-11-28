@@ -621,16 +621,9 @@ void FileDataSource::addDynamicFilter(
     column_index_t outputChannel,
     const std::shared_ptr<common::Filter>& filter) {
   auto& fieldSpec = scanSpec_->getChildByChannel(outputChannel);
-  // YihuDB: a dynamic filter is an additional conjunct. The canonical map
-  // retains predicates even while ScanSpec hides them for delta updates.
-  // Construct a literal root field, including names that contain dots.
-  auto subfield = common::Subfield::create(fieldSpec.fieldName());
-  const auto previous = filters_.find(*subfield);
-  common::FilterPtr combined =
-      previous == filters_.end() ? nullptr : previous->second;
-  common::Filter::merge(filter, combined);
-  filters_.insert_or_assign(std::move(*subfield), combined);
-  fieldSpec.setFilter(std::move(combined));
+  // YihuDB: keep static split-validation metadata immutable. ScanSpec owns
+  // the cumulative runtime predicate, including one hidden for delta updates.
+  fieldSpec.addFilter(filter);
   scanSpec_->resetCachedValues(true);
   if (splitReader_) {
     splitReader_->resetFilterCaches();

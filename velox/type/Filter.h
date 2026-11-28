@@ -15,9 +15,9 @@
  */
 #pragma once
 
-#include "velox/common/base/LikePattern.h"
 #include <fmt/format.h>
 #include <re2/re2.h>
+#include "velox/common/base/LikePattern.h"
 
 #include <folly/Range.h>
 #include <folly/container/F14Set.h>
@@ -58,6 +58,7 @@ enum class FilterKind {
   kTimestampRange,
   kHugeintValuesUsingHashTable,
   kBigintValuesUsingBloomFilter,
+  kConjunction,
 };
 
 VELOX_DECLARE_ENUM_NAME(FilterKind);
@@ -278,10 +279,10 @@ class Filter : public velox::ISerializable {
     VELOX_UNSUPPORTED("{}: testTimestampRange() is not supported.", toString());
   }
 
-  /// Combines this filter with another filter using 'AND' logic.
-  virtual std::unique_ptr<Filter> mergeWith(const Filter* /*other*/) const {
-    VELOX_UNSUPPORTED("{}: mergeWith() is not supported.", toString());
-  }
+  /// Combines deterministic filters over the same value type using AND.
+  /// Specialized implementations compact the predicate; the default retains
+  /// both terms in an exact conjunction.
+  virtual std::unique_ptr<Filter> mergeWith(const Filter* other) const;
 
   static void merge(
       const std::shared_ptr<Filter>& newFilter,
@@ -329,6 +330,53 @@ class Filter : public velox::ISerializable {
  private:
   const bool deterministic_;
   const FilterKind kind_;
+};
+
+/// YihuDB: exact AND for combinations without a specialized representation.
+/// Terms are deterministic and support the same value type. Metadata tests
+/// remain conservative; NULL is controlled by the composite, as in MultiRange.
+class ConjunctionFilter final : public Filter {
+ public:
+  ConjunctionFilter(
+      std::vector<std::unique_ptr<Filter>> filters,
+      bool nullAllowed);
+  static std::unique_ptr<Filter> intersect(
+      const Filter& left,
+      const Filter& right);
+  folly::dynamic serialize() const override;
+  static std::unique_ptr<Filter> create(const folly::dynamic& obj);
+  std::unique_ptr<Filter> clone(
+      std::optional<bool> nullAllowed = std::nullopt) const final;
+  std::unique_ptr<Filter> mergeWith(const Filter* other) const final;
+  bool testingEquals(const Filter& other) const final;
+  bool testNonNull() const final;
+  bool testBool(bool value) const final;
+  bool testInt64(int64_t value) const final;
+  bool testInt128(const int128_t& value) const final;
+  bool testFloat(float value) const final;
+  bool testDouble(double value) const final;
+  bool testBytes(const char* value, int32_t length) const final;
+  bool testTimestamp(const Timestamp& value) const final;
+  bool hasTestLength() const final;
+  bool testLength(int32_t length) const final;
+  bool testInt64Range(int64_t min, int64_t max, bool hasNull) const final;
+  bool testInt128Range(const int128_t& min, const int128_t& max, bool hasNull)
+      const final;
+  bool testDoubleRange(double min, double max, bool hasNull) const final;
+  bool testBytesRange(
+      std::optional<std::string_view> min,
+      std::optional<std::string_view> max,
+      bool hasNull) const final;
+  bool testTimestampRange(
+      const Timestamp& min,
+      const Timestamp& max,
+      bool hasNull) const final;
+
+ private:
+  static void append(
+      const Filter& filter,
+      std::vector<std::unique_ptr<Filter>>& terms);
+  std::vector<std::unique_ptr<Filter>> filters_;
 };
 
 /// TODO Check if this filter is needed. This should not be passed down.
@@ -1698,6 +1746,8 @@ class FloatingPointRange final : public AbstractRange {
 
   std::unique_ptr<Filter> mergeWith(const Filter* other) const final {
     switch (other->kind()) {
+      case FilterKind::kConjunction:
+        return other->mergeWith(this);
       case FilterKind::kAlwaysTrue:
       case FilterKind::kAlwaysFalse:
       case FilterKind::kIsNull:
@@ -1714,6 +1764,11 @@ class FloatingPointRange final : public AbstractRange {
             false);
       case FilterKind::kDoubleRange:
       case FilterKind::kFloatRange: {
+        // The two specializations have different bound layouts. Preserve
+        // cross-kind predicates through the common AND representation.
+        if (other->kind() != kind()) {
+          return Filter::mergeWith(other);
+        }
         bool bothNullAllowed = nullAllowed_ && other->testNull();
 
         auto otherRange = static_cast<const FloatingPointRange<T>*>(other);
@@ -2486,18 +2541,14 @@ class LikeFilter final : public Filter {
   }
 
   std::unique_ptr<Filter> mergeWith(const Filter* other) const final {
-    if (const auto* otherLike = other->as<LikeFilter>();
-        otherLike != nullptr && otherLike->pattern_ == pattern_ &&
-        otherLike->escapeChar_ == escapeChar_) {
-      return std::make_unique<LikeFilter>(
-          *this, nullAllowed() && other->nullAllowed());
+    if (other->kind() == FilterKind::kLike) {
+      const auto* otherLike = other->as<LikeFilter>();
+      if (otherLike->pattern_ == pattern_ &&
+          otherLike->escapeChar_ == escapeChar_) {
+        return this->clone(nullAllowed() && other->nullAllowed());
+      }
     }
-    // Two different LIKE patterns (or a LIKE merged with another filter kind)
-    // on the same column cannot be combined into one filter; keep the
-    // existing filter (a superset of the conjunction; the Filter node or the
-    // top-N operator still arbitrate correctness, just without the new
-    // pruning).
-    return this->clone();
+    return Filter::mergeWith(other);
   }
 
   bool testingEquals(const Filter& other) const final;
